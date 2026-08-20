@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "paths": {
+      "@telemetry/shared-config": ["./packages/shared-config/src/index.ts"],
+      "@telemetry/shared-types": ["./packages/shared-types/src/index.ts"],
+      "@telemetry/shared-utils": ["./packages/shared-utils/src/index.ts"],
+      "@telemetry/shared-validation": ["./packages/shared-validation/src/index.ts"],
+      "@telemetry/shared-logger": ["./packages/shared-logger/src/index.ts"],
+      "@telemetry/shared-tracing": ["./packages/shared-tracing/src/index.ts"]
+    }
+  },
+  "exclude": ["node_modules", "dist", "coverage"]
+}

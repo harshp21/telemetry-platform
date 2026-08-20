@@ -1,0 +1,40 @@
+import js from "@eslint/js";
+import globals from "globals";
+import tseslint from "@typescript-eslint/eslint-plugin";
+import parser from "@typescript-eslint/parser";
+import eslintConfigPrettier from "eslint-config-prettier";
+
+export default [
+  {
+    ignores: ["**/dist/**", "**/coverage/**", "**/node_modules/**", "**/.turbo/**"]
+  },
+  js.configs.recommended,
+  {
+    files: ["**/*.ts", "**/*.tsx"],
+    languageOptions: {
+      parser,
+      parserOptions: {
+        ecmaVersion: "latest",
+        sourceType: "module"
+      },
+      globals: {
+        ...globals.node,
+        ...globals.browser
+      }
+    },
+    plugins: {
+      "@typescript-eslint": tseslint
+    },
+    rules: {
+      "no-undef": "off",
+      "no-console": ["warn", { "allow": ["warn", "error"] }],
+      "@typescript-eslint/consistent-type-imports": "error",
+      "@typescript-eslint/no-explicit-any": "error",
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }
+      ]
+    }
+  },
+  eslintConfigPrettier
+];

@@ -1,0 +1,16 @@
+node_modules
+.pnpm-store
+.turbo
+dist
+coverage
+.env
+*.log
+.DS_Store
+.vscode
+
+# Frontend
+apps/web/.vite
+apps/web/dist
+
+# Prisma
+prisma/generated
