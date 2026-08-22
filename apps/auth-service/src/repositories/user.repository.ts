@@ -23,19 +23,19 @@ interface UserCreateArgs {
 
 interface AuthPrismaTxClient {
 	tenant: {
-		create: (...params: [TenantCreateArgs]) => Promise<{ id: string }>;
+		create: (args: TenantCreateArgs) => Promise<{ id: string }>;
 	};
 	user: {
-		create: (...params: [UserCreateArgs]) => Promise<{ id: string }>;
-		findFirst: (...params: [UserFindFirstArgs]) => Promise<{ id: string } | null>;
+		create: (args: UserCreateArgs) => Promise<{ id: string }>;
+		findFirst: (args: UserFindFirstArgs) => Promise<{ id: string } | null>;
 	};
 }
 
 interface AuthPrismaClient {
 	user: {
-		findFirst: (...params: [UserFindFirstArgs]) => Promise<{ id: string } | null>;
+		findFirst: (args: UserFindFirstArgs) => Promise<{ id: string } | null>;
 	};
-	$transaction: <T>(...params: [(tx: AuthPrismaTxClient) => Promise<T>]) => Promise<T>;
+	$transaction: <T>(operation: (tx: AuthPrismaTxClient) => Promise<T>) => Promise<T>;
 }
 
 interface CreateUserWithTenantInput {
@@ -49,6 +49,15 @@ interface RegisterResult {
 	tenantId: TenantId;
 }
 
+const isUniqueConstraintError = (error: unknown): error is { code: string } => {
+	if (typeof error !== "object" || error === null) {
+		return false;
+	}
+
+	const maybeCode = (error as { code?: unknown }).code;
+	return typeof maybeCode === "string" && maybeCode === "P2002";
+};
+
 export class UserRepository {
 	private readonly db: AuthPrismaClient;
 
@@ -61,38 +70,46 @@ export class UserRepository {
 	): Promise<RegisterResult | null> {
 		const normalizedEmail = input.email.trim().toLowerCase();
 
-		const created = await this.db.$transaction(async (tx) => {
-			const existing = await tx.user.findFirst({
-				where: { email: normalizedEmail },
-				select: { id: true }
+		const existing = await this.db.user.findFirst({
+			where: { email: normalizedEmail },
+			select: { id: true }
+		});
+
+		if (existing) {
+			return null;
+		}
+
+		try {
+			const created = await this.db.$transaction(async (tx) => {
+				const tenant = await tx.tenant.create({
+					data: {
+						name: input.tenantName
+					},
+					select: { id: true }
+				});
+
+				const user = await tx.user.create({
+					data: {
+						tenantId: tenant.id,
+						email: normalizedEmail,
+						passwordHash: input.passwordHash
+					},
+					select: { id: true }
+				});
+
+				return {
+					userId: user.id as UserId,
+					tenantId: tenant.id as TenantId
+				};
 			});
 
-			if (existing) {
+			return created;
+		} catch (error) {
+			if (isUniqueConstraintError(error)) {
 				return null;
 			}
 
-			const tenant = await tx.tenant.create({
-				data: {
-					name: input.tenantName
-				},
-				select: { id: true }
-			});
-
-			const user = await tx.user.create({
-				data: {
-					tenantId: tenant.id,
-					email: normalizedEmail,
-					passwordHash: input.passwordHash
-				},
-				select: { id: true }
-			});
-
-			return {
-				userId: user.id as UserId,
-				tenantId: tenant.id as TenantId
-			};
-		});
-
-		return created;
+			throw error;
+		}
 	}
 }
