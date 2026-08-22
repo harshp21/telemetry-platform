@@ -39,7 +39,9 @@ describe(`POST ${USAGE_SERVICE_ROUTES.USAGE_EVENTS}`, () => {
             idempotencyKey: "idem_1",
             version: 1,
             payload: {
-              quantity: 10
+              quantity: 10,
+              unit: "request",
+              occurredAt: "2026-01-01T00:00:00Z"
             }
           }
         ]
@@ -92,7 +94,9 @@ describe(`POST ${USAGE_SERVICE_ROUTES.USAGE_EVENTS}`, () => {
             idempotencyKey: "idem_1",
             version: 1,
             payload: {
-              quantity: 10
+              quantity: 10,
+              unit: "request",
+              occurredAt: "2026-01-01T00:00:00Z"
             }
           }
         ]

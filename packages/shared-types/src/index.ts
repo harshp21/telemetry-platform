@@ -8,18 +8,44 @@ export type UserId = Brand<string, "UserId">;
 export type EventId = Brand<string, "EventId">;
 export type InvoiceId = Brand<string, "InvoiceId">;
 
-export interface EventPayload {
-	eventType: string;
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
+export interface JsonObject {
+	[key: string]: JsonValue;
+}
+
+export type EventPayload = JsonObject;
+
+export type CanonicalEventPayload = JsonObject & {
 	quantity: number;
 	unit: string;
 	occurredAt: string;
 	idempotencyKey?: string;
-	metadata?: Record<string, unknown>;
+	metadata?: JsonObject;
+};
+
+export type BillingInvoiceGeneratedPayload = JsonObject & {
+	invoiceId: string;
+	amountCents: number;
+	currency: string;
+	periodStart: string;
+	periodEnd: string;
+	lineItems?: JsonObject[];
+};
+
+export interface EventPayloadByType {
+	"api.request": CanonicalEventPayload;
+	"billing.invoice_generated": BillingInvoiceGeneratedPayload;
 }
+
+export type KnownEventType = keyof EventPayloadByType;
+
+export type PayloadForEventType<TEventType extends string> =
+	TEventType extends keyof EventPayloadByType ? EventPayloadByType[TEventType] : EventPayload;
 
 export interface ApiResponse<T> {
 	data: T;
-	meta?: Record<string, unknown>;
+	meta?: JsonObject;
 }
 
 export interface PaginatedResult<T> {
@@ -78,7 +104,7 @@ export class ForbiddenError extends AppError {
 	}
 }
 
-export interface TelemetryEventEnvelope {
+export interface TelemetryEventEnvelope<TPayload extends JsonObject = EventPayload> {
 	eventId: EventId;
 	tenantId: TenantId;
 	eventType: string;
@@ -87,9 +113,19 @@ export interface TelemetryEventEnvelope {
 	source: string;
 	idempotencyKey: string;
 	version: number;
-	payload: EventPayload;
+	payload: TPayload;
 }
 
-export interface UsageEventsBatch {
-	events: TelemetryEventEnvelope[];
+export type TypedTelemetryEvent<TEventType extends string> = TelemetryEventEnvelope<
+	PayloadForEventType<TEventType>
+> & {
+	eventType: TEventType;
+};
+
+export interface UsageEventsBatch<TPayload extends JsonObject = EventPayload> {
+	events: TelemetryEventEnvelope<TPayload>[];
+}
+
+export interface TypedUsageEventsBatch<TEventType extends string> {
+	events: TypedTelemetryEvent<TEventType>[];
 }

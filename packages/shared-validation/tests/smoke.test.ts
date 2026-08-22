@@ -44,10 +44,58 @@ describe("shared-validation schemas", () => {
       source: "sdk-web",
       idempotencyKey: "idem_1",
       version: 1,
-      payload: { quantity: 42 }
+      payload: {
+        quantity: 42,
+        unit: "request",
+        occurredAt: "2026-01-01T00:00:00Z"
+      }
     });
 
     expect(parsed.success).toBe(true);
+  });
+
+  it("accepts a valid billing.invoice_generated event envelope", () => {
+    const parsed = TelemetryEventEnvelopeSchema.safeParse({
+      eventId: "f29f20c2-c0ba-41fc-8e84-b6e11318dbaa",
+      tenantId: "0f1b6f57-8a59-4ee6-9293-e1e6df7bf444",
+      eventType: "billing.invoice_generated",
+      occurredAt: "2026-01-01T00:00:00Z",
+      receivedAt: "2026-01-01T00:00:01Z",
+      source: "billing-service",
+      idempotencyKey: "idem_2",
+      version: 1,
+      payload: {
+        invoiceId: "inv_123",
+        amountCents: 1500,
+        currency: "USD",
+        periodStart: "2026-01-01T00:00:00Z",
+        periodEnd: "2026-02-01T00:00:00Z"
+      }
+    });
+
+    expect(parsed.success).toBe(true);
+  });
+
+  it("rejects known mapped event type with invalid payload shape", () => {
+    const parsed = TelemetryEventEnvelopeSchema.safeParse({
+      eventId: "f29f20c2-c0ba-41fc-8e84-b6e11318dbaa",
+      tenantId: "0f1b6f57-8a59-4ee6-9293-e1e6df7bf444",
+      eventType: "billing.invoice_generated",
+      occurredAt: "2026-01-01T00:00:00Z",
+      receivedAt: "2026-01-01T00:00:01Z",
+      source: "billing-service",
+      idempotencyKey: "idem_2",
+      version: 1,
+      payload: {
+        invoiceId: "inv_123",
+        amountCents: -1,
+        currency: "usd",
+        periodStart: "2026-01-01T00:00:00Z",
+        periodEnd: "2026-02-01T00:00:00Z"
+      }
+    });
+
+    expect(parsed.success).toBe(false);
   });
 
   it("rejects batch payload without events", () => {
