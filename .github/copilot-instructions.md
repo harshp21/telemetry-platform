@@ -5,8 +5,9 @@
 - Keep changes scoped to a single completed slice.
 - Show a concise execution plan before making substantive changes.
 - Keep a visible pending-task list and update it as work progresses.
+- Ask for approval before starting implementation after presenting the plan.
 - Ask for approval before any commit or push.
-- Prefer the agent flow: Enterprise Delivery -> Epic Router -> Task Planner -> Task Implementer -> Senior Reviewer.
+- Prefer the agent flow: Enterprise Delivery -> Epic Router -> Task Planner -> Task Implementer -> QA Tester -> Senior Reviewer.
 
 ## Token Discipline
 - Read the smallest local surface that can prove or disprove the current hypothesis.

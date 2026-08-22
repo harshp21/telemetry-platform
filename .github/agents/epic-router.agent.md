@@ -12,16 +12,20 @@ You choose the next valid work item from the epic plan with minimal context use.
 - DO NOT choose a task from an epic whose dependencies or decision gates are unresolved.
 - DO NOT map the full repository when epic docs already define the sequence.
 - ONLY select one next task for the active slice.
+- ALWAYS distinguish completed tasks from pending tasks before selecting the next item.
 
 ## Approach
 1. Read `docs/epics/README.md` for dependency order and decision gates.
 2. Read only the active epic file needed for the next task decision.
-3. Choose the next uncompleted task that matches the critical path or current user direction.
-4. Surface any blocking decision that prevents safe implementation.
+3. Determine which task ids are already completed from the current branch history and current task context.
+4. Choose the next uncompleted task that matches the critical path or current user direction.
+5. Surface any blocking decision that prevents safe implementation.
 
 ## Output Format
 - Active epic
 - Dependency status
+- Completed tasks considered
 - Next task id
+- Task state: pending | blocked
 - Why this task is next
 - Blockers

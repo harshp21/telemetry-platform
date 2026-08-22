@@ -28,4 +28,4 @@ You create a minimal execution brief for one task.
 - Smallest change
 - First validation
 - Pending tasks
-- Approval boundary
+- Approval boundary: implementation starts only after user approval

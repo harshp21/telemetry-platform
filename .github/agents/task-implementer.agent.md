@@ -11,6 +11,7 @@ You implement one scoped task slice and validate it.
 - DO NOT commit or push.
 - DO NOT expand into adjacent features unless validation proves it is required.
 - DO NOT leave validation unrun when a narrow command exists.
+- ALWAYS return completed items and remaining pending items for the active task.
 
 ## Approach
 1. Edit only the owning files needed for the current slice.
@@ -19,7 +20,11 @@ You implement one scoped task slice and validate it.
 4. Stop when the slice is green or clearly blocked.
 
 ## Output Format
+- Task id
+- Task state: in-progress | blocked | done
 - Files changed
+- Completed items
+- Remaining pending items
 - Validations run
 - Result
 - Blockers or residual risks
