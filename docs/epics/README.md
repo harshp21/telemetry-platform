@@ -8,16 +8,52 @@ Implementation sequence based on architectural dependencies and open decision ga
 
 | Decision | Required before |
 |---|---|
-| Q1 — Event payload shape | Epic 2, Epic 6 |
-| Q6 — Multi-tenancy scope | Epic 2 |
-| Q7 — API versioning (`/v1/`) | Epic 5, Epic 6 |
+| Q1 — Event payload shape (**decided**: envelope + required `version` + additive-only evolution in v1) | Epic 2, Epic 6 |
+| Q6 — Multi-tenancy scope (**decided**: repository tenant scoping + immediate PostgreSQL RLS) | Epic 2 |
+| Q7 — API versioning (`/v1/`) (**decided**: URI major versioning for external APIs) | Epic 5, Epic 6 |
 | Q5 — Refresh token delivery | Epic 4 |
-| Q8 — External vs internal API consumers | Epic 6 |
+| Q8 — External vs internal API consumers (**decided**: external only via gateway; internal routes private + `X-Internal-Secret`) | Epic 6 |
 | Q9 — Worker concurrency (**decided**: horizontal-ready, single instance locally) | Epic 7 |
 | Q10 — DLQ retry policy | Epic 7 |
 | Q2 — Pricing model | Epic 8 |
 | Q3 — UTC aggregation timezone | Epic 9 |
 | Q11 — Dashboard scope | Epic 11 |
+
+### Day 1 decision notes
+
+#### Q1 — Event payload shape
+
+- Decision: Use a versioned event envelope with strict required fields and typed payload.
+- Required envelope fields: `eventId`, `tenantId`, `eventType`, `occurredAt`, `receivedAt`, `source`, `idempotencyKey`, `version`, `payload`.
+- Evolution rule (v1): additive-only changes in `payload`; no breaking removals/renames.
+- Why now: protects replay, idempotency, and contract governance while keeping ingestion simple.
+- Revisit trigger: multiple producer SDKs, frequent breaking changes, or cross-language schema generation needs.
+
+#### Q6 — Multi-tenancy scope
+
+- Decision: Enforce tenant scoping in repositories and enable PostgreSQL RLS immediately.
+- Enforcement rules:
+        - every read/write query must include `tenantId` context;
+        - no trusted raw `tenantId` from client payloads;
+        - privileged cross-tenant operations remain explicit and isolated.
+- Why now: senior-level safety baseline with reduced blast radius for data leaks.
+- Revisit trigger: only if RLS cost/operational complexity blocks throughput targets.
+
+#### Q7 — API versioning
+
+- Decision: External APIs use URI major versioning under `/v1`.
+- Internal APIs may remain unversioned while private but must stay behind internal auth.
+- Breaking changes require a new major path (`/v2`), additive fields remain non-breaking.
+- Why now: clear consumer contracts and low operational overhead.
+- Revisit trigger: if consumer-specific behavior requires content negotiation.
+
+#### Q8 — Internal vs external boundary
+
+- Decision: all external traffic enters only through `gateway`; internal endpoints are private.
+- Internal endpoints require `X-Internal-Secret` and must not be publicly proxied.
+- Health endpoints remain unauthenticated for operability checks.
+- Why now: clear trust boundaries and reduced accidental exposure risk.
+- Revisit trigger: service mesh/mTLS rollout or external partner access requirements.
 
 ---
 
