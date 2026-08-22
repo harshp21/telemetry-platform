@@ -142,3 +142,33 @@ model InvoiceLineItem {
   unitPrice Decimal @db.Decimal(18, 6)
   amount    Decimal @db.Decimal(18, 6)
 }
+
+model MetricRollup {
+  id          String      @id @default(uuid())
+  tenantId    String
+  metricKey   String
+  granularity Granularity
+  bucketStart DateTime
+  value       Decimal     @db.Decimal(18, 6)
+  computedAt  DateTime    @default(now())
+
+  @@unique([tenantId, metricKey, granularity, bucketStart])
+  @@index([tenantId, granularity, bucketStart])
+}
+
+enum Granularity {
+  HOUR
+  DAY
+  WEEK
+}
+
+model ExportAudit {
+  id         String   @id @default(uuid())
+  tenantId   String
+  userId     String
+  filters    Json
+  rowCount   Int
+  exportedAt DateTime @default(now())
+
+  @@index([tenantId, exportedAt])
+}
