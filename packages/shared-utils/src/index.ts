@@ -13,12 +13,100 @@ const isPrismaKnownError = (error: unknown): error is { code: string } => {
 export const generateIdempotencyKey = (
 	tenantId: string,
 	eventType: string,
-	occurredAt: string,
-	source: string
+	timestamp: string
 ): string => {
 	return createHash("sha256")
-		.update([tenantId, eventType, occurredAt, source].join("|"))
+		.update([tenantId, eventType, timestamp].join("|"))
 		.digest("hex");
+};
+
+export const chunkArray = <T>(arr: T[], size: number): T[][] => {
+	if (!Number.isInteger(size) || size <= 0) {
+		throw new Error("size must be a positive integer");
+	}
+
+	const chunks: T[][] = [];
+	for (let index = 0; index < arr.length; index += size) {
+		chunks.push(arr.slice(index, index + size));
+	}
+
+	return chunks;
+};
+
+export const sleep = (ms: number): Promise<void> => {
+	if (ms < 0) {
+		return Promise.reject(new Error("ms must be non-negative"));
+	}
+
+	return new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
+};
+
+interface RetryWithBackoffOptions {
+	maxAttempts: number;
+	baseDelayMs: number;
+}
+
+export const retryWithBackoff = async <T>(
+	fn: () => Promise<T>,
+	opts: RetryWithBackoffOptions
+): Promise<T> => {
+	const { maxAttempts, baseDelayMs } = opts;
+
+	if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+		throw new Error("maxAttempts must be at least 1");
+	}
+
+	if (baseDelayMs < 0) {
+		throw new Error("baseDelayMs must be non-negative");
+	}
+
+	let lastError: unknown;
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		try {
+			return await fn();
+		} catch (error) {
+			lastError = error;
+
+			if (attempt === maxAttempts) {
+				break;
+			}
+
+			const exponentialDelay = baseDelayMs * 2 ** (attempt - 1);
+			const jitter = Math.floor(Math.random() * (baseDelayMs + 1));
+			await sleep(exponentialDelay + jitter);
+		}
+	}
+
+	throw lastError;
+};
+
+export const formatCurrency = (amountInCents: number, currency: string): string => {
+	return new Intl.NumberFormat("en-US", {
+		style: "currency",
+		currency,
+		currencyDisplay: "symbol"
+	}).format(amountInCents / 100);
+};
+
+export const formatBytes = (bytes: number): string => {
+	if (bytes < 0) {
+		throw new Error("bytes must be non-negative");
+	}
+
+	const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+	let value = bytes;
+	let unitIndex = 0;
+
+	while (value >= 1024 && unitIndex < units.length - 1) {
+		value /= 1024;
+		unitIndex += 1;
+	}
+
+	const rounded = value >= 10 || Number.isInteger(value) ? Math.round(value) : Number(value.toFixed(1));
+	return `${rounded} ${units[unitIndex]}`;
 };
 
 export const registerGlobalErrorHandler = (app: FastifyInstance): void => {

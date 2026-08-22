@@ -1,21 +1,32 @@
 import Fastify from "fastify";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppError, ERROR_RESPONSES } from "@telemetry/shared-types";
-import { generateIdempotencyKey, registerGlobalErrorHandler } from "../src";
+import {
+  chunkArray,
+  formatBytes,
+  formatCurrency,
+  generateIdempotencyKey,
+  registerGlobalErrorHandler,
+  retryWithBackoff,
+  sleep
+} from "../src";
 
 describe("shared-utils", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
   it("generates deterministic idempotency key for same inputs", () => {
     const first = generateIdempotencyKey(
       "tenant_1",
       "api.request",
-      "2026-01-01T00:00:00Z",
-      "sdk-web"
+      "2026-01-01T00:00:00Z"
     );
     const second = generateIdempotencyKey(
       "tenant_1",
       "api.request",
-      "2026-01-01T00:00:00Z",
-      "sdk-web"
+      "2026-01-01T00:00:00Z"
     );
 
     expect(first).toBe(second);
@@ -25,17 +36,104 @@ describe("shared-utils", () => {
     const tenantOne = generateIdempotencyKey(
       "tenant_1",
       "api.request",
-      "2026-01-01T00:00:00Z",
-      "sdk-web"
+      "2026-01-01T00:00:00Z"
     );
     const tenantTwo = generateIdempotencyKey(
       "tenant_2",
       "api.request",
-      "2026-01-01T00:00:00Z",
-      "sdk-web"
+      "2026-01-01T00:00:00Z"
     );
 
     expect(tenantOne).not.toBe(tenantTwo);
+  });
+
+  it("chunks arrays with the requested size", () => {
+    const chunks = chunkArray([1, 2, 3, 4, 5], 2);
+
+    expect(chunks).toEqual([[1, 2], [3, 4], [5]]);
+  });
+
+  it("throws for invalid chunk size", () => {
+    expect(() => chunkArray([1, 2], 0)).toThrow("size must be a positive integer");
+  });
+
+  it("resolves sleep after requested delay", async () => {
+    vi.useFakeTimers();
+
+    const promise = sleep(50);
+    await vi.advanceTimersByTimeAsync(50);
+
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("rejects sleep for negative delay", async () => {
+    await expect(sleep(-1)).rejects.toThrow("ms must be non-negative");
+  });
+
+  it("retries with backoff and eventually succeeds", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+
+    let attempts = 0;
+    const operation = vi.fn(async () => {
+      attempts += 1;
+      if (attempts < 3) {
+        throw new Error("transient");
+      }
+
+      return "ok";
+    });
+
+    const result = await retryWithBackoff(operation, {
+      maxAttempts: 3,
+      baseDelayMs: 0
+    });
+
+    expect(result).toBe("ok");
+    expect(operation).toHaveBeenCalledTimes(3);
+  });
+
+  it("throws last error when retries are exhausted", async () => {
+    const expected = new Error("always fails");
+    const operation = vi.fn(async () => {
+      throw expected;
+    });
+
+    await expect(
+      retryWithBackoff(operation, {
+        maxAttempts: 2,
+        baseDelayMs: 0
+      })
+    ).rejects.toThrow("always fails");
+    expect(operation).toHaveBeenCalledTimes(2);
+  });
+
+  it("validates retry options", async () => {
+    await expect(
+      retryWithBackoff(async () => "ok", {
+        maxAttempts: 0,
+        baseDelayMs: 1
+      })
+    ).rejects.toThrow("maxAttempts must be at least 1");
+
+    await expect(
+      retryWithBackoff(async () => "ok", {
+        maxAttempts: 1,
+        baseDelayMs: -1
+      })
+    ).rejects.toThrow("baseDelayMs must be non-negative");
+  });
+
+  it("formats currency values", () => {
+    expect(formatCurrency(1999, "USD")).toBe("$19.99");
+  });
+
+  it("formats bytes using binary units", () => {
+    expect(formatBytes(1048576)).toBe("1 MB");
+    expect(formatBytes(1536)).toBe("1.5 KB");
+  });
+
+  it("rejects negative byte values", () => {
+    expect(() => formatBytes(-1)).toThrow("bytes must be non-negative");
   });
 
   it("normalizes AppError responses through the global handler", async () => {
