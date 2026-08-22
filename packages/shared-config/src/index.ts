@@ -1,9 +1,9 @@
-import type { ZodTypeAny } from "zod";
+import type { ZodType } from "zod";
 
 export const packageName = "@telemetry/shared-config";
 export const packageDescription = "Shared configuration primitives and helpers";
 
-export const parseEnv = <T extends ZodTypeAny>(schema: T, env: NodeJS.ProcessEnv) => {
+export const parseEnv = <TOutput>(schema: ZodType<TOutput>, env: NodeJS.ProcessEnv): Readonly<TOutput> => {
 	const parsed = schema.safeParse(env);
 
 	if (!parsed.success) {

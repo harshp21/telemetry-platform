@@ -3,7 +3,41 @@ import { trace, type Span } from "@opentelemetry/api";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLogger } from "../src/index";
 
-type LogLine = Record<string, unknown>;
+interface ParsedLogLine {
+  service?: string;
+  level?: string;
+  traceId?: string;
+  spanId?: string;
+}
+
+const parseLogLines = (chunks: string[]): ParsedLogLine[] => {
+  const lines = chunks
+    .join("")
+    .split("\n")
+    .filter((line) => line.trim().length > 0);
+
+  return lines.map((line) => {
+    const parsed: unknown = JSON.parse(line);
+
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("Expected pino log line to be a JSON object");
+    }
+
+    const candidate = parsed as {
+      service?: unknown;
+      level?: unknown;
+      traceId?: unknown;
+      spanId?: unknown;
+    };
+
+    return {
+      service: typeof candidate.service === "string" ? candidate.service : undefined,
+      level: typeof candidate.level === "string" ? candidate.level : undefined,
+      traceId: typeof candidate.traceId === "string" ? candidate.traceId : undefined,
+      spanId: typeof candidate.spanId === "string" ? candidate.spanId : undefined
+    };
+  });
+};
 
 describe("createLogger", () => {
   afterEach(() => {
@@ -14,7 +48,7 @@ describe("createLogger", () => {
   it("emits valid JSON to stdout with service on every line", () => {
     const stream = new PassThrough();
     const chunks: string[] = [];
-    stream.on("data", (chunk) => {
+    stream.on("data", (chunk: Buffer) => {
       chunks.push(chunk.toString("utf8"));
     });
 
@@ -23,11 +57,7 @@ describe("createLogger", () => {
     logger.info({ route: "/health" }, "health ok");
     logger.warn({ route: "/health" }, "health slow");
 
-    const lines = chunks
-      .join("")
-      .split("\n")
-      .filter((line) => line.trim().length > 0)
-      .map((line) => JSON.parse(line) as LogLine);
+    const lines = parseLogLines(chunks);
 
     expect(lines.length).toBe(2);
     expect(lines[0]?.service).toBe("gateway");
@@ -39,28 +69,24 @@ describe("createLogger", () => {
   it("injects traceId and spanId when an active span exists", () => {
     const stream = new PassThrough();
     const chunks: string[] = [];
-    stream.on("data", (chunk) => {
+    stream.on("data", (chunk: Buffer) => {
       chunks.push(chunk.toString("utf8"));
     });
 
     const logger = createLogger("auth-service", stream);
 
-    const span = {
+    const span: Pick<Span, "spanContext"> = {
       spanContext: () => ({
         traceId: "1234567890abcdef1234567890abcdef",
         spanId: "1234567890abcdef",
         traceFlags: 1
       })
-    } as unknown as Span;
+    };
 
-    vi.spyOn(trace, "getActiveSpan").mockReturnValue(span);
+    vi.spyOn(trace, "getActiveSpan").mockReturnValue(span as Span);
     logger.info("inside span");
 
-    const lines = chunks
-      .join("")
-      .split("\n")
-      .filter((line) => line.trim().length > 0)
-      .map((line) => JSON.parse(line) as LogLine);
+    const lines = parseLogLines(chunks);
 
     expect(lines[0]?.traceId).toBe("1234567890abcdef1234567890abcdef");
     expect(lines[0]?.spanId).toBe("1234567890abcdef");
@@ -69,7 +95,7 @@ describe("createLogger", () => {
   it("defaults to info and allows LOG_LEVEL override", () => {
     const defaultStream = new PassThrough();
     const defaultChunks: string[] = [];
-    defaultStream.on("data", (chunk) => {
+    defaultStream.on("data", (chunk: Buffer) => {
       defaultChunks.push(chunk.toString("utf8"));
     });
 
@@ -77,11 +103,7 @@ describe("createLogger", () => {
     defaultLogger.debug("hidden debug");
     defaultLogger.info("visible info");
 
-    const defaultLines = defaultChunks
-      .join("")
-      .split("\n")
-      .filter((line) => line.trim().length > 0)
-      .map((line) => JSON.parse(line) as LogLine);
+    const defaultLines = parseLogLines(defaultChunks);
 
     expect(defaultLines.length).toBe(1);
     expect(defaultLines[0]?.level).toBe("info");
@@ -89,18 +111,14 @@ describe("createLogger", () => {
     process.env.LOG_LEVEL = "debug";
     const debugStream = new PassThrough();
     const debugChunks: string[] = [];
-    debugStream.on("data", (chunk) => {
+    debugStream.on("data", (chunk: Buffer) => {
       debugChunks.push(chunk.toString("utf8"));
     });
 
     const debugLogger = createLogger("usage-service", debugStream);
     debugLogger.debug("visible debug");
 
-    const debugLines = debugChunks
-      .join("")
-      .split("\n")
-      .filter((line) => line.trim().length > 0)
-      .map((line) => JSON.parse(line) as LogLine);
+    const debugLines = parseLogLines(debugChunks);
 
     expect(debugLines.length).toBe(1);
     expect(debugLines[0]?.level).toBe("debug");

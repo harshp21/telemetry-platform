@@ -24,7 +24,8 @@
     },
     "test": {
       "dependsOn": ["^test"],
-      "outputs": ["coverage/**"]
+      "outputs": [],
+      "cache": false
     }
   }
 }
