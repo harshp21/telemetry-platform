@@ -3,7 +3,7 @@
 ## Workflow
 - Work one epic task at a time.
 - Keep changes scoped to a single completed slice.
-- Show a concise execution plan before making substantive changes.
+- Show a detailed execution plan before making substantive changes.
 - Keep a visible pending-task list and update it as work progresses.
 - Ask for approval before starting implementation after presenting the plan.
 - Ask for approval before any commit or push.
@@ -12,7 +12,7 @@
 ## Token Discipline
 - Read the smallest local surface that can prove or disprove the current hypothesis.
 - Prefer owning files, nearest tests, and direct call sites over broad repo exploration.
-- Keep plans short: active task, next action, and pending items only.
+- During plan approval, provide detailed scope, steps, validations, risks, and pending tasks.
 - Do not restate unchanged plans or long summaries.
 - Use concise outputs with findings first, then risks, then next action.
 
