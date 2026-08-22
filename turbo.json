@@ -12,7 +12,8 @@
     },
     "dev": {
       "cache": false,
-      "persistent": true
+      "persistent": true,
+      "env": ["INTERNAL_API_SECRET"]
     },
     "lint": {
       "dependsOn": ["^lint"],
