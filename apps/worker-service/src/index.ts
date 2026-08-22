@@ -1,18 +1,10 @@
-import Fastify from "fastify";
-import { createContainer } from "@/config/container";
+import { initTracing } from "@telemetry/shared-tracing";
 
-const serviceName = "worker-service";
-const app = Fastify({ logger: true });
-const container = createContainer(serviceName);
-
-app.get("/health", async () => {
-  return {
-    status: "ok",
-    service: container.serviceName
-  };
-});
+initTracing("worker-service");
 
 const start = async (): Promise<void> => {
+	const { buildWorkerServiceApp } = await import("./app");
+	const app = buildWorkerServiceApp();
   const port = Number(process.env.PORT ?? 3003);
   await app.listen({ port, host: "0.0.0.0" });
 };
