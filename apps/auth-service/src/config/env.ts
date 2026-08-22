@@ -3,11 +3,16 @@ import { z } from "zod";
 
 export const EnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  PORT: z.coerce.number().int().positive().default(3000),
+  PORT: z.coerce.number().int().positive().default(3001),
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().min(1),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().min(1),
-  LOG_LEVEL: z.string().default("info")
+  LOG_LEVEL: z.string().default("info"),
+  JWT_SECRET: z.string().min(32),
+  JWT_REFRESH_SECRET: z.string().min(32),
+  JWT_ACCESS_TTL_SECONDS: z.coerce.number().int().positive().default(900),
+  JWT_REFRESH_TTL_SECONDS: z.coerce.number().int().positive().default(604800),
+  BCRYPT_ROUNDS: z.coerce.number().int().min(10).max(14).default(12)
 });
 
 export type ServiceEnv = z.infer<typeof EnvSchema>;
