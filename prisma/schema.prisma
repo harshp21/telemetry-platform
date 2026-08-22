@@ -15,7 +15,8 @@ model Tenant {
   createdAt DateTime @default(now())
   deletedAt DateTime?
 
-  users User[]
+  users  User[]
+  events Event[]
 }
 
 enum Plan {
@@ -55,4 +56,38 @@ model RefreshToken {
   createdAt DateTime  @default(now())
 
   @@index([userId])
+}
+
+model Event {
+  id             String    @id @default(uuid())
+  tenantId       String
+  tenant         Tenant    @relation(fields: [tenantId], references: [id])
+  idempotencyKey String    @unique
+  eventType      String
+  quantity       Decimal   @db.Decimal(18, 6)
+  unit           String
+  occurredAt     DateTime
+  metadata       Json?
+  createdAt      DateTime  @default(now())
+
+  usageLine UsageLine?
+
+  @@index([tenantId, occurredAt])
+  @@index([tenantId, eventType])
+}
+
+model UsageLine {
+  id          String   @id @default(uuid())
+  tenantId    String
+  eventId     String   @unique
+  event       Event    @relation(fields: [eventId], references: [id])
+  metricKey   String
+  quantity    Decimal  @db.Decimal(18, 6)
+  periodStart DateTime
+  periodEnd   DateTime
+  processedAt DateTime @default(now())
+  billed      Boolean  @default(false)
+
+  @@index([tenantId, periodStart, periodEnd])
+  @@index([tenantId, billed])
 }
