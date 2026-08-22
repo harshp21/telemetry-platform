@@ -15,8 +15,10 @@ model Tenant {
   createdAt DateTime @default(now())
   deletedAt DateTime?
 
-  users  User[]
-  events Event[]
+  users    User[]
+  events   Event[]
+  meters   Meter[]
+  invoices Invoice[]
 }
 
 enum Plan {
@@ -90,4 +92,53 @@ model UsageLine {
 
   @@index([tenantId, periodStart, periodEnd])
   @@index([tenantId, billed])
+}
+
+model Meter {
+  id         String    @id @default(uuid())
+  tenantId   String
+  tenant     Tenant    @relation(fields: [tenantId], references: [id])
+  metricKey  String
+  unitPrice  Decimal   @db.Decimal(18, 6)
+  currency   String    @default("USD")
+  tierJson   Json?
+  activeFrom DateTime
+  activeTo   DateTime?
+
+  @@unique([tenantId, metricKey, activeFrom])
+  @@index([tenantId])
+}
+
+model Invoice {
+  id          String        @id @default(uuid())
+  tenantId    String
+  tenant      Tenant        @relation(fields: [tenantId], references: [id])
+  periodStart DateTime
+  periodEnd   DateTime
+  status      InvoiceStatus @default(DRAFT)
+  totalAmount Decimal       @db.Decimal(18, 6)
+  currency    String        @default("USD")
+  createdAt   DateTime      @default(now())
+  finalizedAt DateTime?
+
+  lineItems InvoiceLineItem[]
+
+  @@unique([tenantId, periodStart, periodEnd])
+  @@index([tenantId, status])
+}
+
+enum InvoiceStatus {
+  DRAFT
+  FINALIZED
+  PAID
+}
+
+model InvoiceLineItem {
+  id        String  @id @default(uuid())
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id])
+  metricKey String
+  quantity  Decimal @db.Decimal(18, 6)
+  unitPrice Decimal @db.Decimal(18, 6)
+  amount    Decimal @db.Decimal(18, 6)
 }
