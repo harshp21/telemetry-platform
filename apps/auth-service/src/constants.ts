@@ -1,11 +1,14 @@
 export const AUTH_SERVICE_NAME = "auth-service";
 
 export const AUTH_ROUTES = {
-  HEALTH: "/health"
+  HEALTH: "/health",
+  V1_AUTH: "/v1/auth",
+  REGISTER: "/register"
 } as const;
 
 export const AUTH_RESPONSES = {
-  STATUS_OK: "ok"
+  STATUS_OK: "ok",
+  CODE_EMAIL_ALREADY_EXISTS: "EMAIL_ALREADY_EXISTS"
 } as const;
 
 export const AUTH_RUNTIME = {
