@@ -1,3 +1,4 @@
+import { parseEnv } from "@telemetry/shared-config";
 import { z } from "zod";
 
 export const EnvSchema = z.object({
@@ -10,3 +11,5 @@ export const EnvSchema = z.object({
 });
 
 export type ServiceEnv = z.infer<typeof EnvSchema>;
+
+export const env = parseEnv(EnvSchema, process.env);
