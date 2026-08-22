@@ -23,18 +23,19 @@ interface UserCreateArgs {
 
 interface AuthPrismaTxClient {
 	tenant: {
-		create(args: TenantCreateArgs): Promise<{ id: string }>;
+		create: (...params: [TenantCreateArgs]) => Promise<{ id: string }>;
 	};
 	user: {
-		create(args: UserCreateArgs): Promise<{ id: string }>;
+		create: (...params: [UserCreateArgs]) => Promise<{ id: string }>;
+		findFirst: (...params: [UserFindFirstArgs]) => Promise<{ id: string } | null>;
 	};
 }
 
 interface AuthPrismaClient {
 	user: {
-		findFirst(args: UserFindFirstArgs): Promise<{ id: string } | null>;
+		findFirst: (...params: [UserFindFirstArgs]) => Promise<{ id: string } | null>;
 	};
-	$transaction<T>(fn: (tx: AuthPrismaTxClient) => Promise<T>): Promise<T>;
+	$transaction: <T>(...params: [(tx: AuthPrismaTxClient) => Promise<T>]) => Promise<T>;
 }
 
 interface CreateUserWithTenantInput {
@@ -49,17 +50,27 @@ interface RegisterResult {
 }
 
 export class UserRepository {
-	constructor(private readonly db: AuthPrismaClient = prisma as unknown as AuthPrismaClient) {}
+	private readonly db: AuthPrismaClient;
 
-	findByEmail(email: string): Promise<{ id: UserId } | null> {
-		return this.db.user.findFirst({
-			where: { email },
-			select: { id: true }
-		}) as Promise<{ id: UserId } | null>;
+	constructor(db: AuthPrismaClient = prisma as unknown as AuthPrismaClient) {
+		this.db = db;
 	}
 
-	async createUserWithTenant(input: CreateUserWithTenantInput): Promise<RegisterResult> {
+	async createUserWithTenantIfEmailAvailable(
+		input: CreateUserWithTenantInput
+	): Promise<RegisterResult | null> {
+		const normalizedEmail = input.email.trim().toLowerCase();
+
 		const created = await this.db.$transaction(async (tx) => {
+			const existing = await tx.user.findFirst({
+				where: { email: normalizedEmail },
+				select: { id: true }
+			});
+
+			if (existing) {
+				return null;
+			}
+
 			const tenant = await tx.tenant.create({
 				data: {
 					name: input.tenantName
@@ -70,7 +81,7 @@ export class UserRepository {
 			const user = await tx.user.create({
 				data: {
 					tenantId: tenant.id,
-					email: input.email,
+					email: normalizedEmail,
 					passwordHash: input.passwordHash
 				},
 				select: { id: true }

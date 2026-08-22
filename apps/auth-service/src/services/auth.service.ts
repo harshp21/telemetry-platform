@@ -1,5 +1,6 @@
 import { hash } from "bcryptjs";
 import type { TenantId, UserId } from "@telemetry/shared-types";
+import { AUTH_VALIDATION } from "../constants";
 import { EmailAlreadyExistsError } from "../errors";
 import { UserRepository } from "../repositories/user.repository";
 
@@ -15,13 +16,20 @@ interface RegisterResult {
 }
 
 const resolveBcryptRounds = (): number => {
-	const parsed = Number.parseInt(process.env.BCRYPT_ROUNDS ?? "12", 10);
+	const parsed = Number.parseInt(
+		process.env.BCRYPT_ROUNDS ?? String(AUTH_VALIDATION.BCRYPT_DEFAULT_ROUNDS),
+		10
+	);
 
-	if (Number.isInteger(parsed) && parsed >= 10 && parsed <= 14) {
+	if (
+		Number.isInteger(parsed) &&
+		parsed >= AUTH_VALIDATION.BCRYPT_MIN_ROUNDS &&
+		parsed <= AUTH_VALIDATION.BCRYPT_MAX_ROUNDS
+	) {
 		return parsed;
 	}
 
-	return 12;
+	return AUTH_VALIDATION.BCRYPT_DEFAULT_ROUNDS;
 };
 
 export class AuthService {
@@ -32,18 +40,17 @@ export class AuthService {
 	}
 
 	async register(input: RegisterInput): Promise<RegisterResult> {
-		const existingUser = await this.userRepository.findByEmail(input.email);
-
-		if (existingUser) {
-			throw new EmailAlreadyExistsError();
-		}
-
 		const passwordHash = await hash(input.password, resolveBcryptRounds());
-
-		return this.userRepository.createUserWithTenant({
+		const created = await this.userRepository.createUserWithTenantIfEmailAvailable({
 			email: input.email,
 			passwordHash,
 			tenantName: input.tenantName
 		});
+
+		if (!created) {
+			throw new EmailAlreadyExistsError();
+		}
+
+		return created;
 	}
 }
