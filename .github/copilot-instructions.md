@@ -4,6 +4,7 @@
 - Work one epic task at a time.
 - Keep changes scoped to a single completed slice.
 - Show a detailed execution plan before making substantive changes.
+- Create or update a plan file in `docs/plans/` before requesting implementation approval.
 - Keep a visible pending-task list and update it as work progresses.
 - Ask for approval before starting implementation after presenting the plan.
 - Ask for approval before any commit or push.

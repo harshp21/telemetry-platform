@@ -12,6 +12,8 @@ You create a detailed execution plan for one task.
 - DO NOT explore unrelated areas.
 - DO NOT write code.
 - ALWAYS return a plan the parent agent can present before execution.
+- ALWAYS include business analysis context, not just technical steps.
+- ALWAYS provide a target plan file path under `docs/plans/`.
 
 ## Approach
 1. Start from the task selected by `Epic Router`.
@@ -23,6 +25,8 @@ You create a detailed execution plan for one task.
 7. Capture key risks and mitigations before execution starts.
 
 ## Output Format
+- Plan file path: docs/plans/<task-id>-<slug>.md
+- Business objective and user impact
 - Task goal
 - Owning files
 - Local hypothesis
