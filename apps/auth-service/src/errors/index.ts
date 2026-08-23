@@ -12,3 +12,13 @@ export class EmailAlreadyExistsError extends AppError {
 		);
 	}
 }
+
+export class InvalidCredentialsError extends AppError {
+	constructor() {
+		super(
+			AUTH_RESPONSES.CODE_INVALID_CREDENTIALS,
+			AUTH_HTTP_STATUS.UNAUTHORIZED,
+			AUTH_MESSAGES.INVALID_CREDENTIALS
+		);
+	}
+}

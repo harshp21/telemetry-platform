@@ -9,14 +9,16 @@ import {
   AUTH_ROUTES,
   AUTH_SERVICE_NAME
 } from "../src/constants";
-import { EmailAlreadyExistsError } from "../src/errors";
+import { EmailAlreadyExistsError, InvalidCredentialsError } from "../src/errors";
 
 const registerMock = vi.fn();
+const loginMock = vi.fn();
 
 vi.mock("../src/services/auth.service", () => {
   return {
     AuthService: class {
       register = registerMock;
+      login = loginMock;
     }
   };
 });
@@ -26,6 +28,7 @@ describe("auth-service", () => {
 
   beforeEach(() => {
     registerMock.mockReset();
+    loginMock.mockReset();
     app = buildAuthServiceApp();
   });
 
@@ -101,5 +104,79 @@ describe("auth-service", () => {
       code: ERROR_RESPONSES.CODE_VALIDATION_ERROR
     });
     expect(registerMock).not.toHaveBeenCalled();
+  });
+
+  it("logs in a user and returns 200", async () => {
+    loginMock.mockResolvedValueOnce({
+      accessToken: "access_token",
+      refreshToken: "refresh_token",
+      tokenType: "Bearer",
+      expiresInSeconds: 900,
+      user: {
+        userId: "user_1",
+        tenantId: "tenant_1",
+        role: "OWNER"
+      }
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGIN}`,
+      payload: {
+        email: "owner@example.com",
+        password: "StrongPass123"
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.OK);
+    expect(response.json()).toEqual({
+      data: {
+        accessToken: "access_token",
+        refreshToken: "refresh_token",
+        tokenType: "Bearer",
+        expiresInSeconds: 900,
+        user: {
+          userId: "user_1",
+          tenantId: "tenant_1",
+          role: "OWNER"
+        }
+      }
+    });
+  });
+
+  it("returns 401 when credentials are invalid", async () => {
+    loginMock.mockRejectedValueOnce(new InvalidCredentialsError());
+
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGIN}`,
+      payload: {
+        email: "owner@example.com",
+        password: "WrongPass123"
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_INVALID_CREDENTIALS,
+      message: AUTH_MESSAGES.INVALID_CREDENTIALS
+    });
+  });
+
+  it("returns 400 for invalid login payload", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGIN}`,
+      payload: {
+        email: "bad-email",
+        password: "short"
+      }
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      code: ERROR_RESPONSES.CODE_VALIDATION_ERROR
+    });
+    expect(loginMock).not.toHaveBeenCalled();
   });
 });

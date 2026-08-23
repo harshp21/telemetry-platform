@@ -7,6 +7,24 @@ interface UserFindFirstArgs {
 	select: { id: true };
 }
 
+interface UserFindUniqueLoginArgs {
+	where: { email: string };
+	select: {
+		id: true;
+		tenantId: true;
+		passwordHash: true;
+		role: true;
+	};
+}
+
+interface RefreshTokenCreateArgs {
+	data: {
+		userId: string;
+		tokenHash: string;
+		expiresAt: Date;
+	};
+}
+
 interface TenantCreateArgs {
 	data: { name: string };
 	select: { id: true };
@@ -29,11 +47,23 @@ interface AuthPrismaTxClient {
 		create: (args: UserCreateArgs) => Promise<{ id: string }>;
 		findFirst: (args: UserFindFirstArgs) => Promise<{ id: string } | null>;
 	};
+	refreshToken: {
+		create: (args: RefreshTokenCreateArgs) => Promise<{ id: string }>;
+	};
 }
 
 interface AuthPrismaClient {
 	user: {
 		findFirst: (args: UserFindFirstArgs) => Promise<{ id: string } | null>;
+		findUnique: (args: UserFindUniqueLoginArgs) => Promise<{
+			id: string;
+			tenantId: string;
+			passwordHash: string;
+			role: "OWNER" | "ADMIN" | "MEMBER";
+		} | null>;
+	};
+	refreshToken: {
+		create: (args: RefreshTokenCreateArgs) => Promise<{ id: string }>;
 	};
 	$transaction: <T>(operation: (tx: AuthPrismaTxClient) => Promise<T>) => Promise<T>;
 }
@@ -47,6 +77,13 @@ interface CreateUserWithTenantInput {
 interface RegisterResult {
 	userId: UserId;
 	tenantId: TenantId;
+}
+
+interface LoginUser {
+	userId: UserId;
+	tenantId: TenantId;
+	passwordHash: string;
+	role: "OWNER" | "ADMIN" | "MEMBER";
 }
 
 const isUniqueConstraintError = (error: unknown): error is { code: string } => {
@@ -111,5 +148,43 @@ export class UserRepository {
 
 			throw error;
 		}
+	}
+
+	async findUserForLogin(email: string): Promise<LoginUser | null> {
+		const normalizedEmail = email.trim().toLowerCase();
+		const user = await this.db.user.findUnique({
+			where: { email: normalizedEmail },
+			select: {
+				id: true,
+				tenantId: true,
+				passwordHash: true,
+				role: true
+			}
+		});
+
+		if (!user) {
+			return null;
+		}
+
+		return {
+			userId: user.id as UserId,
+			tenantId: user.tenantId as TenantId,
+			passwordHash: user.passwordHash,
+			role: user.role
+		};
+	}
+
+	async storeRefreshToken(input: {
+		userId: UserId;
+		refreshTokenHash: string;
+		expiresAt: Date;
+	}): Promise<void> {
+		await this.db.refreshToken.create({
+			data: {
+				userId: input.userId,
+				tokenHash: input.refreshTokenHash,
+				expiresAt: input.expiresAt
+			}
+		});
 	}
 }
