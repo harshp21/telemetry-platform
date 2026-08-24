@@ -14,6 +14,7 @@ You create a detailed execution plan for one task.
 - ALWAYS return a plan the parent agent can present before execution.
 - ALWAYS include business analysis context, not just technical steps.
 - ALWAYS provide a target plan file path under `docs/plans/`.
+- ALWAYS include a Stage Tracker block using state values: pending | in-progress | blocked | done.
 
 ## Approach
 1. Start from the task selected by `Epic Router`.
@@ -35,3 +36,10 @@ You create a detailed execution plan for one task.
 - Risks and mitigations
 - Pending tasks
 - Approval boundary: implementation starts only after user approval
+- Stage Tracker:
+	- Current stage: <stage-name> (<state>)
+	- Previous stage: <stage-name | none>
+	- Next stage: <stage-name | none>
+	- Blocker reason: <none | concise blocker>
+	- Pending tasks snapshot: <task: state, task: state>
+	- Evidence: <plan path | changed files | validation output | review findings>

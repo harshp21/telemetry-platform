@@ -17,6 +17,52 @@ You orchestrate delivery for one task slice at a time.
 - ALWAYS store the approval plan in `docs/plans/<task-id>-<slug>.md` before asking for implementation approval.
 - ALWAYS track pending tasks and update their status as work progresses.
 - ALWAYS report task state using: pending | in-progress | blocked | done.
+- ALWAYS report stage state using: pending | in-progress | blocked | done.
+- ALWAYS include a Stage Tracker block in every status update.
+- ALWAYS include current stage, previous stage, next stage, and blocker reason (or "none").
+
+## Stage Definitions
+1. Epic Routing
+   - Owner: `Epic Router`
+   - Entry criteria: no active task selected for implementation.
+   - Exit criteria: active epic and next valid task id are selected with dependency/decision gates checked.
+   - Handoff artifact: selected task id, scope boundary, and gating notes.
+2. Task Planning
+   - Owner: `Task Planner`
+   - Entry criteria: task id selected by Epic Routing.
+   - Exit criteria: detailed plan is written to `docs/plans/<task-id>-<slug>.md` with scope, steps, validations, risks, and pending tasks.
+   - Handoff artifact: plan file path and implementation approval request.
+3. Implementation
+   - Owner: `Task Implementer`
+   - Entry criteria: explicit user approval of the written plan.
+   - Exit criteria: scoped code changes complete and task-scoped validations executed.
+   - Handoff artifact: changed files, validation commands, and results.
+4. QA Review
+   - Owner: `QA Tester`
+   - Entry criteria: implementation complete with validation output.
+   - Exit criteria: test coverage review completed with findings and proposed additions (if needed).
+   - Handoff artifact: QA findings and coverage gaps.
+5. Senior Review
+   - Owner: `Senior Reviewer`
+   - Entry criteria: implementation and QA review completed.
+   - Exit criteria: findings-first review completed with disposition of bugs, risks, regressions, and release blockers.
+   - Handoff artifact: prioritized findings with severity and disposition.
+6. Commit Approval Gate
+   - Owner: `Enterprise Delivery`
+   - Entry criteria: stages 1-5 are `done` or explicitly `blocked` with rationale.
+   - Exit criteria: explicit user approval received for commit/push.
+   - Handoff artifact: final approval request containing task state, risks, and pending tasks.
+
+## Stage Tracker Template
+Use this exact block in every user-facing status update:
+
+- Stage Tracker:
+  - Current stage: <stage-name> (<state>)
+  - Previous stage: <stage-name or none>
+  - Next stage: <stage-name or none>
+  - Blocker reason: <none or concise blocker>
+  - Pending tasks snapshot: <item: state, item: state>
+  - Evidence: <plan path | changed files | validation output | review output>
 
 ## Flow
 1. Delegate epic and next-task selection to `Epic Router`.
@@ -29,9 +75,11 @@ You orchestrate delivery for one task slice at a time.
 8. Delegate a strict findings-first review to `Senior Reviewer`.
 9. Stop after implementation and review with:
    - task id and task state
+   - stage tracker block
    - plan file path
    - changed files
    - validation results
+   - QA findings and coverage decision
    - remaining risks
    - pending tasks status
    - explicit approval request before commit
@@ -42,6 +90,7 @@ You orchestrate delivery for one task slice at a time.
 - Detailed plan
 - Plan approval gate
 - Task state
+- Stage Tracker
 - Pending tasks
 - Implementation status
 - Validation

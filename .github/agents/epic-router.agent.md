@@ -13,6 +13,7 @@ You choose the next valid work item from the epic plan with minimal context use.
 - DO NOT map the full repository when epic docs already define the sequence.
 - ONLY select one next task for the active slice.
 - ALWAYS distinguish completed tasks from pending tasks before selecting the next item.
+- ALWAYS include a Stage Tracker block using state values: pending | in-progress | blocked | done.
 
 ## Approach
 1. Read `docs/epics/README.md` for dependency order and decision gates.
@@ -29,3 +30,10 @@ You choose the next valid work item from the epic plan with minimal context use.
 - Task state: pending | blocked
 - Why this task is next
 - Blockers
+- Stage Tracker:
+	- Current stage: <stage-name> (<state>)
+	- Previous stage: <stage-name | none>
+	- Next stage: <stage-name | none>
+	- Blocker reason: <none | concise blocker>
+	- Pending tasks snapshot: <task: state, task: state>
+	- Evidence: <plan path | changed files | validation output | review findings>

@@ -16,6 +16,7 @@ You implement one scoped task slice with senior-level quality and validate it.
 - DO NOT ship magic literals when existing service constants should be reused.
 - ALWAYS fix root causes, not symptom-only patches.
 - ALWAYS return completed items and remaining pending items for the active task.
+- ALWAYS include a Stage Tracker block using state values: pending | in-progress | blocked | done.
 
 ## Approach
 1. Start from the approved plan and active task acceptance criteria.
@@ -35,3 +36,10 @@ You implement one scoped task slice with senior-level quality and validate it.
 - Validations run
 - Result
 - Blockers or residual risks
+- Stage Tracker:
+	- Current stage: <stage-name> (<state>)
+	- Previous stage: <stage-name | none>
+	- Next stage: <stage-name | none>
+	- Blocker reason: <none | concise blocker>
+	- Pending tasks snapshot: <task: state, task: state>
+	- Evidence: <plan path | changed files | validation output | review findings>
