@@ -6,6 +6,17 @@ import {
   GATEWAY_ROUTES,
   GATEWAY_SERVICE_NAME
 } from "./constants";
+import { registerGatewayProxyRoutes } from "./plugins/proxy.plugin";
+
+const getRequiredEnv = (key: string): string => {
+  const value = process.env[key];
+
+  if (!value) {
+    throw new Error(`Missing required gateway environment variable: ${key}`);
+  }
+
+  return value;
+};
 
 export const buildGatewayApp = (): FastifyInstance => {
   const app = Fastify({ logger: true });
@@ -26,6 +37,13 @@ export const buildGatewayApp = (): FastifyInstance => {
       service: container.serviceName,
       version: GATEWAY_RESPONSES.VERSION_V1
     };
+  });
+
+  registerGatewayProxyRoutes(app, {
+    authServiceUrl: getRequiredEnv("AUTH_SERVICE_URL"),
+    usageServiceUrl: getRequiredEnv("USAGE_SERVICE_URL"),
+    billingServiceUrl: getRequiredEnv("BILLING_SERVICE_URL"),
+    analyticsServiceUrl: getRequiredEnv("ANALYTICS_SERVICE_URL")
   });
 
   return app;

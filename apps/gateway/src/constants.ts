@@ -5,6 +5,13 @@ export const GATEWAY_ROUTES = {
   V1_HEALTH: "/v1/health"
 } as const;
 
+export const GATEWAY_PROXY_PREFIXES = {
+  AUTH: "/v1/auth",
+  USAGE: "/v1/usage",
+  BILLING: "/v1/billing",
+  ANALYTICS: "/v1/analytics"
+} as const;
+
 export const GATEWAY_RESPONSES = {
   STATUS_OK: "ok",
   VERSION_V1: "v1"

@@ -11,6 +11,8 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@fastify/http-proxy": "^11.6.1",
+    "@opentelemetry/api": "^1.9.0",
     "@prisma/client": "^6.1.0",
     "@telemetry/shared-config": "workspace:*",
     "@telemetry/shared-logger": "workspace:*",
@@ -21,8 +23,7 @@
     "fastify": "^5.0.0",
     "ioredis": "^5.4.1",
     "pino": "^9.4.0",
-    "zod": "^3.23.8",
-    "@opentelemetry/api": "^1.9.0"
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "prisma": "^6.1.0",
