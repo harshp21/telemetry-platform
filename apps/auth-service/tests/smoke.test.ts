@@ -20,6 +20,7 @@ const registerMock = vi.fn();
 const loginMock = vi.fn();
 const refreshMock = vi.fn();
 const logoutMock = vi.fn();
+const isTokenJtiDenylistedMock = vi.fn();
 const TEST_JWT_SECRET = "test-jwt-secret-value-with-at-least-32-characters";
 
 const createAccessTokenFixture = async (): Promise<string> => {
@@ -37,6 +38,36 @@ const createAccessTokenFixture = async (): Promise<string> => {
     .sign(secretKey);
 };
 
+const createExpiredAccessTokenFixture = async (): Promise<string> => {
+  const secretKey = new TextEncoder().encode(TEST_JWT_SECRET);
+
+  return new SignJWT({
+    tenantId: "tenant_1",
+    role: "OWNER"
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject("user_1")
+    .setJti("expired_jti_1")
+    .setIssuedAt()
+    .setExpirationTime("-1s")
+    .sign(secretKey);
+};
+
+const createInvalidSignatureTokenFixture = async (): Promise<string> => {
+  const wrongSecretKey = new TextEncoder().encode("different-secret-value-with-at-least-32");
+
+  return new SignJWT({
+    tenantId: "tenant_1",
+    role: "OWNER"
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject("user_1")
+    .setJti("invalid_signature_jti_1")
+    .setIssuedAt()
+    .setExpirationTime("15m")
+    .sign(wrongSecretKey);
+};
+
 vi.mock("../src/services/auth.service", () => {
   return {
     AuthService: class {
@@ -44,6 +75,14 @@ vi.mock("../src/services/auth.service", () => {
       login = loginMock;
       refresh = refreshMock;
       logout = logoutMock;
+    }
+  };
+});
+
+vi.mock("../src/services/token-denylist.service", () => {
+  return {
+    TokenDenylistService: class {
+      isTokenJtiDenylisted = isTokenJtiDenylistedMock;
     }
   };
 });
@@ -57,6 +96,8 @@ describe("auth-service", () => {
     loginMock.mockReset();
     refreshMock.mockReset();
     logoutMock.mockReset();
+    isTokenJtiDenylistedMock.mockReset();
+    isTokenJtiDenylistedMock.mockResolvedValue(false);
     app = buildAuthServiceApp();
   });
 
@@ -311,8 +352,83 @@ describe("auth-service", () => {
 
     expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
     expect(response.json()).toEqual({
-      code: AUTH_RESPONSES.CODE_UNAUTHORIZED,
-      message: AUTH_MESSAGES.UNAUTHORIZED
+      code: AUTH_RESPONSES.CODE_TOKEN_MISSING,
+      message: AUTH_MESSAGES.TOKEN_MISSING
+    });
+    expect(logoutMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when logout authorization header is malformed", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGOUT}`,
+      headers: {
+        authorization: "Basic malformed"
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_TOKEN_MISSING,
+      message: AUTH_MESSAGES.TOKEN_MISSING
+    });
+    expect(logoutMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when logout token is expired", async () => {
+    const expiredToken = await createExpiredAccessTokenFixture();
+
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGOUT}`,
+      headers: {
+        authorization: `Bearer ${expiredToken}`
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_TOKEN_EXPIRED,
+      message: AUTH_MESSAGES.TOKEN_EXPIRED
+    });
+    expect(logoutMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when logout token signature is invalid", async () => {
+    const invalidSignatureToken = await createInvalidSignatureTokenFixture();
+
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGOUT}`,
+      headers: {
+        authorization: `Bearer ${invalidSignatureToken}`
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_TOKEN_INVALID,
+      message: AUTH_MESSAGES.TOKEN_INVALID
+    });
+    expect(logoutMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when logout token has been denylisted", async () => {
+    isTokenJtiDenylistedMock.mockResolvedValueOnce(true);
+    const accessToken = await createAccessTokenFixture();
+
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGOUT}`,
+      headers: {
+        authorization: `Bearer ${accessToken}`
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_TOKEN_REVOKED,
+      message: AUTH_MESSAGES.TOKEN_REVOKED
     });
     expect(logoutMock).not.toHaveBeenCalled();
   });

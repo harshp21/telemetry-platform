@@ -5,7 +5,7 @@ import type {
 	RefreshRequestBody,
 	RegisterRequestBody
 } from "../controllers/auth.controller";
-import { requireLogoutAuth } from "../plugins/logout-auth.plugin";
+import { requireJwtAuth } from "../plugins/jwt.plugin";
 
 export const registerAuthRoutes = async (app: FastifyInstance): Promise<void> => {
 	app.post<{ Body: RegisterRequestBody }>(AUTH_ROUTES.REGISTER, async (request, reply) => {
@@ -26,7 +26,7 @@ export const registerAuthRoutes = async (app: FastifyInstance): Promise<void> =>
 		return refreshHandler(request, reply);
 	});
 
-	app.post(AUTH_ROUTES.LOGOUT, { preHandler: [requireLogoutAuth] }, async (request, reply) => {
+	app.post(AUTH_ROUTES.LOGOUT, { preHandler: [requireJwtAuth] }, async (request, reply) => {
 		const { logoutHandler } = await import("../controllers/auth.controller");
 
 		return logoutHandler(request, reply);

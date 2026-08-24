@@ -42,3 +42,43 @@ export class UnauthorizedError extends AppError {
 		);
 	}
 }
+
+export class MissingOrMalformedTokenError extends AppError {
+	constructor() {
+		super(
+			AUTH_RESPONSES.CODE_TOKEN_MISSING,
+			AUTH_HTTP_STATUS.UNAUTHORIZED,
+			AUTH_MESSAGES.TOKEN_MISSING
+		);
+	}
+}
+
+export class InvalidTokenError extends AppError {
+	constructor() {
+		super(
+			AUTH_RESPONSES.CODE_TOKEN_INVALID,
+			AUTH_HTTP_STATUS.UNAUTHORIZED,
+			AUTH_MESSAGES.TOKEN_INVALID
+		);
+	}
+}
+
+export class ExpiredTokenError extends AppError {
+	constructor() {
+		super(
+			AUTH_RESPONSES.CODE_TOKEN_EXPIRED,
+			AUTH_HTTP_STATUS.UNAUTHORIZED,
+			AUTH_MESSAGES.TOKEN_EXPIRED
+		);
+	}
+}
+
+export class RevokedTokenError extends AppError {
+	constructor() {
+		super(
+			AUTH_RESPONSES.CODE_TOKEN_REVOKED,
+			AUTH_HTTP_STATUS.UNAUTHORIZED,
+			AUTH_MESSAGES.TOKEN_REVOKED
+		);
+	}
+}
