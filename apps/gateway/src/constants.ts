@@ -12,6 +12,10 @@ export const GATEWAY_PROXY_PREFIXES = {
   ANALYTICS: "/v1/analytics"
 } as const;
 
+export const GATEWAY_USAGE_ROUTES = {
+  EVENTS: `${GATEWAY_PROXY_PREFIXES.USAGE}/events`
+} as const;
+
 export const GATEWAY_AUTH_ROUTES = {
   REGISTER: `${GATEWAY_PROXY_PREFIXES.AUTH}/register`,
   LOGIN: `${GATEWAY_PROXY_PREFIXES.AUTH}/login`,
@@ -28,7 +32,8 @@ export const GATEWAY_PUBLIC_ROUTES = [
 
 export const GATEWAY_RESPONSES = {
   STATUS_OK: "ok",
-  VERSION_V1: "v1"
+  VERSION_V1: "v1",
+  CODE_RATE_LIMIT_EXCEEDED: "RATE_LIMIT_EXCEEDED"
 } as const;
 
 export const GATEWAY_RUNTIME = {

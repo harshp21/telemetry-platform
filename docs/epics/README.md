@@ -101,6 +101,21 @@ Epic 7 — Worker (event → UsageLine in DB)
 
 After critical path: Epic 8 → Epic 9 → Epic 11 → v1 complete.
 
+## V1 scale envelope
+
+Apply these constraints while implementing all epics and plans:
+
+- Average API traffic target: ~1,000 requests/sec.
+- Peak API traffic target: 5,000 requests/sec.
+- Peak usage event target: 5,000 events/sec.
+- Maximum events per ingestion request: 100.
+- Maximum event payload size: 10 KB.
+- Dashboard freshness target: 1-5 seconds.
+- API availability target: 99.9%.
+- Deployment model: single-region, single PostgreSQL cluster, asynchronous processing.
+
+For details and assumptions, see the Scale constraints section in `docs/architecture-overview.md`.
+
 ---
 
 ## Story count by epic

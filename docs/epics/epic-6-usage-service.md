@@ -31,7 +31,7 @@ export const EnvSchema = z.object({
   LOG_LEVEL: z.string().default("info"),
   REDIS_STREAM_NAME: z.string().default("telemetry:events"),
   STREAM_MAX_LEN: z.coerce.number().int().positive().default(100_000),
-  INGEST_BATCH_MAX: z.coerce.number().int().min(1).max(1000).default(100),
+  INGEST_BATCH_MAX: z.coerce.number().int().min(1).max(100).default(100),
 });
 ```
 
@@ -59,6 +59,7 @@ export const EnvSchema = z.object({
 
 **Validation**:
 - Batch size: `1 ≤ events.length ≤ INGEST_BATCH_MAX` — `400` if exceeded
+- Event payload cap: serialized `metadata` + envelope for each event must stay within 10 KB — `400` if exceeded
 - `occurredAt` must not be more than 24h in the future (clock skew tolerance)
 - `quantity` must be positive and finite
 

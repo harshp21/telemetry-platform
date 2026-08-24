@@ -12,11 +12,13 @@ export const EnvSchema = z.object({
   USAGE_SERVICE_URL: z.string().url(),
   BILLING_SERVICE_URL: z.string().url(),
   ANALYTICS_SERVICE_URL: z.string().url(),
-  RATE_LIMIT_MAX: z.coerce.number().int().positive().default(100),
-  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
-  INGESTION_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(30)
+  RATE_LIMIT_MAX: z.coerce.number().int().positive().default(1000),
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(1000),
+  INGESTION_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5000)
 });
 
 export type ServiceEnv = z.infer<typeof EnvSchema>;
 
-export const env = parseEnv(EnvSchema, process.env);
+export const loadEnv = (): ServiceEnv => {
+  return parseEnv(EnvSchema, process.env) as ServiceEnv;
+};

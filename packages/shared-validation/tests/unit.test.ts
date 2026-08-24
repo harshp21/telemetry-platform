@@ -115,7 +115,23 @@ describe("shared-validation schemas", () => {
     };
 
     const parsed = UsageEventsBatchSchema.safeParse({
-      events: Array.from({ length: 1001 }, () => event)
+      events: Array.from({ length: 101 }, () => event)
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects event payload over 10KB", () => {
+    const parsed = UsageEventsBatchSchema.safeParse({
+      events: [
+        {
+          ...baseEnvelope,
+          eventType: "unknown.event",
+          payload: {
+            oversized: "x".repeat(11 * 1024)
+          }
+        }
+      ]
     });
 
     expect(parsed.success).toBe(false);

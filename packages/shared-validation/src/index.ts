@@ -3,6 +3,9 @@ import { z } from "zod";
 export const packageName = "@telemetry/shared-validation";
 export const packageDescription = "Shared Zod schemas and validators";
 
+const MAX_EVENTS_PER_BATCH = 100;
+const MAX_EVENT_SIZE_BYTES = 10 * 1024;
+
 type Brand<T, B extends string> = T & { readonly __brand: B };
 type EventId = Brand<string, "EventId">;
 type TenantId = Brand<string, "TenantId">;
@@ -110,7 +113,24 @@ export const TelemetryEventEnvelopeSchema = z.union([
 ]);
 
 export const UsageEventsBatchSchema = z.object({
-	events: z.array(TelemetryEventEnvelopeSchema).min(1).max(1000)
+	events: z
+		.array(TelemetryEventEnvelopeSchema)
+		.min(1)
+		.max(MAX_EVENTS_PER_BATCH)
+		.superRefine((events, context) => {
+			events.forEach((event, index) => {
+				const serialized = JSON.stringify(event);
+				const byteLength = new TextEncoder().encode(serialized).length;
+
+				if (byteLength > MAX_EVENT_SIZE_BYTES) {
+					context.addIssue({
+						code: z.ZodIssueCode.custom,
+						path: [index],
+						message: `event payload exceeds ${MAX_EVENT_SIZE_BYTES} bytes`
+					});
+				}
+			});
+		})
 });
 
 export type TelemetryEventEnvelope = z.infer<typeof TelemetryEventEnvelopeSchema>;

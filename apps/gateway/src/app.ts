@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { createContainer } from "./config/container";
+import { loadEnv } from "./config/env";
 import {
   GATEWAY_RESPONSES,
   GATEWAY_ROUTES,
@@ -8,23 +9,22 @@ import {
 } from "./constants";
 import { gatewayJwtAuthPreHandler } from "./middleware/auth.middleware";
 import { registerGatewayProxyRoutes } from "./plugins/proxy.plugin";
-
-const getRequiredEnv = (key: string): string => {
-  const value = process.env[key];
-
-  if (!value) {
-    throw new Error(`Missing required gateway environment variable: ${key}`);
-  }
-
-  return value;
-};
+import { registerGatewayRateLimit } from "./plugins/rate-limit.plugin";
 
 export const buildGatewayApp = (): FastifyInstance => {
   const app = Fastify({ logger: true });
   const container = createContainer(GATEWAY_SERVICE_NAME);
+  const config = loadEnv();
 
   registerGlobalErrorHandler(app);
-  app.addHook("preHandler", gatewayJwtAuthPreHandler);
+  app.addHook("onRequest", gatewayJwtAuthPreHandler);
+  registerGatewayRateLimit(app, {
+    redisUrl: config.REDIS_URL,
+    nodeEnv: config.NODE_ENV,
+    rateLimitMax: config.RATE_LIMIT_MAX,
+    rateLimitWindowMs: config.RATE_LIMIT_WINDOW_MS,
+    ingestionRateLimitMax: config.INGESTION_RATE_LIMIT_MAX
+  });
 
   app.get(GATEWAY_ROUTES.HEALTH, async () => {
     return {
@@ -42,10 +42,10 @@ export const buildGatewayApp = (): FastifyInstance => {
   });
 
   registerGatewayProxyRoutes(app, {
-    authServiceUrl: getRequiredEnv("AUTH_SERVICE_URL"),
-    usageServiceUrl: getRequiredEnv("USAGE_SERVICE_URL"),
-    billingServiceUrl: getRequiredEnv("BILLING_SERVICE_URL"),
-    analyticsServiceUrl: getRequiredEnv("ANALYTICS_SERVICE_URL")
+    authServiceUrl: config.AUTH_SERVICE_URL,
+    usageServiceUrl: config.USAGE_SERVICE_URL,
+    billingServiceUrl: config.BILLING_SERVICE_URL,
+    analyticsServiceUrl: config.ANALYTICS_SERVICE_URL
   });
 
   return app;

@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@fastify/http-proxy": "^11.6.1",
+    "@fastify/rate-limit": "^11.2.0",
     "@opentelemetry/api": "^1.9.0",
     "@prisma/client": "^6.1.0",
     "@telemetry/shared-config": "workspace:*",

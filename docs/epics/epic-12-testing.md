@@ -86,6 +86,11 @@ describe("smoke", () => {
   run: pnpm test:smoke
 ```
 
+**Operational assumptions**:
+- Docker Compose must provide Postgres, Redis, and all upstream service endpoints before smoke tests start.
+- Smoke tests should stay health-only and avoid asserting behavior that depends on cross-service business state.
+- Any service-level proxy or auth changes should be validated in the relevant service test suite, not by expanding smoke scope.
+
 ---
 
 ## T-069 · k6 load test: ingestion path
@@ -99,12 +104,19 @@ describe("smoke", () => {
 ```js
 export const options = {
   scenarios: {
-    sustained: {
+    averageLoad: {
       executor: "constant-arrival-rate",
-      rate: 500,          // 500 req/s
+      rate: 1000,         // ~1,000 req/s average target
+      timeUnit: "1s",
+      duration: "5m",
+      preAllocatedVUs: 200,
+    },
+    peakSpike: {
+      executor: "constant-arrival-rate",
+      rate: 5000,         // 5,000 req/s peak target
       timeUnit: "1s",
       duration: "60s",
-      preAllocatedVUs: 50,
+      preAllocatedVUs: 1000,
     },
   },
   thresholds: {
@@ -114,11 +126,16 @@ export const options = {
 };
 ```
 
-**Payload**: Batch of 10 events per request (`quantity` random 1–1000, `eventType` one of 5 types).
+**Payload**: Batch of up to 100 events per request, max 10 KB payload per event (`quantity` random 1–1000, `eventType` one of 5 types).
 
 **Post-run assertions** (manual or scripted):
 - Dead-letter stream length = 0
 - No `UsageLine` records with `billed = false` older than 60s (worker kept up)
+
+**Operational assumptions**:
+- The load test is a staging or dedicated perf-environment gate, not a default CI job.
+- Redis Streams, worker throughput, and Postgres write capacity must be provisioned to the documented v1 envelope before treating the result as representative.
+- Report p99 and failure-rate regressions separately from functional smoke results.
 
 ---
 
@@ -141,3 +158,8 @@ export const options = {
 - start required infra dependencies for auth tests
 - apply Prisma migrations before auth coverage run
 - fail the workflow if auth coverage thresholds are not met
+
+**Operational assumptions**:
+- Coverage gates should run only after the service environment can boot with its required database and cache dependencies.
+- Keep auth coverage thresholds scoped to auth-service first, then replicate the same CI pattern to the other services.
+- Treat coverage as a quality gate, not a substitute for smoke or integration verification.
