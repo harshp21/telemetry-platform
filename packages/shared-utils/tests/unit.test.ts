@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppError, ERROR_RESPONSES } from "@telemetry/shared-types";
+import { z } from "zod";
 import {
   chunkArray,
   formatBytes,
@@ -12,9 +13,12 @@ import {
 } from "../src";
 
 describe("shared-utils", () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+
   afterEach(() => {
     vi.restoreAllMocks();
     vi.useRealTimers();
+    process.env.NODE_ENV = originalNodeEnv;
   });
 
   it("generates deterministic idempotency key for same inputs", () => {
@@ -55,6 +59,10 @@ describe("shared-utils", () => {
 
   it("throws for invalid chunk size", () => {
     expect(() => chunkArray([1, 2], 0)).toThrow("size must be a positive integer");
+  });
+
+  it("returns empty chunk list for empty input", () => {
+    expect(chunkArray([], 5)).toEqual([]);
   });
 
   it("resolves sleep after requested delay", async () => {
@@ -154,6 +162,43 @@ describe("shared-utils", () => {
     });
   });
 
+  it("normalizes ZodError responses through the global handler", async () => {
+    const app = Fastify({ logger: false });
+    registerGlobalErrorHandler(app);
+    app.get("/zod", async () => {
+      const parsed = z.object({ count: z.number().int().positive() }).safeParse({ count: -1 });
+      if (!parsed.success) {
+        throw parsed.error;
+      }
+    });
+
+    const response = await app.inject({ method: "GET", url: "/zod" });
+
+    await app.close();
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      code: ERROR_RESPONSES.CODE_VALIDATION_ERROR
+    });
+  });
+
+  it("maps Prisma duplicate-key errors to conflict responses", async () => {
+    const app = Fastify({ logger: false });
+    registerGlobalErrorHandler(app);
+    app.get("/prisma-conflict", async () => {
+      throw Object.assign(new Error("duplicate"), { code: "P2002" });
+    });
+
+    const response = await app.inject({ method: "GET", url: "/prisma-conflict" });
+
+    await app.close();
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      code: ERROR_RESPONSES.CODE_CONFLICT
+    });
+  });
+
   it("normalizes unexpected errors through the global handler", async () => {
     const app = Fastify({ logger: false });
     registerGlobalErrorHandler(app);
@@ -169,6 +214,25 @@ describe("shared-utils", () => {
     expect(response.json()).toMatchObject({
       code: ERROR_RESPONSES.CODE_INTERNAL_ERROR,
       message: "boom"
+    });
+  });
+
+  it("hides internal error message in production mode", async () => {
+    process.env.NODE_ENV = "production";
+
+    const app = Fastify({ logger: false });
+    registerGlobalErrorHandler(app);
+    app.get("/boom-prod", async () => {
+      throw new Error("boom-prod");
+    });
+
+    const response = await app.inject({ method: "GET", url: "/boom-prod" });
+
+    await app.close();
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({
+      code: ERROR_RESPONSES.CODE_INTERNAL_ERROR
     });
   });
 });

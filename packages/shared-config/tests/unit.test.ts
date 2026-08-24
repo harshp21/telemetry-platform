@@ -21,4 +21,26 @@ describe("shared-config", () => {
     expect(parsed.PORT).toBe(3001);
     expect(Object.isFrozen(parsed)).toBe(true);
   });
+
+  it("includes nested field path in validation errors", () => {
+    const schema = z.object({
+      DATABASE: z.object({
+        URL: z.string().url()
+      })
+    });
+
+    expect(() => parseEnv(schema, { DATABASE: "not-an-object" })).toThrow("DATABASE");
+  });
+
+  it("prevents top-level mutation on parsed env", () => {
+    const schema = z.object({
+      LOG_LEVEL: z.string().min(1)
+    });
+
+    const parsed = parseEnv(schema, { LOG_LEVEL: "info" });
+
+    expect(() => {
+      Object.assign(parsed, { LOG_LEVEL: "debug" });
+    }).toThrow();
+  });
 });

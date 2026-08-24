@@ -123,4 +123,25 @@ describe("createLogger", () => {
     expect(debugLines.length).toBe(1);
     expect(debugLines[0]?.level).toBe("debug");
   });
+
+  it("falls back to info when LOG_LEVEL is blank and omits trace fields without span", () => {
+    process.env.LOG_LEVEL = "   ";
+
+    const stream = new PassThrough();
+    const chunks: string[] = [];
+    stream.on("data", (chunk: Buffer) => {
+      chunks.push(chunk.toString("utf8"));
+    });
+
+    const logger = createLogger("analytics-service", stream);
+    logger.debug("debug hidden");
+    logger.info("info shown");
+
+    const lines = parseLogLines(chunks);
+
+    expect(lines.length).toBe(1);
+    expect(lines[0]?.level).toBe("info");
+    expect(lines[0]?.traceId).toBeUndefined();
+    expect(lines[0]?.spanId).toBeUndefined();
+  });
 });
