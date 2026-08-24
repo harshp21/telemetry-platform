@@ -2,7 +2,6 @@ import type { FastifyInstance } from "fastify";
 import { AUTH_ROUTES } from "../constants";
 import type {
 	LoginRequestBody,
-	RefreshRequestBody,
 	RegisterRequestBody
 } from "../controllers/auth.controller";
 import { requireJwtAuth } from "../plugins/jwt.plugin";
@@ -20,7 +19,7 @@ export const registerAuthRoutes = async (app: FastifyInstance): Promise<void> =>
 		return loginHandler(request, reply);
 	});
 
-	app.post<{ Body: RefreshRequestBody }>(AUTH_ROUTES.REFRESH, async (request, reply) => {
+	app.post(AUTH_ROUTES.REFRESH, async (request, reply) => {
 		const { refreshHandler } = await import("../controllers/auth.controller");
 
 		return refreshHandler(request, reply);

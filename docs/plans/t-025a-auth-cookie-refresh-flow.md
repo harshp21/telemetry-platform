@@ -69,13 +69,13 @@
   - Mitigation: document domain/path/same-site requirements and verify via smoke tests.
 
 ## 7. Pending tasks with state
-- [pending] Add cookie and CSRF constants/config
-- [pending] Implement refresh-cookie helpers
-- [pending] Refactor login/refresh/logout controller behavior
-- [pending] Add CSRF enforcement for cookie session endpoints
-- [pending] Update smoke tests for cookie lifecycle
-- [pending] Run auth-service test/lint/typecheck
-- [pending] Summarize outcomes and request commit approval
+- [done] Add cookie and CSRF constants/config
+- [done] Implement refresh-cookie helpers
+- [done] Refactor login/refresh/logout controller behavior
+- [done] Add CSRF enforcement for cookie session endpoints
+- [done] Update smoke tests for cookie lifecycle
+- [done] Run auth-service test/lint/typecheck
+- [in-progress] Summarize outcomes and request commit approval
 
 ## 8. Dependencies and sequencing
 - Depends on completion of T-022 for shared JWT verification plugin hardening.

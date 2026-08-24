@@ -4,6 +4,7 @@ import { SignJWT } from "jose";
 import { ERROR_RESPONSES } from "@telemetry/shared-types";
 import { buildAuthServiceApp } from "../src/app";
 import {
+  AUTH_COOKIES,
   AUTH_MESSAGES,
   AUTH_HTTP_STATUS,
   AUTH_RESPONSES,
@@ -22,6 +23,7 @@ const refreshMock = vi.fn();
 const logoutMock = vi.fn();
 const isTokenJtiDenylistedMock = vi.fn();
 const TEST_JWT_SECRET = "test-jwt-secret-value-with-at-least-32-characters";
+const TEST_CSRF_TOKEN = "csrf-token-fixture";
 
 const createAccessTokenFixture = async (): Promise<string> => {
   const secretKey = new TextEncoder().encode(TEST_JWT_SECRET);
@@ -90,8 +92,23 @@ vi.mock("../src/services/token-denylist.service", () => {
 describe("auth-service", () => {
   let app: FastifyInstance;
 
+  const extractSetCookies = (response: Awaited<ReturnType<FastifyInstance["inject"]>>): string[] => {
+    const setCookieHeader = response.headers["set-cookie"];
+    if (!setCookieHeader) {
+      return [];
+    }
+
+    return Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
+  };
+
+  const buildSessionCookieHeader = (refreshToken: string, csrfToken = TEST_CSRF_TOKEN): string => {
+    return `${AUTH_COOKIES.REFRESH_COOKIE_NAME_DEFAULT}=${refreshToken}; ${AUTH_COOKIES.CSRF_COOKIE_NAME_DEFAULT}=${csrfToken}`;
+  };
+
   beforeEach(() => {
     process.env.JWT_SECRET = TEST_JWT_SECRET;
+    process.env.AUTH_COOKIE_SECURE = "false";
+    process.env.AUTH_COOKIE_SAME_SITE = "Lax";
     registerMock.mockReset();
     loginMock.mockReset();
     refreshMock.mockReset();
@@ -198,10 +215,19 @@ describe("auth-service", () => {
     });
 
     expect(response.statusCode).toBe(AUTH_HTTP_STATUS.OK);
+    const setCookies = extractSetCookies(response);
+    const refreshCookie = setCookies.find((cookie) =>
+      cookie.startsWith(`${AUTH_COOKIES.REFRESH_COOKIE_NAME_DEFAULT}=`)
+    );
+    const csrfCookie = setCookies.find((cookie) =>
+      cookie.startsWith(`${AUTH_COOKIES.CSRF_COOKIE_NAME_DEFAULT}=`)
+    );
+    expect(refreshCookie).toBeDefined();
+    expect(refreshCookie).toContain("HttpOnly");
+    expect(csrfCookie).toBeDefined();
     expect(response.json()).toEqual({
       data: {
         accessToken: "access_token",
-        refreshToken: "refresh_token",
         tokenType: "Bearer",
         expiresInSeconds: 900,
         user: {
@@ -265,16 +291,23 @@ describe("auth-service", () => {
     const response = await app.inject({
       method: "POST",
       url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REFRESH}`,
-      payload: {
-        refreshToken: "refresh_token"
+      headers: {
+        cookie: buildSessionCookieHeader("refresh_token"),
+        [AUTH_COOKIES.CSRF_HEADER_NAME_DEFAULT]: TEST_CSRF_TOKEN
       }
     });
 
     expect(response.statusCode).toBe(AUTH_HTTP_STATUS.OK);
+    expect(refreshMock).toHaveBeenCalledWith({ refreshToken: "refresh_token" });
+    const setCookies = extractSetCookies(response);
+    const refreshCookie = setCookies.find((cookie) =>
+      cookie.startsWith(`${AUTH_COOKIES.REFRESH_COOKIE_NAME_DEFAULT}=`)
+    );
+    expect(refreshCookie).toBeDefined();
+    expect(refreshCookie).toContain(`${AUTH_COOKIES.REFRESH_COOKIE_NAME_DEFAULT}=next_refresh_token`);
     expect(response.json()).toEqual({
       data: {
         accessToken: "next_access_token",
-        refreshToken: "next_refresh_token",
         tokenType: "Bearer",
         expiresInSeconds: 900,
         user: {
@@ -292,8 +325,9 @@ describe("auth-service", () => {
     const response = await app.inject({
       method: "POST",
       url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REFRESH}`,
-      payload: {
-        refreshToken: "bad_refresh_token"
+      headers: {
+        cookie: buildSessionCookieHeader("bad_refresh_token"),
+        [AUTH_COOKIES.CSRF_HEADER_NAME_DEFAULT]: TEST_CSRF_TOKEN
       }
     });
 
@@ -304,18 +338,36 @@ describe("auth-service", () => {
     });
   });
 
-  it("returns 400 for invalid refresh payload", async () => {
+  it("returns 401 for missing refresh-token cookie", async () => {
     const response = await app.inject({
       method: "POST",
       url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REFRESH}`,
-      payload: {
-        refreshToken: ""
+      headers: {
+        [AUTH_COOKIES.CSRF_HEADER_NAME_DEFAULT]: TEST_CSRF_TOKEN
       }
     });
 
-    expect(response.statusCode).toBe(400);
-    expect(response.json()).toMatchObject({
-      code: ERROR_RESPONSES.CODE_VALIDATION_ERROR
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_REFRESH_TOKEN_INVALID,
+      message: AUTH_MESSAGES.INVALID_REFRESH_TOKEN
+    });
+    expect(refreshMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when refresh CSRF token is missing", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REFRESH}`,
+      headers: {
+        cookie: buildSessionCookieHeader("refresh_token")
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_CSRF_INVALID,
+      message: AUTH_MESSAGES.CSRF_INVALID
     });
     expect(refreshMock).not.toHaveBeenCalled();
   });
@@ -327,11 +379,24 @@ describe("auth-service", () => {
       method: "POST",
       url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGOUT}`,
       headers: {
-        authorization: `Bearer ${accessToken}`
+        authorization: `Bearer ${accessToken}`,
+        cookie: buildSessionCookieHeader("refresh_token"),
+        [AUTH_COOKIES.CSRF_HEADER_NAME_DEFAULT]: TEST_CSRF_TOKEN
       }
     });
 
     expect(response.statusCode).toBe(AUTH_HTTP_STATUS.NO_CONTENT);
+    const setCookies = extractSetCookies(response);
+    const refreshCookie = setCookies.find((cookie) =>
+      cookie.startsWith(`${AUTH_COOKIES.REFRESH_COOKIE_NAME_DEFAULT}=`)
+    );
+    const csrfCookie = setCookies.find((cookie) =>
+      cookie.startsWith(`${AUTH_COOKIES.CSRF_COOKIE_NAME_DEFAULT}=`)
+    );
+    expect(refreshCookie).toBeDefined();
+    expect(refreshCookie).toContain("Max-Age=0");
+    expect(csrfCookie).toBeDefined();
+    expect(csrfCookie).toContain("Max-Age=0");
     expect(response.body).toBe("");
     expect(logoutMock).toHaveBeenCalledTimes(1);
     expect(logoutMock).toHaveBeenCalledWith(
@@ -354,6 +419,27 @@ describe("auth-service", () => {
     expect(response.json()).toEqual({
       code: AUTH_RESPONSES.CODE_TOKEN_MISSING,
       message: AUTH_MESSAGES.TOKEN_MISSING
+    });
+    expect(logoutMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when logout CSRF token is invalid", async () => {
+    const accessToken = await createAccessTokenFixture();
+
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGOUT}`,
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        cookie: buildSessionCookieHeader("refresh_token", "csrf-cookie-token"),
+        [AUTH_COOKIES.CSRF_HEADER_NAME_DEFAULT]: "csrf-header-token"
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_CSRF_INVALID,
+      message: AUTH_MESSAGES.CSRF_INVALID
     });
     expect(logoutMock).not.toHaveBeenCalled();
   });

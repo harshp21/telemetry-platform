@@ -43,6 +43,16 @@ export class UnauthorizedError extends AppError {
 	}
 }
 
+export class CsrfValidationError extends AppError {
+	constructor() {
+		super(
+			AUTH_RESPONSES.CODE_CSRF_INVALID,
+			AUTH_HTTP_STATUS.UNAUTHORIZED,
+			AUTH_MESSAGES.CSRF_INVALID
+		);
+	}
+}
+
 export class MissingOrMalformedTokenError extends AppError {
 	constructor() {
 		super(
