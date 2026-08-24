@@ -182,3 +182,22 @@ app.register(async (router) => {
 - JWT plugin rejects denylisted JTI → `401 TOKEN_REVOKED`
 
 **Setup**: Use Docker Compose test database. Truncate `User`, `Tenant`, `RefreshToken` tables in `beforeEach`.
+
+---
+
+## T-025A · Browser refresh-cookie + CSRF hardening
+
+**Plan**: `docs/plans/t-025a-auth-cookie-refresh-flow.md`
+
+**Story**: Harden browser session handling by moving refresh-token transport to HttpOnly cookie while preserving Bearer access-token verification.
+
+**Scope highlights**:
+- Login sets refresh token cookie with secure attributes.
+- Refresh rotates token via cookie flow.
+- Logout clears refresh cookie while retaining denylist + refresh-token revocation.
+- Add CSRF protection checks for cookie-authenticated session mutation endpoints.
+
+**Validation**:
+- `pnpm --filter @telemetry/auth-service test`
+- `pnpm --filter @telemetry/auth-service lint`
+- `pnpm --filter @telemetry/auth-service typecheck`
