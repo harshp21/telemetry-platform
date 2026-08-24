@@ -58,7 +58,10 @@ jobs:
         run: pnpm install --frozen-lockfile=false
 
       - name: Apply Prisma Migrations
-        run: pnpm --filter @telemetry/auth-service exec prisma migrate deploy --schema=./prisma/schema.prisma
+        run: pnpm --filter @telemetry/auth-service exec prisma migrate deploy --schema=../../prisma/schema.prisma
+
+      - name: Check Prisma Migration Status
+        run: pnpm --filter @telemetry/auth-service exec prisma migrate status --schema=../../prisma/schema.prisma
 
       - name: Auth Coverage
         run: pnpm --filter @telemetry/auth-service test:coverage
