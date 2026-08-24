@@ -6,6 +6,7 @@ import {
   GATEWAY_ROUTES,
   GATEWAY_SERVICE_NAME
 } from "./constants";
+import { gatewayJwtAuthPreHandler } from "./middleware/auth.middleware";
 import { registerGatewayProxyRoutes } from "./plugins/proxy.plugin";
 
 const getRequiredEnv = (key: string): string => {
@@ -23,6 +24,7 @@ export const buildGatewayApp = (): FastifyInstance => {
   const container = createContainer(GATEWAY_SERVICE_NAME);
 
   registerGlobalErrorHandler(app);
+  app.addHook("preHandler", gatewayJwtAuthPreHandler);
 
   app.get(GATEWAY_ROUTES.HEALTH, async () => {
     return {

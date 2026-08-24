@@ -22,6 +22,7 @@
     "@telemetry/shared-validation": "workspace:*",
     "fastify": "^5.0.0",
     "ioredis": "^5.4.1",
+    "jose": "^6.2.10",
     "pino": "^9.4.0",
     "zod": "^3.23.8"
   },

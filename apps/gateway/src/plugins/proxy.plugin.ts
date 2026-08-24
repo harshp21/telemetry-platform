@@ -18,7 +18,23 @@ const registerProxyRoute = (
     upstream,
     prefix,
     // Keep path structure unchanged across gateway and upstream services.
-    rewritePrefix: prefix
+    rewritePrefix: prefix,
+    replyOptions: {
+      rewriteRequestHeaders: (request, headers) => {
+        const authContext = request.authContext;
+
+        if (!authContext) {
+          return headers;
+        }
+
+        return {
+          ...headers,
+          "x-tenant-id": authContext.tenantId,
+          "x-user-id": authContext.userId,
+          "x-user-role": authContext.role
+        };
+      }
+    }
   });
 };
 
