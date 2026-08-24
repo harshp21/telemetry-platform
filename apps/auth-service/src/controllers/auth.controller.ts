@@ -14,9 +14,14 @@ const loginRequestSchema = z.object({
 	password: z.string().min(AUTH_VALIDATION.PASSWORD_MIN_LENGTH)
 });
 
+const refreshRequestSchema = z.object({
+	refreshToken: z.string().min(1)
+});
+
 type RegisterRequestBody = z.infer<typeof registerRequestSchema>;
 type LoginRequestBody = z.infer<typeof loginRequestSchema>;
-export type { LoginRequestBody, RegisterRequestBody };
+type RefreshRequestBody = z.infer<typeof refreshRequestSchema>;
+export type { LoginRequestBody, RefreshRequestBody, RegisterRequestBody };
 
 const authService = new AuthService();
 
@@ -36,6 +41,16 @@ export const loginHandler = async (
 ): Promise<FastifyReply> => {
 	const input = loginRequestSchema.parse(request.body);
 	const data = await authService.login(input);
+
+	return reply.status(AUTH_HTTP_STATUS.OK).send({ data });
+};
+
+export const refreshHandler = async (
+	request: FastifyRequest<{ Body: RefreshRequestBody }>,
+	reply: FastifyReply
+): Promise<FastifyReply> => {
+	const input = refreshRequestSchema.parse(request.body);
+	const data = await authService.refresh(input);
 
 	return reply.status(AUTH_HTTP_STATUS.OK).send({ data });
 };

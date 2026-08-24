@@ -9,16 +9,22 @@ import {
   AUTH_ROUTES,
   AUTH_SERVICE_NAME
 } from "../src/constants";
-import { EmailAlreadyExistsError, InvalidCredentialsError } from "../src/errors";
+import {
+  EmailAlreadyExistsError,
+  InvalidCredentialsError,
+  InvalidRefreshTokenError
+} from "../src/errors";
 
 const registerMock = vi.fn();
 const loginMock = vi.fn();
+const refreshMock = vi.fn();
 
 vi.mock("../src/services/auth.service", () => {
   return {
     AuthService: class {
       register = registerMock;
       login = loginMock;
+      refresh = refreshMock;
     }
   };
 });
@@ -29,6 +35,7 @@ describe("auth-service", () => {
   beforeEach(() => {
     registerMock.mockReset();
     loginMock.mockReset();
+    refreshMock.mockReset();
     app = buildAuthServiceApp();
   });
 
@@ -178,5 +185,76 @@ describe("auth-service", () => {
       code: ERROR_RESPONSES.CODE_VALIDATION_ERROR
     });
     expect(loginMock).not.toHaveBeenCalled();
+  });
+
+  it("refreshes tokens and returns 200", async () => {
+    refreshMock.mockResolvedValueOnce({
+      accessToken: "next_access_token",
+      refreshToken: "next_refresh_token",
+      tokenType: "Bearer",
+      expiresInSeconds: 900,
+      user: {
+        userId: "user_1",
+        tenantId: "tenant_1",
+        role: "OWNER"
+      }
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REFRESH}`,
+      payload: {
+        refreshToken: "refresh_token"
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.OK);
+    expect(response.json()).toEqual({
+      data: {
+        accessToken: "next_access_token",
+        refreshToken: "next_refresh_token",
+        tokenType: "Bearer",
+        expiresInSeconds: 900,
+        user: {
+          userId: "user_1",
+          tenantId: "tenant_1",
+          role: "OWNER"
+        }
+      }
+    });
+  });
+
+  it("returns 401 when refresh token is invalid", async () => {
+    refreshMock.mockRejectedValueOnce(new InvalidRefreshTokenError());
+
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REFRESH}`,
+      payload: {
+        refreshToken: "bad_refresh_token"
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_REFRESH_TOKEN_INVALID,
+      message: AUTH_MESSAGES.INVALID_REFRESH_TOKEN
+    });
+  });
+
+  it("returns 400 for invalid refresh payload", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REFRESH}`,
+      payload: {
+        refreshToken: ""
+      }
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      code: ERROR_RESPONSES.CODE_VALIDATION_ERROR
+    });
+    expect(refreshMock).not.toHaveBeenCalled();
   });
 });

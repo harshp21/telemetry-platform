@@ -25,6 +25,28 @@ interface RefreshTokenCreateArgs {
 	};
 }
 
+interface RefreshTokenFindUniqueArgs {
+	where: { tokenHash: string };
+	select: {
+		id: true;
+		expiresAt: true;
+		revokedAt: true;
+		user: {
+			select: {
+				id: true;
+				tenantId: true;
+				role: true;
+			};
+		};
+	};
+}
+
+interface RefreshTokenUpdateArgs {
+	where: { id: string };
+	data: { revokedAt: Date };
+	select?: { id: true };
+}
+
 interface TenantCreateArgs {
 	data: { name: string };
 	select: { id: true };
@@ -49,6 +71,7 @@ interface AuthPrismaTxClient {
 	};
 	refreshToken: {
 		create: (args: RefreshTokenCreateArgs) => Promise<{ id: string }>;
+		update: (args: RefreshTokenUpdateArgs) => Promise<{ id: string }>;
 	};
 }
 
@@ -64,6 +87,16 @@ interface AuthPrismaClient {
 	};
 	refreshToken: {
 		create: (args: RefreshTokenCreateArgs) => Promise<{ id: string }>;
+		findUnique: (args: RefreshTokenFindUniqueArgs) => Promise<{
+			id: string;
+			expiresAt: Date;
+			revokedAt: Date | null;
+			user: {
+				id: string;
+				tenantId: string;
+				role: "OWNER" | "ADMIN" | "MEMBER";
+			};
+		} | null>;
 	};
 	$transaction: <T>(operation: (tx: AuthPrismaTxClient) => Promise<T>) => Promise<T>;
 }
@@ -84,6 +117,15 @@ interface LoginUser {
 	tenantId: TenantId;
 	passwordHash: string;
 	role: "OWNER" | "ADMIN" | "MEMBER";
+}
+
+interface RefreshTokenRecord {
+	refreshTokenId: string;
+	userId: UserId;
+	tenantId: TenantId;
+	role: "OWNER" | "ADMIN" | "MEMBER";
+	expiresAt: Date;
+	revokedAt: Date | null;
 }
 
 const isUniqueConstraintError = (error: unknown): error is { code: string } => {
@@ -185,6 +227,60 @@ export class UserRepository {
 				tokenHash: input.refreshTokenHash,
 				expiresAt: input.expiresAt
 			}
+		});
+	}
+
+	async findRefreshTokenForRotation(tokenHash: string): Promise<RefreshTokenRecord | null> {
+		const refreshToken = await this.db.refreshToken.findUnique({
+			where: { tokenHash },
+			select: {
+				id: true,
+				expiresAt: true,
+				revokedAt: true,
+				user: {
+					select: {
+						id: true,
+						tenantId: true,
+						role: true
+					}
+				}
+			}
+		});
+
+		if (!refreshToken) {
+			return null;
+		}
+
+		return {
+			refreshTokenId: refreshToken.id,
+			userId: refreshToken.user.id as UserId,
+			tenantId: refreshToken.user.tenantId as TenantId,
+			role: refreshToken.user.role,
+			expiresAt: refreshToken.expiresAt,
+			revokedAt: refreshToken.revokedAt
+		};
+	}
+
+	async rotateRefreshToken(input: {
+		currentRefreshTokenId: string;
+		userId: UserId;
+		newRefreshTokenHash: string;
+		newExpiresAt: Date;
+	}): Promise<void> {
+		await this.db.$transaction(async (tx) => {
+			await tx.refreshToken.update({
+				where: { id: input.currentRefreshTokenId },
+				data: { revokedAt: new Date() },
+				select: { id: true }
+			});
+
+			await tx.refreshToken.create({
+				data: {
+					userId: input.userId,
+					tokenHash: input.newRefreshTokenHash,
+					expiresAt: input.newExpiresAt
+				}
+			});
 		});
 	}
 }

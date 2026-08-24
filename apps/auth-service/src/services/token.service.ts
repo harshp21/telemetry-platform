@@ -23,6 +23,10 @@ interface RefreshTokenResult {
 const jwtSecretKey = new TextEncoder().encode(env.JWT_SECRET);
 
 export class TokenService {
+	hashRefreshToken(refreshToken: string): string {
+		return createHash("sha256").update(refreshToken).digest("hex");
+	}
+
 	async createAccessToken(input: AccessTokenInput): Promise<AccessTokenResult> {
 		const accessTtlSeconds = env.JWT_ACCESS_TTL_SECONDS ?? AUTH_TOKENS.ACCESS_TTL_SECONDS_DEFAULT;
 
@@ -47,7 +51,7 @@ export class TokenService {
 		const refreshTtlSeconds =
 			env.JWT_REFRESH_TTL_SECONDS ?? AUTH_TOKENS.REFRESH_TTL_SECONDS_DEFAULT;
 		const refreshToken = randomBytes(32).toString("hex");
-		const refreshTokenHash = createHash("sha256").update(refreshToken).digest("hex");
+		const refreshTokenHash = this.hashRefreshToken(refreshToken);
 		const expiresAt = new Date(Date.now() + refreshTtlSeconds * 1000);
 
 		return {

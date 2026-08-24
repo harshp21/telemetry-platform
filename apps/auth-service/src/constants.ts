@@ -4,13 +4,15 @@ export const AUTH_ROUTES = {
   HEALTH: "/health",
   V1_AUTH: "/v1/auth",
   REGISTER: "/register",
-  LOGIN: "/login"
+  LOGIN: "/login",
+  REFRESH: "/refresh"
 } as const;
 
 export const AUTH_RESPONSES = {
   STATUS_OK: "ok",
   CODE_EMAIL_ALREADY_EXISTS: "EMAIL_ALREADY_EXISTS",
-  CODE_INVALID_CREDENTIALS: "INVALID_CREDENTIALS"
+  CODE_INVALID_CREDENTIALS: "INVALID_CREDENTIALS",
+  CODE_REFRESH_TOKEN_INVALID: "REFRESH_TOKEN_INVALID"
 } as const;
 
 export const AUTH_HTTP_STATUS = {
@@ -29,7 +31,8 @@ export const AUTH_VALIDATION = {
 
 export const AUTH_MESSAGES = {
   REGISTRATION_FAILED: "Registration failed",
-  INVALID_CREDENTIALS: "Invalid credentials"
+  INVALID_CREDENTIALS: "Invalid credentials",
+  INVALID_REFRESH_TOKEN: "Invalid refresh token"
 } as const;
 
 export const AUTH_SECURITY = {

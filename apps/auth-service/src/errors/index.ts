@@ -22,3 +22,13 @@ export class InvalidCredentialsError extends AppError {
 		);
 	}
 }
+
+export class InvalidRefreshTokenError extends AppError {
+	constructor() {
+		super(
+			AUTH_RESPONSES.CODE_REFRESH_TOKEN_INVALID,
+			AUTH_HTTP_STATUS.UNAUTHORIZED,
+			AUTH_MESSAGES.INVALID_REFRESH_TOKEN
+		);
+	}
+}

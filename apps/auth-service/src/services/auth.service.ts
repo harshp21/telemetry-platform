@@ -2,7 +2,11 @@ import { compare, hash } from "bcryptjs";
 import type { TenantId, UserId } from "@telemetry/shared-types";
 import { AUTH_SECURITY, AUTH_VALIDATION } from "../constants";
 import { env } from "../config/env";
-import { EmailAlreadyExistsError, InvalidCredentialsError } from "../errors";
+import {
+	EmailAlreadyExistsError,
+	InvalidCredentialsError,
+	InvalidRefreshTokenError
+} from "../errors";
 import { UserRepository } from "../repositories/user.repository";
 import { TokenService } from "./token.service";
 
@@ -22,7 +26,11 @@ interface LoginInput {
 	password: string;
 }
 
-interface LoginResult {
+interface RefreshInput {
+	refreshToken: string;
+}
+
+interface AuthSessionResult {
 	accessToken: string;
 	refreshToken: string;
 	tokenType: "Bearer";
@@ -59,7 +67,7 @@ export class AuthService {
 		return created;
 	}
 
-	async login(input: LoginInput): Promise<LoginResult> {
+	async login(input: LoginInput): Promise<AuthSessionResult> {
 		const user = await this.userRepository.findUserForLogin(input.email);
 		const passwordHashForCheck = user?.passwordHash ?? AUTH_SECURITY.DUMMY_PASSWORD_HASH;
 		const passwordMatches = await compare(input.password, passwordHashForCheck);
@@ -90,6 +98,46 @@ export class AuthService {
 				userId: user.userId,
 				tenantId: user.tenantId,
 				role: user.role
+			}
+		};
+	}
+
+	async refresh(input: RefreshInput): Promise<AuthSessionResult> {
+		const refreshTokenHash = this.tokenService.hashRefreshToken(input.refreshToken);
+		const currentRefreshToken =
+			await this.userRepository.findRefreshTokenForRotation(refreshTokenHash);
+
+		if (
+			!currentRefreshToken ||
+			currentRefreshToken.revokedAt !== null ||
+			currentRefreshToken.expiresAt.getTime() <= Date.now()
+		) {
+			throw new InvalidRefreshTokenError();
+		}
+
+		const accessTokenResult = await this.tokenService.createAccessToken({
+			userId: currentRefreshToken.userId,
+			tenantId: currentRefreshToken.tenantId,
+			role: currentRefreshToken.role
+		});
+		const newRefreshTokenResult = this.tokenService.createRefreshToken();
+
+		await this.userRepository.rotateRefreshToken({
+			currentRefreshTokenId: currentRefreshToken.refreshTokenId,
+			userId: currentRefreshToken.userId,
+			newRefreshTokenHash: newRefreshTokenResult.refreshTokenHash,
+			newExpiresAt: newRefreshTokenResult.expiresAt
+		});
+
+		return {
+			accessToken: accessTokenResult.accessToken,
+			refreshToken: newRefreshTokenResult.refreshToken,
+			tokenType: "Bearer",
+			expiresInSeconds: accessTokenResult.expiresInSeconds,
+			user: {
+				userId: currentRefreshToken.userId,
+				tenantId: currentRefreshToken.tenantId,
+				role: currentRefreshToken.role
 			}
 		};
 	}
