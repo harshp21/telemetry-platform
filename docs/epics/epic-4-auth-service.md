@@ -6,11 +6,11 @@
 
 ---
 
-## Pre-coding decisions required
+## Pre-coding decisions
 
-| Question | Decision needed |
+| Question | Status |
 |---|---|
-| Q5 — Refresh token delivery | HttpOnly cookie or response body JSON? Affects login response contract and gateway config |
+| Q5 — Refresh token delivery | Decided: HttpOnly cookie for refresh + Bearer access token (hybrid). |
 
 ---
 
@@ -75,9 +75,7 @@ export const EnvSchema = z.object({
 2. `bcrypt.compare(password, user.passwordHash)` — `401` on mismatch
 3. Generate access token: `jose` `SignJWT` with payload `{ sub: userId, tenantId, role, jti: crypto.randomUUID() }`, signed HS256, TTL from `JWT_ACCESS_TTL_SECONDS`
 4. Generate refresh token: `crypto.randomBytes(32).toString('hex')`, store SHA-256 hash in `RefreshToken` table with `expiresAt`
-5. Return per Q5 decision:
-   - **Cookie**: Set `HttpOnly; Secure; SameSite=Strict` cookie for refresh token, return `{ data: { accessToken, expiresIn } }`
-   - **Body**: Return `{ data: { accessToken, refreshToken, expiresIn } }`
+5. Set refresh token as `HttpOnly; Secure; SameSite` cookie and return `{ data: { accessToken, expiresIn } }`.
 
 **Error responses**:
 - `401 { code: 'INVALID_CREDENTIALS' }` — same message for "not found" and "wrong password"
@@ -88,7 +86,7 @@ export const EnvSchema = z.object({
 
 **Files**: `controllers/auth.controller.ts`, `services/token.service.ts`, `repositories/refresh-token.repository.ts`
 
-**Request**: Refresh token from body or cookie (per Q5 decision)
+**Request**: Refresh token from cookie (hybrid model decision).
 
 **Logic**:
 1. SHA-256 hash the incoming refresh token
@@ -96,7 +94,7 @@ export const EnvSchema = z.object({
 3. Check `expiresAt > now` — `401` if expired
 4. Check `revokedAt IS NULL` — `401` if already revoked
 5. Prisma transaction: set `revokedAt` on old token → create new `RefreshToken` → issue new access token
-6. Return same shape as login
+6. Rotate refresh token cookie and return access-token response shape.
 
 **Error responses**:
 - `401 { code: 'REFRESH_TOKEN_INVALID' }` — covers all failure cases (no enumeration)
@@ -173,10 +171,12 @@ app.register(async (router) => {
 **Test cases**:
 - Register → `201` with `userId` and `tenantId`
 - Register duplicate email → `409`
-- Login with correct credentials → returns valid `accessToken`
+- Login with correct credentials → returns valid `accessToken` and sets refresh cookie
 - Login with wrong password → `401` (same timing as not-found)
-- Refresh with valid token → new `accessToken` issued, old refresh token revoked
+- Refresh with valid cookie + CSRF header → new `accessToken` issued, old refresh token revoked
 - Refresh with revoked token → `401`
+- Refresh without CSRF header → `401 CSRF_TOKEN_INVALID`
+- Logout with valid cookie + CSRF header → `204` and clears refresh cookie
 - Logout → access token rejected on subsequent authenticated request
 - JWT plugin rejects expired token → `401 TOKEN_EXPIRED`
 - JWT plugin rejects denylisted JTI → `401 TOKEN_REVOKED`

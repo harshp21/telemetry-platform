@@ -1,5 +1,7 @@
 # T-020 Plan: Refresh Token Endpoint
 
+> Historical note: refresh-token transport details in this task were later superseded by T-025A, which moved refresh handling to HttpOnly cookie flow.
+
 ## 1. Business objective and user impact
 - Allow authenticated sessions to continue securely without forcing frequent logins by exchanging a valid refresh token for a new access token.
 - Reduce security risk by rotating refresh tokens and invalidating old ones on every refresh.
@@ -14,14 +16,14 @@
 - Return standardized unauthorized error for all invalid refresh scenarios.
 
 ### Non-goals
-- Cookie-based refresh-token delivery change (keep current body-based contract).
+- Cookie and CSRF hardening details (later addressed in T-025A).
 - Logout and token denylist logic (T-021).
 - JWT verification middleware (T-022).
 - Route protection expansion (T-023).
 
 ## 3. Acceptance criteria
 - New route exists: `POST /v1/auth/refresh` under `/v1/auth`.
-- Valid refresh token returns `200` with a new access token and rotated refresh token.
+- Valid refresh token returns `200` with rotated session state and refreshed access-token response.
 - Invalid, expired, revoked, or not-found refresh token returns `401` with single normalized error code.
 - Old refresh token is revoked during successful rotation.
 - Auth service scoped validation passes:

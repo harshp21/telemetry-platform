@@ -1,5 +1,7 @@
 # T-021 Plan: Logout Endpoint
 
+> Historical note: cookie/session clearing and CSRF protections were added later in T-025A as part of the hybrid auth hardening slice.
+
 ## 1. Business objective and user impact
 - Let authenticated users explicitly terminate their session.
 - Reduce token replay risk by revoking active refresh tokens and denylisting the current access-token identifier for its remaining lifetime.
@@ -14,7 +16,7 @@
 
 ### Non-goals
 - Full JWT verification middleware design and public/protected route expansion beyond the minimum required to support logout.
-- Cookie-based refresh-token clearing behavior.
+- Cookie/session hardening behavior (implemented later in T-025A).
 - Broader auth plugin architecture refactors.
 
 ## 3. Acceptance criteria

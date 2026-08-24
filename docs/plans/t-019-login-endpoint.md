@@ -26,7 +26,8 @@
 2. Valid credentials return success response with access token payload.
 3. Unknown email and wrong password return the same `401 INVALID_CREDENTIALS` surface.
 4. Refresh token storage writes only hashed token data with valid expiry.
-5. Tests cover success and invalid credential behaviors.
+5. Refresh token delivery follows hybrid decision (refresh cookie, bearer access token).
+6. Tests cover success and invalid credential behaviors.
 
 ## Technical implementation steps
 
@@ -65,7 +66,7 @@
 ## Pending tasks
 
 - done: Route next valid epic task (`T-019`).
-- pending: Confirm refresh-token delivery mode for login response.
+- done: Confirm refresh-token delivery mode for login response (cookie-based refresh).
 - pending: Implement controller/service/repository updates for login.
 - pending: Add/update tests for success and invalid-credential parity.
 - pending: Run scoped auth-service validations.
