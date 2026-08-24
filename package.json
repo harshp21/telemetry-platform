@@ -9,6 +9,8 @@
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
+    "test:smoke:compose": "SMOKE_TARGET=external pnpm --filter @telemetry/gateway exec vitest run tests/smoke.test.ts && SMOKE_TARGET=external pnpm --filter @telemetry/auth-service exec vitest run tests/smoke.test.ts && SMOKE_TARGET=external pnpm --filter @telemetry/usage-service exec vitest run tests/smoke.test.ts && SMOKE_TARGET=external pnpm --filter @telemetry/billing-service exec vitest run tests/smoke.test.ts && SMOKE_TARGET=external pnpm --filter @telemetry/analytics-service exec vitest run tests/smoke.test.ts && SMOKE_TARGET=external pnpm --filter @telemetry/worker-service exec vitest run tests/smoke.test.ts",
+    "test:smoke": "pnpm --filter @telemetry/gateway exec vitest run tests/smoke.test.ts && pnpm --filter @telemetry/auth-service exec vitest run tests/smoke.test.ts && pnpm --filter @telemetry/usage-service exec vitest run tests/smoke.test.ts && pnpm --filter @telemetry/billing-service exec vitest run tests/smoke.test.ts && pnpm --filter @telemetry/analytics-service exec vitest run tests/smoke.test.ts && pnpm --filter @telemetry/worker-service exec vitest run tests/smoke.test.ts",
     "test:coverage:auth": "pnpm --filter @telemetry/auth-service test:coverage",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

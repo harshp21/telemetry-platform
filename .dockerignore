@@ -1,0 +1,9 @@
+.git
+node_modules
+dist
+coverage
+.vscode
+.tmp
+*.log
+apps/*/coverage
+packages/*/coverage

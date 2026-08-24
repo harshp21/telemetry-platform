@@ -1,4 +1,19 @@
-version: "3.9"
+x-common-app-env: &common-app-env
+  NODE_ENV: production
+  DATABASE_URL: postgresql://postgres:postgres@postgres:5432/telemetry
+  REDIS_URL: redis://redis:6379
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4318
+  LOG_LEVEL: info
+
+x-http-healthcheck: &http-healthcheck
+  test:
+    - CMD-SHELL
+    - >-
+      node -e "const u = 'http://127.0.0.1:' + process.env.PORT + '/health'; fetch(u).then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 15s
 
 services:
   postgres:
@@ -7,8 +22,6 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: telemetry
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -17,42 +30,159 @@ services:
       timeout: 5s
       retries: 5
 
-  pgbouncer:
-    image: bitnami/pgbouncer:1.23.1
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  auth-service:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: auth-service
     environment:
-      POSTGRESQL_HOST: postgres
-      POSTGRESQL_PORT: 5432
-      POSTGRESQL_USERNAME: postgres
-      POSTGRESQL_PASSWORD: postgres
-      POSTGRESQL_DATABASE: telemetry
-      PGBOUNCER_POOL_MODE: transaction
-      PGBOUNCER_MAX_CLIENT_CONN: 1000
+      <<: *common-app-env
+      PORT: "3001"
+      JWT_SECRET: test-jwt-secret-value-with-at-least-32-characters
+      JWT_REFRESH_SECRET: test-refresh-secret-value-with-at-least-32-chars
+      JWT_ACCESS_TTL_SECONDS: "900"
+      JWT_REFRESH_TTL_SECONDS: "604800"
+      BCRYPT_ROUNDS: "10"
+      AUTH_COOKIE_SECURE: "false"
+      AUTH_COOKIE_SAME_SITE: Lax
     ports:
-      - "6432:6432"
+      - "3001:3001"
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck: *http-healthcheck
 
-  redis:
-    image: redis:7-alpine
+  usage-service:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: usage-service
+    environment:
+      <<: *common-app-env
+      PORT: "3002"
     ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck: *http-healthcheck
+
+  billing-service:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: billing-service
+    environment:
+      <<: *common-app-env
+      PORT: "3004"
+      INTERNAL_API_SECRET: test-internal-secret
+    ports:
+      - "3004:3004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck: *http-healthcheck
+
+  analytics-service:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: analytics-service
+    environment:
+      <<: *common-app-env
+      PORT: "3005"
+    ports:
+      - "3005:3005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck: *http-healthcheck
+
+  worker-service:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: worker-service
+    environment:
+      <<: *common-app-env
+      PORT: "3003"
+      INTERNAL_API_SECRET: test-internal-secret
+    ports:
+      - "3003:3003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck: *http-healthcheck
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: gateway
+    environment:
+      NODE_ENV: production
+      PORT: "3100"
+      REDIS_URL: redis://redis:6379
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4318
+      LOG_LEVEL: info
+      JWT_SECRET: test-jwt-secret-value-with-at-least-32-characters
+      AUTH_SERVICE_URL: http://auth-service:3001
+      USAGE_SERVICE_URL: http://usage-service:3002
+      BILLING_SERVICE_URL: http://billing-service:3004
+      ANALYTICS_SERVICE_URL: http://analytics-service:3005
+      RATE_LIMIT_MAX: "1000"
+      RATE_LIMIT_WINDOW_MS: "1000"
+      INGESTION_RATE_LIMIT_MAX: "5000"
+    ports:
+      - "3100:3100"
+    depends_on:
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      usage-service:
+        condition: service_healthy
+      billing-service:
+        condition: service_healthy
+      analytics-service:
+        condition: service_healthy
+    healthcheck: *http-healthcheck
 
   prometheus:
     image: prom/prometheus:v2.54.1
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
-    ports:
-      - "9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
 
   grafana:
     image: grafana/grafana:11.2.0
-    ports:
-      - "3001:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
