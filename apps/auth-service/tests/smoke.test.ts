@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
+import { SignJWT } from "jose";
 import { ERROR_RESPONSES } from "@telemetry/shared-types";
 import { buildAuthServiceApp } from "../src/app";
 import {
@@ -18,6 +19,23 @@ import {
 const registerMock = vi.fn();
 const loginMock = vi.fn();
 const refreshMock = vi.fn();
+const logoutMock = vi.fn();
+const TEST_JWT_SECRET = "test-jwt-secret-value-with-at-least-32-characters";
+
+const createAccessTokenFixture = async (): Promise<string> => {
+  const secretKey = new TextEncoder().encode(TEST_JWT_SECRET);
+
+  return new SignJWT({
+    tenantId: "tenant_1",
+    role: "OWNER"
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject("user_1")
+    .setJti("logout_jti_1")
+    .setIssuedAt()
+    .setExpirationTime("15m")
+    .sign(secretKey);
+};
 
 vi.mock("../src/services/auth.service", () => {
   return {
@@ -25,6 +43,7 @@ vi.mock("../src/services/auth.service", () => {
       register = registerMock;
       login = loginMock;
       refresh = refreshMock;
+      logout = logoutMock;
     }
   };
 });
@@ -33,9 +52,11 @@ describe("auth-service", () => {
   let app: FastifyInstance;
 
   beforeEach(() => {
+    process.env.JWT_SECRET = TEST_JWT_SECRET;
     registerMock.mockReset();
     loginMock.mockReset();
     refreshMock.mockReset();
+    logoutMock.mockReset();
     app = buildAuthServiceApp();
   });
 
@@ -256,5 +277,43 @@ describe("auth-service", () => {
       code: ERROR_RESPONSES.CODE_VALIDATION_ERROR
     });
     expect(refreshMock).not.toHaveBeenCalled();
+  });
+
+  it("logs out an authenticated user and returns 204", async () => {
+    const accessToken = await createAccessTokenFixture();
+
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGOUT}`,
+      headers: {
+        authorization: `Bearer ${accessToken}`
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.NO_CONTENT);
+    expect(response.body).toBe("");
+    expect(logoutMock).toHaveBeenCalledTimes(1);
+    expect(logoutMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: "user_1",
+        tenantId: "tenant_1",
+        role: "OWNER",
+        jti: "logout_jti_1"
+      })
+    );
+  });
+
+  it("returns 401 when logout request is missing authorization", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGOUT}`
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(response.json()).toEqual({
+      code: AUTH_RESPONSES.CODE_UNAUTHORIZED,
+      message: AUTH_MESSAGES.UNAUTHORIZED
+    });
+    expect(logoutMock).not.toHaveBeenCalled();
   });
 });

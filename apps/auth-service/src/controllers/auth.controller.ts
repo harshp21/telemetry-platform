@@ -1,6 +1,7 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { AUTH_HTTP_STATUS, AUTH_VALIDATION } from "../constants";
+import { UnauthorizedError } from "../errors";
 import { AuthService } from "../services/auth.service";
 
 const registerRequestSchema = z.object({
@@ -53,4 +54,17 @@ export const refreshHandler = async (
 	const data = await authService.refresh(input);
 
 	return reply.status(AUTH_HTTP_STATUS.OK).send({ data });
+};
+
+export const logoutHandler = async (
+	request: FastifyRequest,
+	reply: FastifyReply
+): Promise<FastifyReply> => {
+	if (!request.auth) {
+		throw new UnauthorizedError();
+	}
+
+	await authService.logout(request.auth);
+
+	return reply.status(AUTH_HTTP_STATUS.NO_CONTENT).send();
 };

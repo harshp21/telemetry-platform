@@ -32,3 +32,13 @@ export class InvalidRefreshTokenError extends AppError {
 		);
 	}
 }
+
+export class UnauthorizedError extends AppError {
+	constructor() {
+		super(
+			AUTH_RESPONSES.CODE_UNAUTHORIZED,
+			AUTH_HTTP_STATUS.UNAUTHORIZED,
+			AUTH_MESSAGES.UNAUTHORIZED
+		);
+	}
+}

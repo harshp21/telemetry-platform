@@ -47,6 +47,14 @@ interface RefreshTokenUpdateArgs {
 	select?: { id: true };
 }
 
+interface RefreshTokenUpdateManyArgs {
+	where: {
+		userId: string;
+		revokedAt: null;
+	};
+	data: { revokedAt: Date };
+}
+
 interface TenantCreateArgs {
 	data: { name: string };
 	select: { id: true };
@@ -72,6 +80,7 @@ interface AuthPrismaTxClient {
 	refreshToken: {
 		create: (args: RefreshTokenCreateArgs) => Promise<{ id: string }>;
 		update: (args: RefreshTokenUpdateArgs) => Promise<{ id: string }>;
+		updateMany: (args: RefreshTokenUpdateManyArgs) => Promise<{ count: number }>;
 	};
 }
 
@@ -97,6 +106,7 @@ interface AuthPrismaClient {
 				role: "OWNER" | "ADMIN" | "MEMBER";
 			};
 		} | null>;
+		updateMany: (args: RefreshTokenUpdateManyArgs) => Promise<{ count: number }>;
 	};
 	$transaction: <T>(operation: (tx: AuthPrismaTxClient) => Promise<T>) => Promise<T>;
 }
@@ -281,6 +291,18 @@ export class UserRepository {
 					expiresAt: input.newExpiresAt
 				}
 			});
+		});
+	}
+
+	async revokeActiveRefreshTokens(userId: UserId): Promise<void> {
+		await this.db.refreshToken.updateMany({
+			where: {
+				userId,
+				revokedAt: null
+			},
+			data: {
+				revokedAt: new Date()
+			}
 		});
 	}
 }

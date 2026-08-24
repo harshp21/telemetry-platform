@@ -7,7 +7,9 @@ import {
 	InvalidCredentialsError,
 	InvalidRefreshTokenError
 } from "../errors";
+import type { AuthenticatedRequestContext } from "../plugins";
 import { UserRepository } from "../repositories/user.repository";
+import { TokenDenylistService } from "./token-denylist.service";
 import { TokenService } from "./token.service";
 
 interface RegisterInput {
@@ -44,11 +46,17 @@ interface AuthSessionResult {
 
 export class AuthService {
 	private readonly userRepository: UserRepository;
+	private readonly tokenDenylistService: TokenDenylistService;
 	private readonly tokenService: TokenService;
 
-	constructor(userRepository = new UserRepository(), tokenService = new TokenService()) {
+	constructor(
+		userRepository = new UserRepository(),
+		tokenService = new TokenService(),
+		tokenDenylistService = new TokenDenylistService()
+	) {
 		this.userRepository = userRepository;
 		this.tokenService = tokenService;
+		this.tokenDenylistService = tokenDenylistService;
 	}
 
 	async register(input: RegisterInput): Promise<RegisterResult> {
@@ -140,5 +148,12 @@ export class AuthService {
 				role: currentRefreshToken.role
 			}
 		};
+	}
+
+	async logout(input: AuthenticatedRequestContext): Promise<void> {
+		const ttlSeconds = Math.max(1, input.expiresAt - Math.floor(Date.now() / 1000));
+
+		await this.tokenDenylistService.denylistTokenJti(input.jti, ttlSeconds);
+		await this.userRepository.revokeActiveRefreshTokens(input.userId as UserId);
 	}
 }
