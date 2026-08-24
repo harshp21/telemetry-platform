@@ -183,6 +183,35 @@ app.register(async (router) => {
 
 **Setup**: Use Docker Compose test database. Truncate `User`, `Tenant`, `RefreshToken` tables in `beforeEach`.
 
+**Status**: Implemented in `apps/auth-service/tests/auth.integration.test.ts` and validated via scoped auth-service checks.
+
+---
+
+## T-024B · Auth service unit tests + coverage gate
+
+**Plan**: `docs/plans/t-024b-auth-unit-tests-and-coverage.md`
+
+**Files**:
+- `apps/auth-service/tests/*.unit.test.ts` (or equivalent unit-focused split)
+- `apps/auth-service/vitest.config.mjs`
+- `apps/auth-service/package.json`
+
+**Story**: Add focused unit tests for auth service internals and enforce auth-service coverage thresholds to keep fast feedback loops and protect security-sensitive logic.
+
+**Unit-test focus**:
+- `services/token.service.ts`: hash determinism, access-token claims/ttl contract, refresh-token expiration behavior
+- `utils/session-cookie.ts`: cookie parsing, csrf validation matrix, cookie serialization attributes
+- `plugins/jwt.plugin.ts`: malformed header, invalid signature, expired token, missing claims, denylisted jti behavior via isolated doubles
+
+**Coverage gate**:
+- Enforce minimum auth-service thresholds: statements >= 80, lines >= 80, functions >= 80, branches >= 75
+
+**Validation**:
+- `pnpm --filter @telemetry/auth-service test`
+- `pnpm --filter @telemetry/auth-service test:coverage`
+- `pnpm --filter @telemetry/auth-service lint`
+- `pnpm --filter @telemetry/auth-service typecheck`
+
 ---
 
 ## T-025A · Browser refresh-cookie + CSRF hardening

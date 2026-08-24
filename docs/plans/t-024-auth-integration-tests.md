@@ -66,13 +66,13 @@
   - Mitigation: keep smoke tests for mocked contract checks, integration tests for real persistence/token lifecycle.
 
 ## 7. Pending tasks with state
-- [pending] Create integration test file scaffold
-- [pending] Add DB reset helpers for auth tables
-- [pending] Add register/login integration scenarios
-- [pending] Add refresh/logout integration scenarios
-- [pending] Add JWT expired/denylist integration scenarios
-- [pending] Run auth-service test/lint/typecheck
-- [pending] Summarize outcomes and request commit approval
+- [done] Create integration test file scaffold
+- [done] Add DB reset helpers for auth tables
+- [done] Add register/login integration scenarios
+- [done] Add refresh/logout integration scenarios
+- [done] Add JWT expired/denylist integration scenarios
+- [done] Run auth-service test/lint/typecheck
+- [done] Summarize outcomes and request commit approval
 
 ## 8. Approval gate
 - Implementation starts only after explicit user approval.

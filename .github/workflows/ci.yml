@@ -9,6 +9,35 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/telemetry
+      REDIS_URL: redis://localhost:6379
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
+      JWT_SECRET: test-jwt-secret-value-with-at-least-32-characters
+      JWT_REFRESH_SECRET: test-refresh-secret-value-with-at-least-32-chars
+      JWT_ACCESS_TTL_SECONDS: "900"
+      JWT_REFRESH_TTL_SECONDS: "604800"
+      BCRYPT_ROUNDS: "10"
+      AUTH_COOKIE_SECURE: "false"
+      AUTH_COOKIE_SAME_SITE: Lax
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: telemetry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
 
     steps:
       - name: Checkout
@@ -27,6 +56,12 @@ jobs:
 
       - name: Install
         run: pnpm install --frozen-lockfile=false
+
+      - name: Apply Prisma Migrations
+        run: pnpm --filter @telemetry/auth-service exec prisma migrate deploy --schema=./prisma/schema.prisma
+
+      - name: Auth Coverage
+        run: pnpm --filter @telemetry/auth-service test:coverage
 
       - name: Lint
         run: pnpm lint

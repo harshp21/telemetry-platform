@@ -119,3 +119,25 @@ export const options = {
 **Post-run assertions** (manual or scripted):
 - Dead-letter stream length = 0
 - No `UsageLine` records with `billed = false` older than 60s (worker kept up)
+
+---
+
+## T-070 · Service coverage thresholds and CI gate (auth-service first)
+
+**Files**:
+- `apps/auth-service/vitest.config.mjs`
+- `apps/auth-service/package.json`
+- `.github/workflows/ci.yml`
+
+**Story**: Ensure service-level coverage is measurable and enforced in CI starting with auth-service, then replicate pattern to other services.
+
+**Auth-service thresholds**:
+- statements >= 80
+- lines >= 80
+- functions >= 80
+- branches >= 75
+
+**CI expectations**:
+- start required infra dependencies for auth tests
+- apply Prisma migrations before auth coverage run
+- fail the workflow if auth coverage thresholds are not met
