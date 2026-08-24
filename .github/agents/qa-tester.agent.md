@@ -2,7 +2,7 @@
 name: QA Tester
 description: "Use when validating task-level test coverage, identifying missing unit or integration checks, and proposing the smallest regression-safe test additions before final review."
 tools: [read, search, execute]
-user-invocable: false
+user-invocable: true
 disable-model-invocation: false
 ---
 You evaluate whether the active task has sufficient test coverage and validation depth.

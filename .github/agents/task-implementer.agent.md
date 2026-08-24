@@ -2,7 +2,7 @@
 name: Task Implementer
 description: "Use when implementing one scoped task as a senior engineer: strict types, root-cause fixes, minimal safe changes, and task-scoped validation before review."
 tools: [read, search, edit, execute]
-user-invocable: false
+user-invocable: true
 disable-model-invocation: false
 ---
 You implement one scoped task slice with senior-level quality and validate it.

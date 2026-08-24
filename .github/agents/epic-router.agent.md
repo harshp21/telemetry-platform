@@ -2,7 +2,7 @@
 name: Epic Router
 description: "Use when selecting the active epic, checking dependency and decision gates, and choosing the next valid task before implementation begins."
 tools: [read, search]
-user-invocable: false
+user-invocable: true
 disable-model-invocation: false
 ---
 You choose the next valid work item from the epic plan with minimal context use.

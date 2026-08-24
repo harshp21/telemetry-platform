@@ -2,7 +2,7 @@
 name: Task Planner
 description: "Use when planning a single epic task selected from the active epic, choosing the owning files, setting the smallest edit slice, and picking the cheapest discriminating validation."
 tools: [read, search]
-user-invocable: false
+user-invocable: true
 disable-model-invocation: false
 ---
 You create a detailed execution plan for one task.
