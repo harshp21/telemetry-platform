@@ -1,47 +1,51 @@
-# T-067C Plan: CI Prisma Client Generate Fix
+# T-067C Plan: CI Prisma Client Generate Fix (Auth Coverage)
 
 ## 1. Business objective and user impact
-- Unblock the auth coverage step in CI by ensuring Prisma build scripts are allowed during fresh installs.
-- Remove reliance on a follow-up `prisma generate` workaround that fails under the current workspace layout.
+- Unblock the auth coverage step in CI by guaranteeing Prisma Client generation occurs in a package context where `@prisma/client` is resolvable.
+- Prevent CI-only failures where auth integration tests fail with missing `.prisma/client/default` during fresh installs.
 
 ## 2. Scope and non-goals
 
 ### In scope
-- Update root `package.json` so pnpm allows Prisma build scripts during install.
-- Remove the temporary explicit `prisma generate` step from `.github/workflows/ci.yml`.
-- Keep existing migration and coverage commands otherwise unchanged.
+- Add a deterministic Prisma generate step in `.github/workflows/ci.yml` before auth coverage.
+- Generate from an auth-service-local schema copy so Prisma resolves `@prisma/client` from `apps/auth-service`.
+- Keep existing migrate deploy/status and coverage commands unchanged.
 
 ### Non-goals
 - Changing Prisma schema or migrations.
 - Refactoring auth tests or app code.
-- Reworking package-manager build script policy.
+- Reworking workspace dependency topology.
 
 ## 3. Acceptance criteria
-- Fresh-install reproduction confirms `@prisma/client` exports `PrismaClient` after install.
-- CI no longer depends on the explicit `prisma generate` workaround.
-- Existing Prisma migrate and auth coverage commands remain valid.
+- Clean-clone CI-sequence reproduction passes `test:coverage` for `@telemetry/auth-service`.
+- Prisma generate step succeeds without attempting auto-install in the wrong workspace root context.
+- Existing migrate deploy/status and coverage commands remain valid.
 
 ## 4. Technical implementation steps
-1. Add a root `pnpm.onlyBuiltDependencies` allowlist for Prisma packages.
-2. Remove the explicit `Prisma Generate Client` CI step.
-3. Validate in a clean install repro that `require('@prisma/client').PrismaClient` becomes available after install.
+1. Insert a CI step after migration checks that:
+  - copies `prisma/schema.prisma` to `apps/auth-service/schema.ci.prisma`
+  - runs `pnpm --filter @telemetry/auth-service exec prisma generate --schema=./schema.ci.prisma`
+2. Keep existing auth coverage command unchanged.
+3. Validate in clean-clone repro and targeted local run.
 
 ## 5. Validation plan
-- Clean-copy install repro without existing node_modules.
-- Verify `@prisma/client` exports `PrismaClient` after install.
-- Review targeted workflow and package diff.
+- Clean-clone repro with CI-like env vars, install, migrations, generate step, and auth coverage.
+- Confirm generated output targets the shared pnpm store path for `@prisma/client` and coverage passes.
+- Review workflow diff only.
 
 ## 6. Risks and mitigations
-- Risk: allowing Prisma build scripts is broader than a one-off generate command.
-  - Mitigation: restrict the allowlist to the minimal Prisma packages only.
-- Risk: hidden follow-up build script gaps for other packages.
-  - Mitigation: keep the change scoped and review CI again after rerun.
+- Risk: temporary schema copy could be brittle if file paths change.
+  - Mitigation: keep copy path explicit and colocated with auth-service command context.
+- Risk: stale copied schema could linger in CI workspace.
+  - Mitigation: recreate it each run before generate.
 
 ## 7. Pending tasks with state
-- [done] Allow Prisma build scripts during pnpm install
-- [done] Remove explicit Prisma generate CI step
-- [done] Validate fresh-install Prisma client availability after install
-- [done] Summarize outcomes and request commit approval
+- [done] Reproduce failing auth coverage in clean clone
+- [done] Prove deterministic generate strategy from auth-service-local schema copy
+- [done] Patch `.github/workflows/ci.yml` with validated generate step
+- [done] Run targeted local validation for generate command path
+- [done] Attempt auth coverage validation (blocked locally by missing Postgres at localhost:5432)
+- [pending] Summarize results and request commit approval
 
 ## 8. Approval gate
-- Implementation follows from user-requested CI failure debugging and confirmed root cause reproduction.
+- Implementation approved and applied; awaiting user approval for commit/push.

@@ -63,6 +63,12 @@ jobs:
       - name: Check Prisma Migration Status
         run: pnpm --filter @telemetry/auth-service exec prisma migrate status --schema=../../prisma/schema.prisma
 
+      - name: Generate Prisma Client (Auth Coverage)
+        run: |
+          cp prisma/schema.prisma apps/auth-service/schema.ci.prisma
+          pnpm --filter @telemetry/auth-service exec prisma generate --schema=./schema.ci.prisma
+          rm -f apps/auth-service/schema.ci.prisma
+
       - name: Auth Coverage
         run: pnpm --filter @telemetry/auth-service test:coverage
 
