@@ -1,4 +1,3 @@
-/* eslint-disable no-unused-vars */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { registerGatewayRateLimit } from "../src/plugins/rate-limit.plugin";

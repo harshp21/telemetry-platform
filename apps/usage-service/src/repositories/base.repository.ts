@@ -74,7 +74,7 @@ export abstract class TenantScopedRepository {
 				},
 				debug: (obj: unknown, msg: string) => {
 					const context = typeof obj === "object" && obj !== null ? obj : { data: obj };
-					console.log({ ...context, tenantId }, msg);
+					console.warn({ ...context, tenantId }, msg);
 				},
 			};
 	}

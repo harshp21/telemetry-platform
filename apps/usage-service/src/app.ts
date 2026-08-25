@@ -2,7 +2,6 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { UsageEventsBatchSchema } from "@telemetry/shared-validation";
 import { env, type ServiceEnv } from "./config/env";
-import "./config/fastify";
 import { createContainer } from "./config/container";
 import { TenantMismatchError } from "./errors";
 import {

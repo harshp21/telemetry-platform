@@ -1,6 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
-import "./config/fastify";
 import { createContainer } from "./config/container";
 import { loadEnv, type ServiceEnv } from "./config/env";
 import {

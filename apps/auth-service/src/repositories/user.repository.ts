@@ -1,4 +1,3 @@
-/* eslint-disable no-unused-vars */
 import type { TenantId, UserId } from "@telemetry/shared-types";
 import { prisma } from "../lib/prisma";
 
