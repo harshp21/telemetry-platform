@@ -1,58 +1,70 @@
-# T-024B Plan: Auth Service Unit Tests and Coverage Gate
+# T-024B Plan: Auth Unit Test Stabilization and Coverage Backfill
 
 ## 1. Business objective and user impact
-- Improve confidence in security-sensitive auth internals with fast, isolated unit tests.
-- Prevent silent test-quality regression by enforcing service-level coverage thresholds in repeatable local/CI runs.
+- Restore a zero-error baseline in auth unit tests so quality gates are reliable.
+- Complete comprehensive tests for completed tasks through phased, single-slice delivery.
+- Keep regressions out of completed infrastructure and auth foundations.
 
-## 2. Scope and non-goals
+## 2. Delivery model and scope boundary
 
-### In scope
-- Add or extend unit-focused tests for auth internals:
-  - `services/token.service.ts`
-  - `utils/session-cookie.ts`
-  - `plugins/jwt.plugin.ts`
-- Keep auth integration tests as-is; this task complements them.
-- Enforce auth-service coverage thresholds through Vitest coverage config and scripts.
+This request is executed as phased slices because Enterprise Delivery allows one task slice at a time.
 
-### Non-goals
-- Rewriting already stable integration scenarios from T-024.
-- Cross-service coverage rollout beyond auth-service in this slice.
-- Behavior changes in production auth endpoints unless a bug is discovered by tests.
+### Slice-1 (current approval request): T-024B stabilization
+In scope:
+- Fix the compile error in [apps/auth-service/tests/auth.service.unit.test.ts](apps/auth-service/tests/auth.service.unit.test.ts#L232).
+- Run minimal auth-scoped validation to prove zero errors for this slice.
 
-## 3. Acceptance criteria
-- Unit tests exist for token generation/hash behavior and edge cases.
-- Unit tests exist for session cookie parsing/serialization and CSRF validation matrix.
-- Unit tests exist for JWT plugin failure modes (missing/malformed/expired/revoked/invalid).
-- Auth-service coverage command is available and enforces thresholds:
-  - statements >= 80
-  - lines >= 80
-  - functions >= 80
-  - branches >= 75
-- Auth-service scoped checks pass:
-  - `pnpm --filter @telemetry/auth-service test`
-  - `pnpm --filter @telemetry/auth-service test:coverage`
-  - `pnpm --filter @telemetry/auth-service lint`
-  - `pnpm --filter @telemetry/auth-service typecheck`
+Out of scope:
+- New broad tests for completed infra tasks.
+- Cross-service refactors.
 
-## 4. Technical implementation steps
-1. Add unit test files for token service, session-cookie utils, and jwt plugin behavior.
-2. Use isolated doubles/mocks for denylist and request header cases where needed.
-3. Keep assertions contract-focused and deterministic (no timing-flaky expectations).
-4. Run coverage and tighten only where thresholds fail.
+### Slice-2 (next): T-012-TST proposed
+In scope:
+- Add comprehensive singleton tests for completed T-012 across Prisma-backed services.
+
+### Slice-3 (next): T-014-T015-TST proposed
+In scope:
+- Add comprehensive tests for completed T-014 (container wiring) and T-015 (graceful shutdown).
+
+## 3. Slice-1 acceptance criteria
+- The compile error at [apps/auth-service/tests/auth.service.unit.test.ts](apps/auth-service/tests/auth.service.unit.test.ts#L232) is fixed.
+- Auth-service typecheck passes.
+- Modified unit test file passes lint.
+- Target unit file executes successfully.
+- No functional behavior changes beyond type-safe assertion handling.
+
+## 4. Slice-1 technical plan (exact steps)
+1. Confirm current diagnostic in [apps/auth-service/tests/auth.service.unit.test.ts](apps/auth-service/tests/auth.service.unit.test.ts#L232).
+2. Apply minimal local assertion fix to avoid destructuring a possibly undefined tuple from mocked calls.
+3. Preserve test intent: still validate bcrypt rounds are numeric and within expected range.
+4. Run scoped validations:
+   - `pnpm --filter @telemetry/auth-service typecheck`
+   - `pnpm --filter @telemetry/auth-service exec vitest run tests/auth.service.unit.test.ts`
+   - `pnpm --filter @telemetry/auth-service exec eslint tests/auth.service.unit.test.ts`
+5. Prepare handoff artifacts for pre-QA review.
 
 ## 5. Risks and mitigations
-- Risk: overlap with smoke/integration tests causes redundancy and maintenance drag.
-  - Mitigation: keep unit tests focused on branch-level internal behavior not already proven by route-level integration tests.
-- Risk: environment leakage in unit tests.
-  - Mitigation: isolate and restore env vars in test setup/teardown.
+- Risk: additional strict typing errors in the same file.
+  - Mitigation: keep fixes local to the same test file and rerun the same scoped validations.
+- Risk: accidental behavior change while fixing typing.
+  - Mitigation: do not change production code paths; adjust assertion mechanics only.
+- Risk: validation scope creep.
+  - Mitigation: use only the three scoped validation commands for Slice-1.
 
 ## 6. Pending tasks with state
-- [done] Add token service unit tests
-- [done] Add session-cookie unit tests
-- [done] Add jwt plugin unit tests
-- [done] Run auth-service coverage and verify thresholds
-- [done] Run lint and typecheck
-- [done] Summarize results and request commit approval
+- slice-1 baseline diagnostic confirmation: done
+- slice-1 compile-fix implementation: done
+- slice-1 scoped validations: done
+- slice-1 pre-QA review handoff: done
+- slice-2 T-012 singleton comprehensive tests: pending
+- slice-3 T-014 and T-015 comprehensive tests: pending
+- stage-7 full CI gate: pending
+- stage-8 commit approval gate: blocked
 
 ## 7. Approval gate
-- Implementation starts only after explicit user approval.
+Implementation starts only after explicit user approval.
+
+Please approve Slice-2 implementation now:
+- Add comprehensive singleton tests for completed T-012 across Prisma-backed services.
+- Run scoped validations for touched services.
+- Keep T-014 and T-015 backfill work for Slice-3.

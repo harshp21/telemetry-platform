@@ -3,6 +3,23 @@ import { AuthService } from "../src/services/auth.service";
 import { EmailAlreadyExistsError } from "../src/errors";
 import * as bcryptjs from "bcryptjs";
 
+type RegisterInput = {
+	firstName: string;
+	lastName: string;
+	email: string;
+	password: string;
+	tenantName: string;
+};
+
+type RegisterResult = {
+	userId: string;
+	tenantId: string;
+};
+
+type MockUserRepository = {
+	createUserWithTenantIfEmailAvailable: ReturnType<typeof vi.fn>;
+};
+
 vi.mock("bcryptjs");
 vi.mock("../src/config/env", () => ({
 	env: {
@@ -16,7 +33,7 @@ vi.mock("../src/config/env", () => ({
 
 describe("AuthService.register (unit)", () => {
 	let authService: AuthService;
-	let mockUserRepository: any;
+	let mockUserRepository: MockUserRepository;
 
 	beforeEach(() => {
 		vi.clearAllMocks();
@@ -25,14 +42,14 @@ describe("AuthService.register (unit)", () => {
 			createUserWithTenantIfEmailAvailable: vi.fn()
 		};
 
-		authService = new AuthService();
-		// Inject mock repository
-		(authService as any).userRepository = mockUserRepository;
+		authService = new AuthService(
+			mockUserRepository as unknown as ConstructorParameters<typeof AuthService>[0]
+		);
 	});
 
 	describe("happy path", () => {
 		it("should hash password with env.BCRYPT_ROUNDS", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "john@test.com",
@@ -41,12 +58,15 @@ describe("AuthService.register (unit)", () => {
 			};
 
 			const mockHash = "hashed_password_value";
-			vi.mocked(bcryptjs.hash).mockResolvedValue(mockHash as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(async () => mockHash);
 
-			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue({
+			const created: RegisterResult = {
 				userId: "user-123",
 				tenantId: "tenant-456"
-			});
+			};
+			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue(
+				created
+			);
 
 			await authService.register(input);
 
@@ -54,7 +74,7 @@ describe("AuthService.register (unit)", () => {
 		});
 
 		it("should call repository with normalized data", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "john@test.com",
@@ -63,12 +83,15 @@ describe("AuthService.register (unit)", () => {
 			};
 
 			const mockHash = "hashed_password_value";
-			vi.mocked(bcryptjs.hash).mockResolvedValue(mockHash as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(async () => mockHash);
 
-			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue({
+			const created: RegisterResult = {
 				userId: "user-123",
 				tenantId: "tenant-456"
-			});
+			};
+			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue(
+				created
+			);
 
 			await authService.register(input);
 
@@ -82,7 +105,7 @@ describe("AuthService.register (unit)", () => {
 		});
 
 		it("should return userId and tenantId on success", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "john@test.com",
@@ -90,9 +113,11 @@ describe("AuthService.register (unit)", () => {
 				tenantName: "Acme Inc"
 			};
 
-			vi.mocked(bcryptjs.hash).mockResolvedValue("hashed_password_value" as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(
+				async () => "hashed_password_value"
+			);
 
-			const expected = {
+			const expected: RegisterResult = {
 				userId: "user-123",
 				tenantId: "tenant-456"
 			};
@@ -107,7 +132,7 @@ describe("AuthService.register (unit)", () => {
 
 	describe("error handling", () => {
 		it("should throw EmailAlreadyExistsError when repository returns null", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "existing@test.com",
@@ -115,7 +140,9 @@ describe("AuthService.register (unit)", () => {
 				tenantName: "Acme Inc"
 			};
 
-			vi.mocked(bcryptjs.hash).mockResolvedValue("hashed_password_value" as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(
+				async () => "hashed_password_value"
+			);
 
 			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue(null);
 
@@ -125,7 +152,7 @@ describe("AuthService.register (unit)", () => {
 		});
 
 		it("should propagate bcrypt hashing errors", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "john@test.com",
@@ -140,7 +167,7 @@ describe("AuthService.register (unit)", () => {
 		});
 
 		it("should propagate repository errors (other than null return)", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "john@test.com",
@@ -148,7 +175,9 @@ describe("AuthService.register (unit)", () => {
 				tenantName: "Acme Inc"
 			};
 
-			vi.mocked(bcryptjs.hash).mockResolvedValue("hashed_password_value" as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(
+				async () => "hashed_password_value"
+			);
 
 			const dbError = new Error("Database connection timeout");
 			mockUserRepository.createUserWithTenantIfEmailAvailable.mockRejectedValue(
@@ -163,7 +192,7 @@ describe("AuthService.register (unit)", () => {
 
 	describe("password hashing security", () => {
 		it("should use bcryptjs.hash (not compare)", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "john@test.com",
@@ -171,12 +200,17 @@ describe("AuthService.register (unit)", () => {
 				tenantName: "Acme Inc"
 			};
 
-			vi.mocked(bcryptjs.hash).mockResolvedValue("hashed_password_value" as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(
+				async () => "hashed_password_value"
+			);
 
-			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue({
+			const created: RegisterResult = {
 				userId: "user-123",
 				tenantId: "tenant-456"
-			});
+			};
+			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue(
+				created
+			);
 
 			await authService.register(input);
 
@@ -185,7 +219,7 @@ describe("AuthService.register (unit)", () => {
 		});
 
 		it("should not expose plain password after hashing", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "john@test.com",
@@ -193,12 +227,17 @@ describe("AuthService.register (unit)", () => {
 				tenantName: "Acme Inc"
 			};
 
-			vi.mocked(bcryptjs.hash).mockResolvedValue("hashed_password_value" as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(
+				async () => "hashed_password_value"
+			);
 
-			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue({
+			const created: RegisterResult = {
 				userId: "user-123",
 				tenantId: "tenant-456"
-			});
+			};
+			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue(
+				created
+			);
 
 			const result = await authService.register(input);
 
@@ -211,7 +250,7 @@ describe("AuthService.register (unit)", () => {
 		});
 
 		it("should call hash with BCRYPT_ROUNDS from env (range 10-14)", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "john@test.com",
@@ -219,17 +258,26 @@ describe("AuthService.register (unit)", () => {
 				tenantName: "Acme Inc"
 			};
 
-			vi.mocked(bcryptjs.hash).mockResolvedValue("hashed_password_value" as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(
+				async () => "hashed_password_value"
+			);
 
-			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue({
+			const created: RegisterResult = {
 				userId: "user-123",
 				tenantId: "tenant-456"
-			});
+			};
+			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue(
+				created
+			);
 
 			await authService.register(input);
 
 			// Verify rounds is in valid range (env.BCRYPT_ROUNDS = 12)
-			const [, rounds] = vi.mocked(bcryptjs.hash).mock.calls[0];
+			const hashCall = vi.mocked(bcryptjs.hash).mock.calls[0];
+			expect(hashCall).toBeDefined();
+
+			const rounds = hashCall?.[1];
+			expect(typeof rounds).toBe("number");
 			expect(rounds).toBeGreaterThanOrEqual(10);
 			expect(rounds).toBeLessThanOrEqual(14);
 		});
@@ -237,7 +285,7 @@ describe("AuthService.register (unit)", () => {
 
 	describe("input validation", () => {
 		it("should accept all required input fields", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "John",
 				lastName: "Doe",
 				email: "john@test.com",
@@ -245,12 +293,17 @@ describe("AuthService.register (unit)", () => {
 				tenantName: "Acme Inc"
 			};
 
-			vi.mocked(bcryptjs.hash).mockResolvedValue("hashed_password_value" as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(
+				async () => "hashed_password_value"
+			);
 
-			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue({
+			const created: RegisterResult = {
 				userId: "user-123",
 				tenantId: "tenant-456"
-			});
+			};
+			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue(
+				created
+			);
 
 			const result = await authService.register(input);
 
@@ -258,7 +311,7 @@ describe("AuthService.register (unit)", () => {
 		});
 
 		it("should work with minimal valid input", async () => {
-			const input = {
+			const input: RegisterInput = {
 				firstName: "J",
 				lastName: "D",
 				email: "j@d.co",
@@ -266,12 +319,17 @@ describe("AuthService.register (unit)", () => {
 				tenantName: "A"
 			};
 
-			vi.mocked(bcryptjs.hash).mockResolvedValue("hashed_password_value" as any);
+			vi.mocked(bcryptjs.hash).mockImplementation(
+				async () => "hashed_password_value"
+			);
 
-			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue({
+			const created: RegisterResult = {
 				userId: "user-123",
 				tenantId: "tenant-456"
-			});
+			};
+			mockUserRepository.createUserWithTenantIfEmailAvailable.mockResolvedValue(
+				created
+			);
 
 			const result = await authService.register(input);
 

@@ -42,5 +42,35 @@ describe("AppContainer (worker-service)", () => {
     // Verify Redis has error listeners (ioredis exposes listener count via _events)
     expect(container.redis.listenerCount("error")).toBeGreaterThan(0);
   });
+
+  it("createContainer() configures Redis with expected connection options", () => {
+    const container = createContainer("worker-service", env as ServiceEnv);
+    const redisOptions = (container.redis as unknown as {
+      options: {
+        maxRetriesPerRequest: number;
+        enableReadyCheck: boolean;
+        lazyConnect: boolean;
+      };
+    }).options;
+
+    expect(redisOptions.maxRetriesPerRequest).toBe(2);
+    expect(redisOptions.enableReadyCheck).toBe(true);
+    expect(redisOptions.lazyConnect).toBe(true);
+  });
+
+  it("createContainer() logs Redis connection errors with service context", () => {
+    const mockLogger = createLogger("worker-test");
+    const errorSpy = vi.spyOn(mockLogger, "error").mockImplementation(() => {
+      return undefined;
+    });
+    const container = createContainer("worker-service", env as ServiceEnv, mockLogger);
+
+    container.redis.emit("error", new Error("redis-boom"));
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      { error: "redis-boom", service: "worker-service" },
+      "Redis connection error"
+    );
+  });
 });
 

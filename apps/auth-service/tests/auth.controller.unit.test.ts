@@ -11,8 +11,6 @@ const registerRequestSchema = z.object({
 	tenantName: z.string().trim().min(1)
 });
 
-type RegisterRequestBody = z.infer<typeof registerRequestSchema>;
-
 describe("registerRequestSchema (controller validation)", () => {
 	describe("happy path", () => {
 		it("should accept valid input with all fields", () => {
