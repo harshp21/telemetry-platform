@@ -14,9 +14,13 @@ class TestRepository extends TenantScopedRepository {
 
 const mockPrisma = {} as unknown as PrismaClient;
 const tenantId = "tenant-abc-123" as TenantId;
+const mockLogger = {
+	error: vi.fn(),
+	debug: vi.fn(),
+};
 
 describe("TenantScopedRepository.where()", () => {
-	const repo = new TestRepository(mockPrisma, tenantId);
+	const repo = new TestRepository(mockPrisma, tenantId, mockLogger);
 
 	it("merges tenantId into empty conditions", () => {
 		expect(repo.callWhere({})).toEqual({ tenantId });
@@ -50,12 +54,14 @@ describe("TenantScopedRepository.withTenant()", () => {
 		const mockPrismaWithTx = {
 			$transaction: vi.fn((fn: (tx: Prisma.TransactionClient) => Promise<unknown>) => fn(mockTx)),
 		} as unknown as PrismaClient;
+		const testLogger = { error: vi.fn(), debug: vi.fn() };
 
-		const repo = new TestRepository(mockPrismaWithTx, tenantId);
+		const repo = new TestRepository(mockPrismaWithTx, tenantId, testLogger);
 		const result = await repo.callWithTenant(async () => "ok");
 
 		expect(mockPrismaWithTx.$transaction).toHaveBeenCalledOnce();
 		expect(queryRawMock).toHaveBeenCalledOnce();
+		expect(testLogger.debug).toHaveBeenCalledTimes(2); // start + commit
 		expect(result).toBe("ok");
 	});
 
@@ -64,9 +70,26 @@ describe("TenantScopedRepository.withTenant()", () => {
 		const mockPrismaWithTx = {
 			$transaction: vi.fn((fn: (tx: Prisma.TransactionClient) => Promise<unknown>) => fn(mockTx)),
 		} as unknown as PrismaClient;
+		const testLogger = { error: vi.fn(), debug: vi.fn() };
 
-		const repo = new TestRepository(mockPrismaWithTx, tenantId);
+		const repo = new TestRepository(mockPrismaWithTx, tenantId, testLogger);
 		const result = await repo.callWithTenant(async () => ({ id: "row-1" }));
 		expect(result).toEqual({ id: "row-1" });
+	});
+
+	it("logs transaction errors with tenant context and re-throws", async () => {
+		const testError = new Error("Query failed");
+		const mockPrismaWithError = {
+			$transaction: vi.fn().mockRejectedValue(testError),
+		} as unknown as PrismaClient;
+		const testLogger = { error: vi.fn(), debug: vi.fn() };
+
+		const repo = new TestRepository(mockPrismaWithError, tenantId, testLogger);
+
+		await expect(repo.callWithTenant(async () => "ok")).rejects.toThrow("Query failed");
+		expect(testLogger.error).toHaveBeenCalledOnce();
+		// Verify tenant context is included in error log
+		const errorCall = (testLogger.error as any).mock.calls[0];
+		expect(errorCall[0]).toMatchObject({ operation: "transaction_rollback" });
 	});
 });

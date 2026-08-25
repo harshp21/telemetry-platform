@@ -74,8 +74,11 @@ export abstract class TenantScopedRepository {
 5. Each `repositories/index.ts` re-exports `TenantScopedRepository`
 6. `where()` has `{ tenantId?: never }` constraint preventing caller injection
 7. `withTenant()` calls `set_config('app.tenant_id', ...)` to activate Postgres RLS policies
-8. 6 unit tests pass: 4 for `where()` (including override-wins) + 2 for `withTenant()`
-9. No controller, service, or plugin file touched
+8. `withTenant()` includes error handling with transaction lifecycle logging (start, commit, rollback)
+9. Logger is injected via constructor with console fallback for early-stage development
+10. 8 unit tests pass: 4 for `where()` + 4 for `withTenant()` (including error handling)
+11. 4 RLS integration tests verify cross-tenant blocking behavior
+12. No controller, service, or plugin file touched
 
 ---
 

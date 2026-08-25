@@ -1,6 +1,11 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
 import type { TenantId } from "@telemetry/shared-types";
 
+interface Logger {
+	error(obj: unknown, msg: string): void;
+	debug(obj: unknown, msg: string): void;
+}
+
 /**
  * Abstract base class for all tenant-scoped repositories.
  *
@@ -27,10 +32,11 @@ import type { TenantId } from "@telemetry/shared-types";
  * }
  *
  * // In a route handler:
- * const repo = new EventRepository(prisma, req.auth.tenantId);
+ * const repo = new EventRepository(prisma, req.auth.tenantId, logger);
  * const events = await repo.findByType("api.request");
  * // App layer: where() ensures WHERE tenantId = req.auth.tenantId
  * // DB layer: RLS policy blocks any row where row.tenantId != app.tenant_id
+ * // Error layer: transaction failures logged with tenant context
  * ```
  *
  * ## Security Properties
@@ -38,6 +44,7 @@ import type { TenantId } from "@telemetry/shared-types";
  * - ✅ `where()` compile-error if caller tries to pass `tenantId` (via `{ tenantId?: never }` constraint)
  * - ✅ `withTenant()` scopes RLS context to transaction only (`is_local = true`)
  * - ✅ RLS policies use FORCE RLS to prevent superuser bypass
+ * - ✅ Transaction errors logged with tenant context for observability
  * - ✅ Two-layer defense: app + DB isolation
  *
  * ## Non-Goals
@@ -46,10 +53,26 @@ import type { TenantId } from "@telemetry/shared-types";
  * - Auto-wrapping of all queries — developer responsibility
  */
 export abstract class TenantScopedRepository {
+	protected readonly logger: Logger;
+
 	constructor(
 		protected readonly prisma: PrismaClient,
-		protected readonly tenantId: TenantId
-	) {}
+		protected readonly tenantId: TenantId,
+		logger?: Logger
+	) {
+		this.logger =
+			logger ||
+			{
+				error: (obj: unknown, msg: string) => {
+					const context = typeof obj === "object" && obj !== null ? obj : { error: obj };
+					console.error({ ...context, tenantId }, msg);
+				},
+				debug: (obj: unknown, msg: string) => {
+					const context = typeof obj === "object" && obj !== null ? obj : { data: obj };
+					console.log({ ...context, tenantId }, msg);
+				},
+			};
+	}
 
 	protected where<T extends { tenantId?: never } & Record<string, unknown>>(
 		conditions: T
@@ -61,9 +84,20 @@ export abstract class TenantScopedRepository {
 	protected async withTenant<T>(
 		fn: (tx: Prisma.TransactionClient) => Promise<T>
 	): Promise<T> {
-		return this.prisma.$transaction(async (tx) => {
-			await tx.$queryRaw`SELECT set_config('app.tenant_id', ${this.tenantId}, true)`;
-			return fn(tx);
-		});
+		try {
+			this.logger.debug({ operation: "transaction_start" }, "Starting tenant-scoped transaction");
+			const result = await this.prisma.$transaction(async (tx) => {
+				await tx.$queryRaw`SELECT set_config('app.tenant_id', ${this.tenantId}, true)`;
+				return fn(tx);
+			});
+			this.logger.debug({ operation: "transaction_commit" }, "Tenant-scoped transaction committed");
+			return result;
+		} catch (err) {
+			this.logger.error(
+				{ operation: "transaction_rollback", error: err instanceof Error ? err.message : String(err) },
+				"Tenant-scoped transaction failed and was rolled back"
+			);
+			throw err;
+		}
 	}
 }
