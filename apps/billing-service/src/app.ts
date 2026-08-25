@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { env, type ServiceEnv } from "./config/env";
-import { createContainer } from "./config/container";
+import { createContainer, type AppContainer } from "./config/container";
 import {
   BILLING_RESPONSES,
   BILLING_ROUTES,
@@ -16,7 +16,7 @@ interface BuildBillingServiceAppOptions {
 
 export const buildBillingServiceApp = (
   options: BuildBillingServiceAppOptions = {}
-): FastifyInstance => {
+): FastifyInstance & { container: AppContainer } => {
   const app = Fastify({ logger: true });
   const container = createContainer(BILLING_SERVICE_NAME, env as ServiceEnv);
   app.decorate("container", container);
@@ -56,5 +56,5 @@ export const buildBillingServiceApp = (
     });
   });
 
-  return app;
+  return app as unknown as FastifyInstance & { container: AppContainer };
 };

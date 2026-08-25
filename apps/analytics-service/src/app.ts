@@ -1,14 +1,14 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { env, type ServiceEnv } from "./config/env";
-import { createContainer } from "./config/container";
+import { createContainer, type AppContainer } from "./config/container";
 import {
   ANALYTICS_RESPONSES,
   ANALYTICS_ROUTES,
   ANALYTICS_SERVICE_NAME
 } from "./constants";
 
-export const buildAnalyticsServiceApp = (): FastifyInstance => {
+export const buildAnalyticsServiceApp = (): FastifyInstance & { container: AppContainer } => {
   const app = Fastify({ logger: true });
   const container = createContainer(ANALYTICS_SERVICE_NAME, env as ServiceEnv);
   app.decorate("container", container);
@@ -30,5 +30,5 @@ export const buildAnalyticsServiceApp = (): FastifyInstance => {
     };
   });
 
-  return app;
+  return app as unknown as FastifyInstance & { container: AppContainer };
 };

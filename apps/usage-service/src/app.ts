@@ -2,7 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { UsageEventsBatchSchema } from "@telemetry/shared-validation";
 import { env, type ServiceEnv } from "./config/env";
-import { createContainer } from "./config/container";
+import { createContainer, type AppContainer } from "./config/container";
 import { TenantMismatchError } from "./errors";
 import {
   USAGE_SERVICE_HEADERS,
@@ -19,7 +19,7 @@ const normalizeHeader = (value: string | string[] | undefined): string | undefin
   return value;
 };
 
-export const buildUsageServiceApp = (): FastifyInstance => {
+export const buildUsageServiceApp = (): FastifyInstance & { container: AppContainer } => {
   const app = Fastify({ logger: true });
   const container = createContainer(USAGE_SERVICE_NAME, env as ServiceEnv);
   app.decorate("container", container);
@@ -57,5 +57,5 @@ export const buildUsageServiceApp = (): FastifyInstance => {
     });
   });
 
-  return app;
+  return app as unknown as FastifyInstance & { container: AppContainer };
 };

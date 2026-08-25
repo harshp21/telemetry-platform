@@ -1,11 +1,11 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { env, type ServiceEnv } from "./config/env";
-import { createContainer } from "./config/container";
+import { createContainer, type AppContainer } from "./config/container";
 import { AUTH_RESPONSES, AUTH_ROUTES, AUTH_SERVICE_NAME } from "./constants";
 import { registerAuthRoutes } from "./routes";
 
-export const buildAuthServiceApp = (): FastifyInstance => {
+export const buildAuthServiceApp = (): FastifyInstance & { container: AppContainer } => {
   const app = Fastify({ logger: true });
   const container = createContainer(AUTH_SERVICE_NAME, env as ServiceEnv);
   app.decorate("container", container);
@@ -29,5 +29,5 @@ export const buildAuthServiceApp = (): FastifyInstance => {
 
   app.register(registerAuthRoutes, { prefix: AUTH_ROUTES.V1_AUTH });
 
-  return app;
+  return app as unknown as FastifyInstance & { container: AppContainer };
 };

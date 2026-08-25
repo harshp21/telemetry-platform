@@ -1,6 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
-import { createContainer } from "./config/container";
+import { createContainer, type AppContainer } from "./config/container";
 import { loadEnv, type ServiceEnv } from "./config/env";
 import {
   GATEWAY_RESPONSES,
@@ -11,7 +11,7 @@ import { gatewayJwtAuthPreHandler } from "./middleware/auth.middleware";
 import { registerGatewayProxyRoutes } from "./plugins/proxy.plugin";
 import { registerGatewayRateLimit } from "./plugins/rate-limit.plugin";
 
-export const buildGatewayApp = (): FastifyInstance => {
+export const buildGatewayApp = (): FastifyInstance & { container: AppContainer } => {
   const app = Fastify({ logger: true });
   const config = loadEnv();
   const container = createContainer(GATEWAY_SERVICE_NAME, config as ServiceEnv);
@@ -56,5 +56,5 @@ export const buildGatewayApp = (): FastifyInstance => {
     analyticsServiceUrl: config.ANALYTICS_SERVICE_URL
   });
 
-  return app;
+  return app as unknown as FastifyInstance & { container: AppContainer };
 };

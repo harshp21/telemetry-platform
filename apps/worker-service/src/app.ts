@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { env, type ServiceEnv } from "./config/env";
-import { createContainer } from "./config/container";
+import { createContainer, type AppContainer } from "./config/container";
 import {
   WORKER_RESPONSES,
   WORKER_ROUTES,
@@ -16,7 +16,7 @@ interface BuildWorkerServiceAppOptions {
 
 export const buildWorkerServiceApp = (
   options: BuildWorkerServiceAppOptions = {}
-): FastifyInstance => {
+): FastifyInstance & { container: AppContainer } => {
   const app = Fastify({ logger: true });
   const container = createContainer(WORKER_SERVICE_NAME, env as ServiceEnv);
   app.decorate("container", container);
@@ -56,5 +56,5 @@ export const buildWorkerServiceApp = (
     });
   });
 
-  return app;
+  return app as unknown as FastifyInstance & { container: AppContainer };
 };
