@@ -7,6 +7,7 @@ import {
   GATEWAY_ROUTES,
   GATEWAY_SERVICE_NAME
 } from "./constants";
+import { gatewayRequestGuardsPreHandler } from "./middleware/guards.middleware";
 import { gatewayJwtAuthPreHandler } from "./middleware/auth.middleware";
 import { registerGatewayProxyRoutes } from "./plugins/proxy.plugin";
 import { registerGatewayRateLimit } from "./plugins/rate-limit.plugin";
@@ -25,6 +26,7 @@ export const buildGatewayApp = (): FastifyInstance & { container: AppContainer }
       await container.redis.quit();
     }
   });
+  app.addHook("onRequest", gatewayRequestGuardsPreHandler);
   app.addHook("onRequest", gatewayJwtAuthPreHandler);
   registerGatewayRateLimit(app, {
     redisUrl: config.REDIS_URL,
