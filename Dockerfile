@@ -10,6 +10,9 @@ COPY prisma ./prisma
 COPY docs ./docs
 
 RUN pnpm install --frozen-lockfile=false
+RUN cp prisma/schema.prisma apps/auth-service/schema.ci.prisma \
+	&& pnpm --filter @telemetry/auth-service exec prisma generate --schema=./schema.ci.prisma \
+	&& rm -f apps/auth-service/schema.ci.prisma
 
 ARG SERVICE_NAME
 ENV SERVICE_NAME=${SERVICE_NAME}
