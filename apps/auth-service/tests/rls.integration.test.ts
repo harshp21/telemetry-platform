@@ -41,6 +41,8 @@ describe("Postgres RLS enforcement (integration)", () => {
 			data: {
 				id: "u_rls_test_1" as UserId,
 				tenantId: tenant1Id,
+				firstName: "Rls",
+				lastName: "User",
 				email: "rls-test-1@example.com",
 				passwordHash: "hash1",
 				role: "OWNER",

@@ -61,9 +61,9 @@ interface TenantCreateArgs {
 
 interface UserCreateArgs {
 	data: {
+		tenantId: string;
 		firstName: string;
 		lastName: string;
-		tenantId: string;
 		email: string;
 		passwordHash: string;
 		role?: string;
@@ -185,9 +185,9 @@ export class UserRepository {
 
 				const user = await tx.user.create({
 					data: {
+						tenantId: tenant.id,
 						firstName: input.firstName,
 						lastName: input.lastName,
-						tenantId: tenant.id,
 						email: normalizedEmail,
 						passwordHash: input.passwordHash,
 						role: "OWNER"

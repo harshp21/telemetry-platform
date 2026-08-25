@@ -1,10 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { UserRepository } from "../src/repositories/user.repository";
-import type { PrismaClient } from "@prisma/client";
+
+type RepositoryDb = ConstructorParameters<typeof UserRepository>[0];
+type TransactionCallback = (tx: unknown) => unknown;
 
 describe("UserRepository.createUserWithTenantIfEmailAvailable (unit)", () => {
 	let userRepository: UserRepository;
-	let mockPrisma: any;
+	let mockPrisma: {
+		user: {
+			findFirst: ReturnType<typeof vi.fn>;
+			create: ReturnType<typeof vi.fn>;
+		};
+		tenant: {
+			create: ReturnType<typeof vi.fn>;
+		};
+		$transaction: ReturnType<typeof vi.fn>;
+	};
 
 	beforeEach(() => {
 		vi.clearAllMocks();
@@ -17,10 +28,10 @@ describe("UserRepository.createUserWithTenantIfEmailAvailable (unit)", () => {
 			tenant: {
 				create: vi.fn()
 			},
-			$transaction: vi.fn((callback) => callback(mockPrisma))
+			$transaction: vi.fn((callback: TransactionCallback) => callback(mockPrisma))
 		};
 
-		userRepository = new UserRepository(mockPrisma as PrismaClient);
+		userRepository = new UserRepository(mockPrisma as unknown as RepositoryDb);
 	});
 
 	describe("happy path", () => {
@@ -49,12 +60,23 @@ describe("UserRepository.createUserWithTenantIfEmailAvailable (unit)", () => {
 				role: "OWNER"
 			});
 
-			const result = await userRepository.createUserWithTenantIfEmailAvailable(input);
+			const result = await userRepository.createUserWithTenantIfEmailAvailable(
+				input
+			);
 
 			expect(result).toEqual({
 				userId: "user-456",
 				tenantId: "tenant-123"
 			});
+
+			expect(mockPrisma.user.create).toHaveBeenCalledWith(
+				expect.objectContaining({
+					data: expect.objectContaining({
+						firstName: "John",
+						lastName: "Doe"
+					})
+				})
+			);
 		});
 
 		it("should use Prisma transaction for atomicity", async () => {
@@ -67,7 +89,7 @@ describe("UserRepository.createUserWithTenantIfEmailAvailable (unit)", () => {
 			};
 
 			mockPrisma.user.findFirst.mockResolvedValue(null);
-			mockPrisma.$transaction.mockImplementation((callback) =>
+			mockPrisma.$transaction.mockImplementation((callback: TransactionCallback) =>
 				callback(mockPrisma)
 			);
 			mockPrisma.tenant.create.mockResolvedValue({
@@ -104,7 +126,7 @@ describe("UserRepository.createUserWithTenantIfEmailAvailable (unit)", () => {
 				email: "john@test.com"
 			});
 
-			const result = await userRepository.createUserWithTenantIfEmailAvailable(input);
+			await userRepository.createUserWithTenantIfEmailAvailable(input);
 
 			// Verify lowercase email was used
 			expect(mockPrisma.user.create).toHaveBeenCalledWith(
@@ -323,7 +345,7 @@ describe("UserRepository.createUserWithTenantIfEmailAvailable (unit)", () => {
 			};
 
 			mockPrisma.user.findFirst.mockResolvedValue(null);
-			mockPrisma.$transaction.mockImplementation((callback) => {
+			mockPrisma.$transaction.mockImplementation((_callback: TransactionCallback) => {
 				throw {
 					code: "P2002",
 					meta: { target: ["email"] }
@@ -382,7 +404,7 @@ describe("UserRepository.createUserWithTenantIfEmailAvailable (unit)", () => {
 			};
 
 			mockPrisma.user.findFirst.mockResolvedValue(null);
-			mockPrisma.$transaction.mockImplementation((callback) => {
+			mockPrisma.$transaction.mockImplementation((callback: TransactionCallback) => {
 				const tx = {
 					tenant: {
 						create: vi.fn().mockResolvedValue({ id: "tenant-123" })
