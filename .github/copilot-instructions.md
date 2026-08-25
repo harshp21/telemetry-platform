@@ -32,6 +32,15 @@
 - Reuse service constants instead of magic literals.
 - Fix root causes rather than patching symptoms.
 
+## Implementation Methodology: Pseudo-TDD
+- **Task Implementer workflow** (T-019 onwards): Pseudo-Test-Driven Development (TDD)
+  1. Write test file with ALL scenarios (from plan) BEFORE implementing code
+  2. Implement code to pass tests (controller → service → repository)
+  3. Refactor only AFTER all tests pass (tests protect against regression)
+  4. Run validations: typecheck, lint, tests
+- **Benefits**: Guaranteed test coverage, safe refactoring, clear contract definition, edge case discovery
+- **See**: [docs/task-implementer-workflow.md](../docs/task-implementer-workflow.md) for detailed TDD pattern and examples
+
 ## Validation
 - Run the narrowest useful validation immediately after the first substantive edit.
 - Prefer task-scoped lint, typecheck, tests, or schema validation over broad repo commands.
@@ -41,3 +50,4 @@
 - See [docs/contributing-guide.md](../docs/contributing-guide.md) for task hygiene.
 - See [docs/coding-standards.md](../docs/coding-standards.md) for code conventions.
 - See [docs/folder-structure.md](../docs/folder-structure.md) for repo ownership.
+- See [docs/task-implementer-workflow.md](../docs/task-implementer-workflow.md) for TDD implementation pattern (T-019+).
