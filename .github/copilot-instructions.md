@@ -7,8 +7,9 @@
 - Create or update a plan file in `docs/plans/` before requesting implementation approval.
 - Keep a visible pending-task list and update it as work progresses.
 - Ask for approval before starting implementation after presenting the plan.
-- Ask for approval before any commit or push.
-- Prefer the agent flow: Enterprise Delivery -> Epic Router -> Task Planner -> Task Implementer -> Senior Reviewer (pre-QA) -> QA Tester -> Senior Reviewer (final sign-off).
+- **NO commits until all gates pass** (implementation, reviews, QA, CI validation all complete).
+- Ask for approval before final commit/push after all gates are satisfied.
+- Preferred agent flow: Epic Router → Task Planner → Task Implementer → Senior Reviewer (pre-QA) → QA Tester → Senior Reviewer (final) → CI Validation Gate → Commit Approval.
 
 ## Token Discipline
 - Read the smallest local surface that can prove or disprove the current hypothesis.
@@ -16,6 +17,13 @@
 - During plan approval, provide detailed scope, steps, validations, risks, and pending tasks.
 - Do not restate unchanged plans or long summaries.
 - Use concise outputs with findings first, then risks, then next action.
+
+## Commit & CI Best Practices
+- **Commit timing**: Stage all changes during implementation but DO NOT commit until all review/QA gates pass AND CI validation succeeds.
+- **One commit per task**: Each completed task should result in a single, atomic commit (not incremental commits during review cycles).
+- **CI validation gate**: Before final commit approval, run: `pnpm build`, `pnpm test`, `pnpm lint`, `pnpm typecheck` across all 13 packages.
+- **If CI fails**: Request fixes, apply them to staged (uncommitted) changes, re-validate CI, then commit.
+- **Rollback safety**: Uncommitted changes can be discarded if any gate requests major revisions; no need to revert commits.
 
 ## Engineering Standards
 - Use strict TypeScript with explicit types.
