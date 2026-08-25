@@ -21,7 +21,7 @@ export const buildAuthServiceApp = (): FastifyInstance => {
   });
 
   app.get(AUTH_ROUTES.HEALTH, async () => {
-    app.container.logger.info("Health check called");
+    container.logger.info("Health check called");
     return {
       status: AUTH_RESPONSES.STATUS_OK,
       service: container.serviceName

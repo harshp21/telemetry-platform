@@ -37,7 +37,7 @@ export const buildWorkerServiceApp = (
   }
 
   app.get(WORKER_ROUTES.HEALTH, async () => {
-    app.container.logger.info("Health check called");
+    container.logger.info("Health check called");
     return {
       status: WORKER_RESPONSES.STATUS_OK,
       service: container.serviceName

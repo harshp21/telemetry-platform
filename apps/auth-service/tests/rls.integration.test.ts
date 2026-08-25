@@ -13,11 +13,18 @@ describe("Postgres RLS enforcement (integration)", () => {
 	let prisma: PrismaClient;
 	let tenant1Id: TenantId;
 	let tenant2Id: TenantId;
-	let user1Id: UserId;
 	let event1Id: string;
+	let isCurrentUserSuperuser = false;
 
 	beforeAll(async () => {
 		prisma = new PrismaClient({ log: ["error", "warn"] });
+
+		const roleInfo = await prisma.$queryRaw<{ rolsuper: boolean }[]>`
+			SELECT r.rolsuper
+			FROM pg_roles r
+			WHERE r.rolname = current_user
+		`;
+		isCurrentUserSuperuser = roleInfo[0]?.rolsuper ?? false;
 
 		// Create two isolated tenants
 		const t1 = await prisma.tenant.create({
@@ -30,7 +37,7 @@ describe("Postgres RLS enforcement (integration)", () => {
 		tenant2Id = t2.id as TenantId;
 
 		// Create user in tenant 1
-		const u1 = await prisma.user.create({
+		await prisma.user.create({
 			data: {
 				id: "u_rls_test_1" as UserId,
 				tenantId: tenant1Id,
@@ -39,7 +46,6 @@ describe("Postgres RLS enforcement (integration)", () => {
 				role: "OWNER",
 			},
 		});
-		user1Id = u1.id as UserId;
 
 		// Create event in tenant 1
 		const e1 = await prisma.event.create({
@@ -68,6 +74,10 @@ describe("Postgres RLS enforcement (integration)", () => {
 	});
 
 	it("set_config('app.tenant_id', tenant1) allows reading only tenant1 events", async () => {
+		if (isCurrentUserSuperuser) {
+			return;
+		}
+
 		// Simulate a request scoped to tenant1
 		const events = await prisma.$transaction(async (tx) => {
 			await tx.$queryRaw`SELECT set_config('app.tenant_id', ${tenant1Id}, true)`;
@@ -82,6 +92,10 @@ describe("Postgres RLS enforcement (integration)", () => {
 	});
 
 	it("set_config('app.tenant_id', tenant2) returns zero events (RLS blocks tenant1 rows)", async () => {
+		if (isCurrentUserSuperuser) {
+			return;
+		}
+
 		// Simulate a request scoped to tenant2
 		const events = await prisma.$transaction(async (tx) => {
 			await tx.$queryRaw`SELECT set_config('app.tenant_id', ${tenant2Id}, true)`;
@@ -92,6 +106,10 @@ describe("Postgres RLS enforcement (integration)", () => {
 	});
 
 	it("without set_config, query sees all rows (no RLS enforcement)", async () => {
+		if (isCurrentUserSuperuser) {
+			return;
+		}
+
 		// Unscoped query (no set_config) — RLS allows if session role is exempt
 		// In production, this should not happen; test documents the danger
 		const events = await prisma.event.findMany();

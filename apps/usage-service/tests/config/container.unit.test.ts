@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { createContainer } from "../../src/config/container";
 import { env, type ServiceEnv } from "../../src/config/env";
+import { createLogger } from "@telemetry/shared-logger";
 
 describe("AppContainer (usage-service)", () => {
   afterEach(() => {
@@ -29,13 +30,8 @@ describe("AppContainer (usage-service)", () => {
   });
 
   it("createContainer() uses provided logger when given", () => {
-    const mockLogger = {
-      info: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-      warn: vi.fn()
-    };
-    const container = createContainer("usage-service", env as ServiceEnv, mockLogger as any);
+    const mockLogger = createLogger("usage-test");
+    const container = createContainer("usage-service", env as ServiceEnv, mockLogger);
 
     expect(container.logger).toBe(mockLogger);
   });

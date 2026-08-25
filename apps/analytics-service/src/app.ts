@@ -24,7 +24,7 @@ export const buildAnalyticsServiceApp = (): FastifyInstance => {
   });
 
   app.get(ANALYTICS_ROUTES.HEALTH, async () => {
-    app.container.logger.info("Health check called");
+    container.logger.info("Health check called");
     return {
       status: ANALYTICS_RESPONSES.STATUS_OK,
       service: container.serviceName

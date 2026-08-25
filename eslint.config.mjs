@@ -11,6 +11,7 @@ export default [
   js.configs.recommended,
   {
     files: ["**/*.ts", "**/*.tsx"],
+    ignores: ["**/*.d.ts"],
     languageOptions: {
       parser,
       parserOptions: {
@@ -33,6 +34,7 @@ export default [
     },
     rules: {
       "no-undef": "off",
+      "no-unused-vars": "off",
       "no-console": ["warn", { "allow": ["warn", "error"] }],
       "@typescript-eslint/consistent-type-imports": "error",
       "@typescript-eslint/no-explicit-any": "error",

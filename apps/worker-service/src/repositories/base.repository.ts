@@ -1,5 +1,10 @@
-import type { PrismaClient, Prisma } from "@prisma/client";
+import type { PrismaClient } from "@prisma/client";
 import type { TenantId } from "@telemetry/shared-types";
+
+type TransactionClient = Omit<
+	PrismaClient,
+	"$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends"
+>;
 
 interface Logger {
 	error(obj: unknown, msg: string): void;
@@ -82,7 +87,7 @@ export abstract class TenantScopedRepository {
 
 	// Sets app.tenant_id for the duration of the transaction so Postgres RLS policies fire.
 	protected async withTenant<T>(
-		fn: (tx: Prisma.TransactionClient) => Promise<T>
+		fn: (tx: TransactionClient) => Promise<T>
 	): Promise<T> {
 		try {
 			this.logger.debug({ operation: "transaction_start" }, "Starting tenant-scoped transaction");

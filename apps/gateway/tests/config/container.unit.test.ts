@@ -1,8 +1,10 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { createContainer } from "../../src/config/container";
+import type { ServiceEnv } from "../../src/config/env";
+import { createLogger } from "@telemetry/shared-logger";
 
 // Mock env data for testing
-const mockEnv = {
+const mockEnv: ServiceEnv = {
   NODE_ENV: "test" as const,
   PORT: 3100,
   REDIS_URL: "redis://localhost:6379",
@@ -24,7 +26,7 @@ describe("AppContainer (gateway)", () => {
   });
 
   it("createContainer() returns all required properties (excluding prisma)", () => {
-    const container = createContainer("gateway", mockEnv as any);
+    const container = createContainer("gateway", mockEnv);
 
     expect(container).toBeDefined();
     expect(container.serviceName).toBe("gateway");
@@ -32,11 +34,11 @@ describe("AppContainer (gateway)", () => {
     expect(container.logger).toBeDefined();
     expect(container.redis).toBeDefined();
     // Gateway should NOT have prisma property
-    expect((container as any).prisma).toBeUndefined();
+    expect("prisma" in container).toBe(false);
   });
 
   it("createContainer() creates default logger when not provided", () => {
-    const container = createContainer("gateway", mockEnv as any);
+    const container = createContainer("gateway", mockEnv);
 
     expect(container.logger).toBeDefined();
     expect(typeof container.logger.info).toBe("function");
@@ -46,19 +48,14 @@ describe("AppContainer (gateway)", () => {
   });
 
   it("createContainer() uses provided logger when given", () => {
-    const mockLogger = {
-      info: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-      warn: vi.fn()
-    };
-    const container = createContainer("gateway", mockEnv as any, mockLogger as any);
+    const mockLogger = createLogger("gateway-test");
+    const container = createContainer("gateway", mockEnv, mockLogger);
 
     expect(container.logger).toBe(mockLogger);
   });
 
   it("createContainer() attaches error listener to Redis client", () => {
-    const container = createContainer("gateway", mockEnv as any);
+    const container = createContainer("gateway", mockEnv);
 
     // Verify Redis has error listeners (ioredis exposes listener count via _events)
     expect(container.redis.listenerCount("error")).toBeGreaterThan(0);

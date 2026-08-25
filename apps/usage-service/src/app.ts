@@ -35,7 +35,7 @@ export const buildUsageServiceApp = (): FastifyInstance => {
   });
 
   app.get(USAGE_SERVICE_ROUTES.HEALTH, async () => {
-    app.container.logger.info("Health check called");
+    container.logger.info("Health check called");
     return {
       status: USAGE_SERVICE_RESPONSES.STATUS_OK,
       service: container.serviceName

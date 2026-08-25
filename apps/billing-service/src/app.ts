@@ -37,7 +37,7 @@ export const buildBillingServiceApp = (
   }
 
   app.get(BILLING_ROUTES.HEALTH, async () => {
-    app.container.logger.info("Health check called");
+    container.logger.info("Health check called");
     return {
       status: BILLING_RESPONSES.STATUS_OK,
       service: container.serviceName
