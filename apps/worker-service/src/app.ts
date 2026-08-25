@@ -1,5 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
+import { env, type ServiceEnv } from "./config/env";
+import "./config/fastify";
 import { createContainer } from "./config/container";
 import {
   WORKER_RESPONSES,
@@ -17,7 +19,8 @@ export const buildWorkerServiceApp = (
   options: BuildWorkerServiceAppOptions = {}
 ): FastifyInstance => {
   const app = Fastify({ logger: true });
-  const container = createContainer(WORKER_SERVICE_NAME);
+  const container = createContainer(WORKER_SERVICE_NAME, env as ServiceEnv);
+  app.decorate("container", container);
   const internalApiSecret = options.internalApiSecret ?? process.env.INTERNAL_API_SECRET ?? "";
 
   registerGlobalErrorHandler(app);
@@ -27,6 +30,7 @@ export const buildWorkerServiceApp = (
   }
 
   app.get(WORKER_ROUTES.HEALTH, async () => {
+    app.container.logger.info("Health check called");
     return {
       status: WORKER_RESPONSES.STATUS_OK,
       service: container.serviceName

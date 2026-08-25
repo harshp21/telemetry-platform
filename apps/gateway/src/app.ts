@@ -1,7 +1,8 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
+import "./config/fastify";
 import { createContainer } from "./config/container";
-import { loadEnv } from "./config/env";
+import { loadEnv, type ServiceEnv } from "./config/env";
 import {
   GATEWAY_RESPONSES,
   GATEWAY_ROUTES,
@@ -13,8 +14,9 @@ import { registerGatewayRateLimit } from "./plugins/rate-limit.plugin";
 
 export const buildGatewayApp = (): FastifyInstance => {
   const app = Fastify({ logger: true });
-  const container = createContainer(GATEWAY_SERVICE_NAME);
   const config = loadEnv();
+  const container = createContainer(GATEWAY_SERVICE_NAME, config as ServiceEnv);
+  app.decorate("container", container);
 
   registerGlobalErrorHandler(app);
   app.addHook("onRequest", gatewayJwtAuthPreHandler);

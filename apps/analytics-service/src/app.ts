@@ -1,5 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
+import { env, type ServiceEnv } from "./config/env";
+import "./config/fastify";
 import { createContainer } from "./config/container";
 import {
   ANALYTICS_RESPONSES,
@@ -9,11 +11,13 @@ import {
 
 export const buildAnalyticsServiceApp = (): FastifyInstance => {
   const app = Fastify({ logger: true });
-  const container = createContainer(ANALYTICS_SERVICE_NAME);
+  const container = createContainer(ANALYTICS_SERVICE_NAME, env as ServiceEnv);
+  app.decorate("container", container);
 
   registerGlobalErrorHandler(app);
 
   app.get(ANALYTICS_ROUTES.HEALTH, async () => {
+    app.container.logger.info("Health check called");
     return {
       status: ANALYTICS_RESPONSES.STATUS_OK,
       service: container.serviceName

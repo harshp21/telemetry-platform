@@ -1,6 +1,8 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { UsageEventsBatchSchema } from "@telemetry/shared-validation";
+import { env, type ServiceEnv } from "./config/env";
+import "./config/fastify";
 import { createContainer } from "./config/container";
 import { TenantMismatchError } from "./errors";
 import {
@@ -20,11 +22,13 @@ const normalizeHeader = (value: string | string[] | undefined): string | undefin
 
 export const buildUsageServiceApp = (): FastifyInstance => {
   const app = Fastify({ logger: true });
-  const container = createContainer(USAGE_SERVICE_NAME);
+  const container = createContainer(USAGE_SERVICE_NAME, env as ServiceEnv);
+  app.decorate("container", container);
 
   registerGlobalErrorHandler(app);
 
   app.get(USAGE_SERVICE_ROUTES.HEALTH, async () => {
+    app.container.logger.info("Health check called");
     return {
       status: USAGE_SERVICE_RESPONSES.STATUS_OK,
       service: container.serviceName

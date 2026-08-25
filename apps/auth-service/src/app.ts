@@ -1,16 +1,20 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
+import { env, type ServiceEnv } from "./config/env";
+import "./config/fastify";
 import { createContainer } from "./config/container";
 import { AUTH_RESPONSES, AUTH_ROUTES, AUTH_SERVICE_NAME } from "./constants";
 import { registerAuthRoutes } from "./routes";
 
 export const buildAuthServiceApp = (): FastifyInstance => {
   const app = Fastify({ logger: true });
-  const container = createContainer(AUTH_SERVICE_NAME);
+  const container = createContainer(AUTH_SERVICE_NAME, env as ServiceEnv);
+  app.decorate("container", container);
 
   registerGlobalErrorHandler(app);
 
   app.get(AUTH_ROUTES.HEALTH, async () => {
+    app.container.logger.info("Health check called");
     return {
       status: AUTH_RESPONSES.STATUS_OK,
       service: container.serviceName
