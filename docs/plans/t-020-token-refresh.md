@@ -78,4 +78,7 @@
 - [in-progress] Summarize results and request commit approval
 
 ## 8. Approval gate
-- Implementation starts only after explicit user approval.
+- Senior Reviewer pre-QA review completed and required fixes integrated.
+- QA validation completed on the updated revision.
+- Senior Reviewer final sign-off completed on the tested revision.
+- Awaiting explicit user approval for commit/push.

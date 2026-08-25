@@ -24,3 +24,7 @@ This folder stores implementation plans that must be reviewed and approved befor
 1. Create/update plan file in this folder.
 2. Present plan for explicit approve/reject decision.
 3. Start implementation only after approval.
+4. Run Senior Reviewer pre-QA review and apply required fixes.
+5. Run QA validation on the updated revision.
+6. Run Senior Reviewer final sign-off on the exact tested revision.
+7. Request explicit approval before commit/push.

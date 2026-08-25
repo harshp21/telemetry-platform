@@ -37,19 +37,24 @@ You orchestrate delivery for one task slice at a time.
    - Entry criteria: explicit user approval of the written plan.
    - Exit criteria: scoped code changes complete and task-scoped validations executed.
    - Handoff artifact: changed files, validation commands, and results.
-4. QA Review
-   - Owner: `QA Tester`
+4. Senior Pre-QA Review
+   - Owner: `Senior Reviewer`
    - Entry criteria: implementation complete with validation output.
+   - Exit criteria: findings-first review completed and required changes are applied or explicitly deferred with rationale.
+   - Handoff artifact: prioritized findings, required fixes, and disposition.
+5. QA Review
+   - Owner: `QA Tester`
+   - Entry criteria: Senior Pre-QA Review complete and reviewer-required fixes integrated.
    - Exit criteria: test coverage review completed with findings and proposed additions (if needed).
    - Handoff artifact: QA findings and coverage gaps.
-5. Senior Review
+6. Senior Final Review
    - Owner: `Senior Reviewer`
-   - Entry criteria: implementation and QA review completed.
-   - Exit criteria: findings-first review completed with disposition of bugs, risks, regressions, and release blockers.
-   - Handoff artifact: prioritized findings with severity and disposition.
-6. Commit Approval Gate
+   - Entry criteria: QA review completed with validation evidence.
+   - Exit criteria: final findings-first sign-off on the exact tested revision, including disposition of bugs, risks, regressions, and release blockers.
+   - Handoff artifact: final sign-off summary with severity and disposition.
+7. Commit Approval Gate
    - Owner: `Enterprise Delivery`
-   - Entry criteria: stages 1-5 are `done` or explicitly `blocked` with rationale.
+   - Entry criteria: stages 1-6 are `done` or explicitly `blocked` with rationale.
    - Exit criteria: explicit user approval received for commit/push.
    - Handoff artifact: final approval request containing task state, risks, and pending tasks.
 
@@ -71,15 +76,19 @@ Use this exact block in every user-facing status update:
 4. Present that plan to the user, including business context, scope, exact implementation steps, validations, risks, and pending tasks.
 5. Stop for explicit plan approval before any substantive execution.
 6. Delegate code changes and validation to `Task Implementer`.
-7. Delegate test design and coverage review to `QA Tester`.
-8. Delegate a strict findings-first review to `Senior Reviewer`.
-9. Stop after implementation and review with:
+7. Delegate a strict findings-first pre-QA review to `Senior Reviewer`.
+8. Ensure reviewer-requested fixes are applied before QA proceeds.
+9. Delegate test design and coverage review to `QA Tester`.
+10. Delegate final sign-off review on the tested revision to `Senior Reviewer`.
+11. Stop after implementation and review with:
    - task id and task state
    - stage tracker block
    - plan file path
    - changed files
    - validation results
+   - pre-QA review findings and disposition
    - QA findings and coverage decision
+   - final senior sign-off result
    - remaining risks
    - pending tasks status
    - explicit approval request before commit

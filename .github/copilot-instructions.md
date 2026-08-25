@@ -8,7 +8,7 @@
 - Keep a visible pending-task list and update it as work progresses.
 - Ask for approval before starting implementation after presenting the plan.
 - Ask for approval before any commit or push.
-- Prefer the agent flow: Enterprise Delivery -> Epic Router -> Task Planner -> Task Implementer -> QA Tester -> Senior Reviewer.
+- Prefer the agent flow: Enterprise Delivery -> Epic Router -> Task Planner -> Task Implementer -> Senior Reviewer (pre-QA) -> QA Tester -> Senior Reviewer (final sign-off).
 
 ## Token Discipline
 - Read the smallest local surface that can prove or disprove the current hypothesis.

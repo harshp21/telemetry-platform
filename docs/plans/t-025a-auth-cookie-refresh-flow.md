@@ -82,4 +82,7 @@
 - Execute immediately after T-022 is completed and approved.
 
 ## 9. Approval gate
-- Implementation starts only after explicit user approval.
+- Senior Reviewer pre-QA review completed and required fixes integrated.
+- QA validation completed on the updated revision.
+- Senior Reviewer final sign-off completed on the tested revision.
+- Awaiting explicit user approval for commit/push.
