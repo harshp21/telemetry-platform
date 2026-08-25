@@ -27,6 +27,13 @@ export const buildUsageServiceApp = (): FastifyInstance => {
 
   registerGlobalErrorHandler(app);
 
+  // Add cleanup hook for Redis connection
+  app.addHook("onClose", async () => {
+    if (container.redis.status === "ready" || container.redis.status === "connecting") {
+      await container.redis.quit();
+    }
+  });
+
   app.get(USAGE_SERVICE_ROUTES.HEALTH, async () => {
     app.container.logger.info("Health check called");
     return {

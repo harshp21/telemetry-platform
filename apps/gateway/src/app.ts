@@ -19,6 +19,13 @@ export const buildGatewayApp = (): FastifyInstance => {
   app.decorate("container", container);
 
   registerGlobalErrorHandler(app);
+
+  // Add cleanup hook for Redis connection
+  app.addHook("onClose", async () => {
+    if (container.redis.status === "ready" || container.redis.status === "connecting") {
+      await container.redis.quit();
+    }
+  });
   app.addHook("onRequest", gatewayJwtAuthPreHandler);
   registerGatewayRateLimit(app, {
     redisUrl: config.REDIS_URL,

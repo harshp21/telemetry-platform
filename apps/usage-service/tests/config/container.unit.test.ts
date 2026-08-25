@@ -1,10 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import { createContainer } from "../../src/config/container";
-import { env } from "../../src/config/env";
+import { env, type ServiceEnv } from "../../src/config/env";
 
 describe("AppContainer (usage-service)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("createContainer() returns all required properties", () => {
-    const container = createContainer("usage-service", env);
+    const container = createContainer("usage-service", env as ServiceEnv);
 
     expect(container).toBeDefined();
     expect(container.serviceName).toBe("usage-service");
@@ -15,7 +19,7 @@ describe("AppContainer (usage-service)", () => {
   });
 
   it("createContainer() creates default logger when not provided", () => {
-    const container = createContainer("usage-service", env);
+    const container = createContainer("usage-service", env as ServiceEnv);
 
     expect(container.logger).toBeDefined();
     expect(typeof container.logger.info).toBe("function");
@@ -31,8 +35,16 @@ describe("AppContainer (usage-service)", () => {
       debug: vi.fn(),
       warn: vi.fn()
     };
-    const container = createContainer("usage-service", env, mockLogger as any);
+    const container = createContainer("usage-service", env as ServiceEnv, mockLogger as any);
 
     expect(container.logger).toBe(mockLogger);
   });
+
+  it("createContainer() attaches error listener to Redis client", () => {
+    const container = createContainer("usage-service", env as ServiceEnv);
+
+    // Verify Redis has error listeners (ioredis exposes listener count via _events)
+    expect(container.redis.listenerCount("error")).toBeGreaterThan(0);
+  });
 });
+

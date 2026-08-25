@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import { createContainer } from "../../src/config/container";
 
 // Mock env data for testing
@@ -19,6 +19,10 @@ const mockEnv = {
 };
 
 describe("AppContainer (gateway)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("createContainer() returns all required properties (excluding prisma)", () => {
     const container = createContainer("gateway", mockEnv as any);
 
@@ -51,5 +55,12 @@ describe("AppContainer (gateway)", () => {
     const container = createContainer("gateway", mockEnv as any, mockLogger as any);
 
     expect(container.logger).toBe(mockLogger);
+  });
+
+  it("createContainer() attaches error listener to Redis client", () => {
+    const container = createContainer("gateway", mockEnv as any);
+
+    // Verify Redis has error listeners (ioredis exposes listener count via _events)
+    expect(container.redis.listenerCount("error")).toBeGreaterThan(0);
   });
 });

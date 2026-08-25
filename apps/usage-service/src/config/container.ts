@@ -25,6 +25,15 @@ export const createContainer = (
     lazyConnect: true
   });
 
+  // Add error listener for connection failures
+  redisClient.on("error", (err: Error) => {
+    const defaultLogger = logger || createLogger(serviceName);
+    defaultLogger.error(
+      { error: err.message, service: serviceName },
+      "Redis connection error"
+    );
+  });
+
   return {
     serviceName,
     env,
