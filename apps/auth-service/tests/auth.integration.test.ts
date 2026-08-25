@@ -144,6 +144,8 @@ describe.sequential("auth-service integration", () => {
       method: "POST",
       url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
       payload: {
+        firstName: "Test",
+        lastName: "User",
         email,
         password: "StrongPass123",
         tenantName: "Acme Inc"
@@ -189,6 +191,8 @@ describe.sequential("auth-service integration", () => {
       method: "POST",
       url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
       payload: {
+        firstName: "John",
+        lastName: "Doe",
         email,
         password: "StrongPass123",
         tenantName: "Acme Inc"
@@ -206,6 +210,8 @@ describe.sequential("auth-service integration", () => {
       method: "POST",
       url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
       payload: {
+        firstName: "Jane",
+        lastName: "Smith",
         email,
         password: "StrongPass123",
         tenantName: "Acme Inc"
@@ -258,7 +264,7 @@ describe.sequential("auth-service integration", () => {
     expect(loginBody.data.user.userId.length).toBeGreaterThan(0);
     expect(typeof loginBody.data.user.tenantId).toBe("string");
     expect(loginBody.data.user.tenantId.length).toBeGreaterThan(0);
-    expect(loginBody.data.user.role).toBe("MEMBER");
+    expect(loginBody.data.user.role).toBe("OWNER");
 
     const wrongPasswordResponse: InjectResponse = await getApp().inject({
       method: "POST",
@@ -444,6 +450,224 @@ describe.sequential("auth-service integration", () => {
     expect(parseJsonBody<{ code: string; message: string }>(response)).toEqual({
       code: AUTH_RESPONSES.CODE_TOKEN_EXPIRED,
       message: AUTH_MESSAGES.TOKEN_EXPIRED
+    });
+  });
+
+  describe("register endpoint (T-018)", () => {
+    it("registers a new user with valid input and returns 201 with userId and tenantId", async () => {
+      const email = `valid-${randomUUID()}@example.com`;
+
+      const response: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "Alice",
+          lastName: "Johnson",
+          email,
+          password: "ValidPassword123",
+          tenantName: "Test Tenant"
+        }
+      });
+
+      expect(response.statusCode).toBe(AUTH_HTTP_STATUS.CREATED);
+      const body = parseJsonBody<{ data: { userId: string; tenantId: string } }>(response);
+      expect(body.data.userId).toBeTruthy();
+      expect(body.data.tenantId).toBeTruthy();
+      expect(typeof body.data.userId).toBe("string");
+      expect(typeof body.data.tenantId).toBe("string");
+    });
+
+    it("sets first registrant as OWNER role", async () => {
+      const email = `owner-role-${randomUUID()}@example.com`;
+
+      const registerResponse: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "Bob",
+          lastName: "Smith",
+          email,
+          password: "ValidPassword123",
+          tenantName: "Owner Test Tenant"
+        }
+      });
+
+      expect(registerResponse.statusCode).toBe(AUTH_HTTP_STATUS.CREATED);
+
+      const loginResponse: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGIN}`,
+        payload: {
+          email,
+          password: "ValidPassword123"
+        }
+      });
+
+      expect(loginResponse.statusCode).toBe(AUTH_HTTP_STATUS.OK);
+      const loginBody = parseJsonBody<{
+        data: {
+          user: {
+            userId: string;
+            tenantId: string;
+            role: string;
+          };
+        };
+      }>(loginResponse);
+      expect(loginBody.data.user.role).toBe("OWNER");
+    });
+
+    it("rejects duplicate email with 409 and EMAIL_ALREADY_EXISTS code", async () => {
+      const email = `duplicate-${randomUUID()}@example.com`;
+
+      const firstRegister: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "Carol",
+          lastName: "White",
+          email,
+          password: "ValidPassword123",
+          tenantName: "First Tenant"
+        }
+      });
+
+      expect(firstRegister.statusCode).toBe(AUTH_HTTP_STATUS.CREATED);
+
+      const secondRegister: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "David",
+          lastName: "Brown",
+          email,
+          password: "AnotherPassword123",
+          tenantName: "Second Tenant"
+        }
+      });
+
+      expect(secondRegister.statusCode).toBe(AUTH_HTTP_STATUS.CONFLICT);
+      const body = parseJsonBody<{ code: string; message: string }>(secondRegister);
+      expect(body.code).toBe(AUTH_RESPONSES.CODE_EMAIL_ALREADY_EXISTS);
+    });
+
+    it("rejects duplicate email case-insensitively with 409", async () => {
+      const email = `caseinsensitive-${randomUUID()}@example.com`;
+
+      const firstRegister: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "Eve",
+          lastName: "Green",
+          email: email.toUpperCase(),
+          password: "ValidPassword123",
+          tenantName: "Case Tenant 1"
+        }
+      });
+
+      expect(firstRegister.statusCode).toBe(AUTH_HTTP_STATUS.CREATED);
+
+      const secondRegister: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "Frank",
+          lastName: "Pink",
+          email: email.toLowerCase(),
+          password: "AnotherPassword123",
+          tenantName: "Case Tenant 2"
+        }
+      });
+
+      expect(secondRegister.statusCode).toBe(AUTH_HTTP_STATUS.CONFLICT);
+    });
+
+    it("rejects invalid email format with 400", async () => {
+      const response: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "Grace",
+          lastName: "Red",
+          email: "not-an-email",
+          password: "ValidPassword123",
+          tenantName: "Invalid Email Tenant"
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    it("rejects password shorter than 8 characters with 400", async () => {
+      const email = `shortpass-${randomUUID()}@example.com`;
+
+      const response: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "Henry",
+          lastName: "Yellow",
+          email,
+          password: "Short1",
+          tenantName: "Short Password Tenant"
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    it("rejects empty firstName with 400", async () => {
+      const email = `emptyname-${randomUUID()}@example.com`;
+
+      const response: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "",
+          lastName: "Blue",
+          email,
+          password: "ValidPassword123",
+          tenantName: "Empty Name Tenant"
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    it("rejects empty lastName with 400", async () => {
+      const email = `emptylast-${randomUUID()}@example.com`;
+
+      const response: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "Iris",
+          lastName: "",
+          email,
+          password: "ValidPassword123",
+          tenantName: "Empty Last Name Tenant"
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    it("rejects missing required field with 400", async () => {
+      const email = `missing-${randomUUID()}@example.com`;
+
+      const response: InjectResponse = await getApp().inject({
+        method: "POST",
+        url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.REGISTER}`,
+        payload: {
+          firstName: "Jack",
+          email,
+          password: "ValidPassword123",
+          tenantName: "Missing Field Tenant"
+          // lastName is missing
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
     });
   });
 });

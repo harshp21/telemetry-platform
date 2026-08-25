@@ -55,15 +55,18 @@ interface RefreshTokenUpdateManyArgs {
 }
 
 interface TenantCreateArgs {
-	data: { name: string };
+	data: { name: string; plan?: string; timezone?: string };
 	select: { id: true };
 }
 
 interface UserCreateArgs {
 	data: {
+		firstName: string;
+		lastName: string;
 		tenantId: string;
 		email: string;
 		passwordHash: string;
+		role?: string;
 	};
 	select: { id: true };
 }
@@ -111,6 +114,8 @@ interface AuthPrismaClient {
 }
 
 interface CreateUserWithTenantInput {
+	firstName: string;
+	lastName: string;
 	email: string;
 	passwordHash: string;
 	tenantName: string;
@@ -171,16 +176,21 @@ export class UserRepository {
 			const created = await this.db.$transaction(async (tx) => {
 				const tenant = await tx.tenant.create({
 					data: {
-						name: input.tenantName
+						name: input.tenantName,
+						plan: "FREE",
+						timezone: "UTC"
 					},
 					select: { id: true }
 				});
 
 				const user = await tx.user.create({
 					data: {
+						firstName: input.firstName,
+						lastName: input.lastName,
 						tenantId: tenant.id,
 						email: normalizedEmail,
-						passwordHash: input.passwordHash
+						passwordHash: input.passwordHash,
+						role: "OWNER"
 					},
 					select: { id: true }
 				});

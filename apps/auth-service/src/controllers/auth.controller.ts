@@ -11,6 +11,8 @@ import {
 } from "../utils/session-cookie";
 
 const registerRequestSchema = z.object({
+	firstName: z.string().trim().min(1),
+	lastName: z.string().trim().min(1),
 	email: z.string().email(),
 	password: z.string().min(AUTH_VALIDATION.PASSWORD_MIN_LENGTH),
 	tenantName: z.string().trim().min(1)

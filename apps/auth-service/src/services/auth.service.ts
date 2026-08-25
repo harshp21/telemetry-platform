@@ -13,6 +13,8 @@ import { TokenDenylistService } from "./token-denylist.service";
 import { TokenService } from "./token.service";
 
 interface RegisterInput {
+	firstName: string;
+	lastName: string;
 	email: string;
 	password: string;
 	tenantName: string;
@@ -63,6 +65,8 @@ export class AuthService {
 		const bcryptRounds = env.BCRYPT_ROUNDS ?? AUTH_VALIDATION.BCRYPT_DEFAULT_ROUNDS;
 		const passwordHash = await hash(input.password, bcryptRounds);
 		const created = await this.userRepository.createUserWithTenantIfEmailAvailable({
+			firstName: input.firstName,
+			lastName: input.lastName,
 			email: input.email,
 			passwordHash,
 			tenantName: input.tenantName
