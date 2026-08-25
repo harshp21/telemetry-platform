@@ -1,13 +1,13 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
-import { env, type ServiceEnv } from "./config/env";
+import { env } from "./config/env";
 import { createContainer, type AppContainer } from "./config/container";
 import { AUTH_RESPONSES, AUTH_ROUTES, AUTH_SERVICE_NAME } from "./constants";
 import { registerAuthRoutes } from "./routes";
 
 export const buildAuthServiceApp = (): FastifyInstance & { container: AppContainer } => {
   const app = Fastify({ logger: true });
-  const container = createContainer(AUTH_SERVICE_NAME, env as ServiceEnv);
+  const container = createContainer(AUTH_SERVICE_NAME, env);
   app.decorate("container", container);
 
   registerGlobalErrorHandler(app);

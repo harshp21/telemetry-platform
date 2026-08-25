@@ -8,7 +8,7 @@ import { createLogger } from "@telemetry/shared-logger";
 
 export interface AppContainer {
   readonly serviceName: string;
-  readonly env: ServiceEnv;
+  readonly env: Readonly<ServiceEnv>;
   readonly logger: Logger;
   readonly prisma: PrismaClient;
   readonly redis: Redis;
@@ -16,7 +16,7 @@ export interface AppContainer {
 
 export const createContainer = (
   serviceName: string,
-  env: ServiceEnv,
+  env: Readonly<ServiceEnv>,
   logger?: Logger
 ): AppContainer => {
   const redisClient = new RedisClient(env.REDIS_URL, {
