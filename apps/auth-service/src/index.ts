@@ -1,9 +1,17 @@
 import { initTracing } from "@telemetry/shared-tracing";
 import { AUTH_STARTUP } from "./startup.constants";
 
+type EnvLoadError = Error & { code?: string };
+
 const loadLocalEnv = (): void => {
 	if (typeof process.loadEnvFile === "function") {
-		process.loadEnvFile();
+		try {
+			process.loadEnvFile();
+		} catch (error) {
+			if ((error as EnvLoadError).code !== "ENOENT") {
+				throw error;
+			}
+		}
 	}
 };
 
@@ -49,4 +57,7 @@ const start = async (): Promise<void> => {
 	await app.listen({ port, host: AUTH_STARTUP.HOST });
 };
 
-void start();
+void start().catch((error) => {
+	console.error(error);
+	process.exit(1);
+});

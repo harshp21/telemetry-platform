@@ -5,6 +5,7 @@ type SignalHandler = () => void;
 type WorkerIndexModule = {
   shuttingDown: boolean;
 };
+type EnvLoadError = Error & { code?: string };
 
 const flushAsyncWork = async (): Promise<void> => {
   await Promise.resolve();
@@ -29,6 +30,7 @@ describe("graceful shutdown (worker-service)", () => {
 
   const setupIndexModule = async (options?: {
     closeError?: Error;
+    loadEnvFileError?: EnvLoadError;
   }): Promise<{
     moduleUnderTest: WorkerIndexModule;
     logger: { info: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
@@ -85,7 +87,13 @@ describe("graceful shutdown (worker-service)", () => {
     );
 
     if (typeof process.loadEnvFile === "function") {
-      vi.spyOn(process, "loadEnvFile").mockImplementation(() => undefined);
+      vi.spyOn(process, "loadEnvFile").mockImplementation(() => {
+        if (options?.loadEnvFileError) {
+          throw options.loadEnvFileError;
+        }
+
+        return undefined;
+      });
     }
 
     const moduleUnderTest = await import("../src/index");
@@ -109,6 +117,23 @@ describe("graceful shutdown (worker-service)", () => {
     expect(context.appListen).toHaveBeenCalledTimes(1);
     expect(signalHandlers.SIGTERM).toBeTypeOf("function");
     expect(signalHandlers.SIGINT).toBeTypeOf("function");
+  });
+
+  it("continues startup when loadEnvFile throws ENOENT", async () => {
+    const envLoadError = Object.assign(new Error("missing .env"), { code: "ENOENT" }) as EnvLoadError;
+    const context = await setupIndexModule({ loadEnvFileError: envLoadError });
+
+    expect(context.buildApp).toHaveBeenCalledTimes(1);
+    expect(context.appListen).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails startup when loadEnvFile throws non-ENOENT", async () => {
+    const envLoadError = Object.assign(new Error("load failure"), { code: "EACCES" }) as EnvLoadError;
+    const context = await setupIndexModule({ loadEnvFileError: envLoadError });
+
+    expect(context.buildApp).not.toHaveBeenCalled();
+    expect(context.appListen).not.toHaveBeenCalled();
+    expect(exitCodes).toContain(1);
   });
 
   it("handles SIGTERM with full shutdown sequence and exit code 0", async () => {
