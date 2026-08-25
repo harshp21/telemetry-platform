@@ -14,12 +14,15 @@ const start = async (): Promise<void> => {
 	const { buildAuthServiceApp } = await import("./app");
 	const app = buildAuthServiceApp();
 	const container = app.container;
+	let isShuttingDown = false;
 
 	const shutdown = async (signal: string): Promise<void> => {
 		container.logger.info({ signal }, "Shutting down gracefully");
 		try {
 			await app.close();
 			await container.prisma.$disconnect();
+			// Redis disconnect: quit() called via app.close() → onClose hook;
+			// disconnect() here ensures immediate cleanup even if quit() fails.
 			container.redis.disconnect();
 			container.logger.info("Shutdown complete");
 			process.exit(0);
@@ -30,10 +33,16 @@ const start = async (): Promise<void> => {
 	};
 
 	process.on("SIGTERM", () => {
-		void shutdown("SIGTERM");
+		if (!isShuttingDown) {
+			isShuttingDown = true;
+			void shutdown("SIGTERM");
+		}
 	});
 	process.on("SIGINT", () => {
-		void shutdown("SIGINT");
+		if (!isShuttingDown) {
+			isShuttingDown = true;
+			void shutdown("SIGINT");
+		}
 	});
 
 	const port = Number(process.env.PORT ?? AUTH_STARTUP.DEFAULT_PORT);

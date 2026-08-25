@@ -9,6 +9,8 @@ const loadLocalEnv = (): void => {
 
 initTracing(WORKER_SERVICE_STARTUP.SERVICE_NAME);
 
+// Exported for T-039 (stream consumer loop) to signal graceful shutdown.
+// Stream consumer should check this flag in its loop condition.
 export let shuttingDown = false;
 
 const start = async (): Promise<void> => {
@@ -16,6 +18,7 @@ const start = async (): Promise<void> => {
 	const { buildWorkerServiceApp } = await import("./app");
 	const app = buildWorkerServiceApp();
 	const container = app.container;
+	let isShuttingDown = false;
 
 	const shutdown = async (signal: string): Promise<void> => {
 		shuttingDown = true;
@@ -33,10 +36,16 @@ const start = async (): Promise<void> => {
 	};
 
 	process.on("SIGTERM", () => {
-		void shutdown("SIGTERM");
+		if (!isShuttingDown) {
+			isShuttingDown = true;
+			void shutdown("SIGTERM");
+		}
 	});
 	process.on("SIGINT", () => {
-		void shutdown("SIGINT");
+		if (!isShuttingDown) {
+			isShuttingDown = true;
+			void shutdown("SIGINT");
+		}
 	});
 
 	const port = Number(process.env.PORT ?? WORKER_SERVICE_STARTUP.DEFAULT_PORT);
