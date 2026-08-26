@@ -15,7 +15,12 @@ export const USAGE_SERVICE_RESPONSES = {
   VERSION_V1: "v1",
   CODE_VALIDATION_ERROR: "VALIDATION_ERROR",
   CODE_TENANT_MISMATCH: "TENANT_MISMATCH",
-  MESSAGE_TENANT_MISMATCH: "Event tenantId does not match authenticated tenant context"
+  MESSAGE_TENANT_MISMATCH: "Event tenantId does not match authenticated tenant context",
+  CODE_TENANT_CONTEXT_MISSING: "TENANT_CONTEXT_MISSING",
+  MESSAGE_TENANT_CONTEXT_MISSING: "X-Tenant-Id header is required",
+  HTTP_STATUS_ACCEPTED: 202,
+  HTTP_STATUS_FORBIDDEN: 403,
+  HTTP_STATUS_UNAUTHORIZED: 401
 } as const;
 
 export const USAGE_SERVICE_RUNTIME = {

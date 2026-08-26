@@ -4,6 +4,8 @@ import { UsageEventsBatchSchema } from "@telemetry/shared-validation";
 import { env, type ServiceEnv } from "./config/env";
 import { createContainer, type AppContainer } from "./config/container";
 import { TenantMismatchError } from "./errors";
+import { registerUsageTenantContextMiddleware } from "./middleware";
+import "./types";
 import {
   USAGE_SERVICE_HEADERS,
   USAGE_SERVICE_NAME,
@@ -25,6 +27,7 @@ export const buildUsageServiceApp = (): FastifyInstance & { container: AppContai
   app.decorate("container", container);
 
   registerGlobalErrorHandler(app);
+  registerUsageTenantContextMiddleware(app);
 
   // Add cleanup hook for Redis connection
   app.addHook("onClose", async () => {
@@ -50,7 +53,7 @@ export const buildUsageServiceApp = (): FastifyInstance & { container: AppContai
       throw new TenantMismatchError();
     }
 
-    return reply.status(202).send({
+    return reply.status(USAGE_SERVICE_RESPONSES.HTTP_STATUS_ACCEPTED).send({
       status: USAGE_SERVICE_RESPONSES.STATUS_ACCEPTED,
       acceptedCount: parsed.events.length,
       version: USAGE_SERVICE_RESPONSES.VERSION_V1

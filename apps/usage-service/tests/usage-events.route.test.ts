@@ -69,6 +69,9 @@ describe(`POST ${USAGE_SERVICE_ROUTES.USAGE_EVENTS}`, () => {
             eventId: "evt_1"
           }
         ]
+      },
+      headers: {
+        [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A
       }
     });
 
@@ -119,7 +122,10 @@ describe(`POST ${USAGE_SERVICE_ROUTES.USAGE_EVENTS}`, () => {
 
     const response = await app.inject({
       method: "GET",
-      url: "/boom"
+      url: "/boom",
+      headers: {
+        [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A
+      }
     });
 
     expect(response.statusCode).toBe(500);
