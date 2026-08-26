@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance, FastifyRequest } from "fastify";
+import type Redis from "ioredis";
 import { registerGatewayRateLimit } from "../src/plugins/rate-limit.plugin";
 import { GATEWAY_PUBLIC_ROUTES, GATEWAY_RESPONSES, GATEWAY_USAGE_ROUTES } from "../src/constants";
 
@@ -104,7 +105,32 @@ describe("gateway rate limit contract", () => {
     });
   });
 
-  it("creates and closes a redis client in production mode", async () => {
+  it("uses passed redis client when provided in config", async () => {
+    const addHook = vi.fn();
+    const register = vi.fn();
+    const passedRedisClient = { quit: vi.fn() } as unknown as Redis;
+    const app = { addHook, register } satisfies GatewayRateLimitAppMock;
+
+    registerGatewayRateLimit(app as unknown as FastifyInstance, {
+      redis: passedRedisClient,
+      redisUrl: "redis://redis.example.internal:6379",
+      nodeEnv: "production",
+      rateLimitMax: 1000,
+      rateLimitWindowMs: 1000,
+      ingestionRateLimitMax: 5000
+    });
+
+    expect(register).toHaveBeenCalledTimes(1);
+    const [, options] = register.mock.calls[0] as [unknown, { redis: Redis }];
+    // Should use the passed client, not create a new one
+    expect(options.redis).toBe(passedRedisClient);
+
+    // Should NOT add a close hook for passed clients (container manages lifecycle)
+    const closeHooks = addHook.mock.calls.filter(([hookName]) => hookName === "onClose");
+    expect(closeHooks).toHaveLength(0);
+  });
+
+  it("creates and closes a redis client in production mode when not provided", async () => {
     const addHook = vi.fn();
     const register = vi.fn();
     const app = { addHook, register } satisfies GatewayRateLimitAppMock;
@@ -121,6 +147,7 @@ describe("gateway rate limit contract", () => {
     const [, options] = register.mock.calls[0] as [unknown, { redis: { quit: () => Promise<void> } }];
     expect(options.redis).toBeDefined();
 
+    // Should add close hook only when creating the client (not when passed)
     const closeHook = addHook.mock.calls.find(([hookName]) => hookName === "onClose")?.[1] as
       | (() => Promise<void>)
       | undefined;

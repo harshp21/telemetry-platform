@@ -8,6 +8,7 @@ import {
 } from "../constants";
 
 export interface GatewayRateLimitConfig {
+  readonly redis?: Redis;
   readonly redisUrl: string;
   readonly nodeEnv: string;
   readonly rateLimitMax: number;
@@ -41,16 +42,19 @@ export const registerGatewayRateLimit = (
   app: FastifyInstance,
   config: GatewayRateLimitConfig
 ): void => {
+  // Use passed Redis client (from container) if available;
+  // only create new client if not provided (for backward compatibility).
   const redisClient =
     config.nodeEnv === "test"
       ? undefined
-      : new Redis(config.redisUrl, {
+      : config.redis ?? new Redis(config.redisUrl, {
           maxRetriesPerRequest: 2,
           enableReadyCheck: true,
           lazyConnect: true
         });
 
-  if (redisClient) {
+  // Only manage lifecycle for clients we created (not container-managed).
+  if (redisClient && !config.redis) {
     app.addHook("onClose", async () => {
       await redisClient.quit();
     });

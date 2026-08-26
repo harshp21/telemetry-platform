@@ -29,6 +29,7 @@ export const buildGatewayApp = (): FastifyInstance & { container: AppContainer }
   app.addHook("onRequest", gatewayRequestGuardsPreHandler);
   app.addHook("onRequest", gatewayJwtAuthPreHandler);
   registerGatewayRateLimit(app, {
+    redis: container.redis,
     redisUrl: config.REDIS_URL,
     nodeEnv: config.NODE_ENV,
     rateLimitMax: config.RATE_LIMIT_MAX,
