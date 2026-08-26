@@ -46,6 +46,42 @@
 - Prefer task-scoped lint, typecheck, tests, or schema validation over broad repo commands.
 - For Prisma changes, keep schema and migration files aligned.
 
+## Senior Reviewer Standards (Pre-QA & Final)
+
+### Pre-QA Review Checklist
+- **Compile-Time Validation** (REQUIRED GATE):
+  - Run task-scoped lint, typecheck, build — NO errors allowed
+  - Run full workspace lint, typecheck, build — NO blockers allowed
+  - Report status (all 13 packages) for every review
+- **Clean Code Practices** (REQUIRED GATE):
+  - Verify NO magic strings (literals must use constants)
+  - Verify NO magic numbers (status codes, retries, timeouts from constants)
+  - Verify DRY principle (no duplicate definitions)
+  - Verify all error codes/messages in constants.ts or service-specific constants
+  - Report findings-first: each violation as BLOCKER/HIGH/MEDIUM/LOW with disposition
+- **Code Correctness**:
+  - Bug detection and regression risk assessment
+  - Type safety and boundary violations
+  - Security vulnerabilities and injection risks
+- **Production Readiness**:
+  - Error handling contract verification
+  - Middleware ordering and execution flow
+  - Logging/observability adequacy
+  - Performance overhead assessment
+
+### Final Review Checklist (Post-QA)
+- **All Pre-QA checks** (repeated on tested revision)
+- **Test Coverage Alignment**:
+  - Verify tests match implementation (no orphaned code or untested logic)
+  - Verify error paths tested (all failure cases)
+- **Release Readiness**:
+  - Verify acceptance criteria 100% satisfied
+  - Verify no regressions in related services
+  - Verify breaking change assessment
+- **Approval Gate**:
+  - Explicit sign-off required: "APPROVED FOR COMMIT" or "CONDITIONAL" with required fixes
+  - List remaining risks and dispositions
+
 ## References
 - See [docs/contributing-guide.md](../docs/contributing-guide.md) for task hygiene.
 - See [docs/coding-standards.md](../docs/coding-standards.md) for code conventions.
