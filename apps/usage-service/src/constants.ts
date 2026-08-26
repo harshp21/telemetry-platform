@@ -27,3 +27,13 @@ export const USAGE_SERVICE_RUNTIME = {
   DEFAULT_PORT: 3002,
   HOST: "0.0.0.0"
 } as const;
+
+export const DEDUP_CONSTANTS = {
+  KEY_PREFIX: "dedup:",
+  KEY_TTL_SECONDS: 86400 // 24 hours
+} as const;
+
+export const STREAM_CONSTANTS = {
+  DEFAULT_STREAM_NAME: "telemetry:events",
+  DEFAULT_MAX_LEN: 100_000
+} as const;

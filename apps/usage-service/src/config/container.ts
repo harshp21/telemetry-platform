@@ -5,6 +5,8 @@ import type { ServiceEnv } from "./env";
 import { prisma } from "../lib/prisma";
 import RedisClient from "ioredis";
 import { createLogger } from "@telemetry/shared-logger";
+import { DeduplicationService } from "../services/deduplication.service";
+import { StreamPublisher } from "../events/stream.publisher";
 
 export interface AppContainer {
   readonly serviceName: string;
@@ -12,6 +14,8 @@ export interface AppContainer {
   readonly logger: Logger;
   readonly prisma: PrismaClient;
   readonly redis: Redis;
+  readonly deduplication: DeduplicationService;
+  readonly streamPublisher: StreamPublisher;
 }
 
 export const createContainer = (
@@ -34,11 +38,15 @@ export const createContainer = (
     );
   });
 
+  const containerLogger = logger ?? createLogger(serviceName);
+
   return {
     serviceName,
     env,
-    logger: logger ?? createLogger(serviceName),
+    logger: containerLogger,
     prisma,
-    redis: redisClient
+    redis: redisClient,
+    deduplication: new DeduplicationService(redisClient, containerLogger),
+    streamPublisher: new StreamPublisher(redisClient, containerLogger, env)
   };
 };
