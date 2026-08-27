@@ -2,12 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { Logger } from "pino";
 import type Redis from "ioredis";
 import type { ServiceEnv } from "../src/config/env";
-import { StreamPublisher } from "../src/events/stream.publisher";
-import {
-  eventIdSchema,
-  tenantIdSchema,
-  type TelemetryEventEnvelope
-} from "@telemetry/shared-validation";
+import { StreamPublisher, type StreamEvent } from "../src/events/stream.publisher";
 
 describe("StreamPublisher", () => {
   let mockRedis: Record<string, ReturnType<typeof vi.fn>>;
@@ -15,25 +10,15 @@ describe("StreamPublisher", () => {
   let mockEnv: Partial<ServiceEnv>;
   let publisher: StreamPublisher;
 
-  const eventId = eventIdSchema.parse("550e8400-e29b-41d4-a716-446655440000");
-  const tenantId = tenantIdSchema.parse(
-    "550e8400-e29b-41d4-a716-446655440001"
-  );
-
-  const mockEvent: TelemetryEventEnvelope = {
-    eventId,
-    tenantId,
+  const mockEvent: StreamEvent = {
+    eventId: "550e8400-e29b-41d4-a716-446655440000",
+    tenantId: "550e8400-e29b-41d4-a716-446655440001",
     eventType: "api.request",
     occurredAt: new Date().toISOString(),
-    receivedAt: new Date().toISOString(),
-    source: "test-source",
+    timestamp: Date.now(),
     idempotencyKey: "test-key",
-    version: 1,
-    payload: {
-      quantity: 100,
-      unit: "requests",
-      occurredAt: new Date().toISOString()
-    }
+    quantity: "100",
+    unit: "requests"
   };
 
   beforeEach(() => {
@@ -138,6 +123,17 @@ describe("StreamPublisher", () => {
       );
     });
 
+    it("should throw error when Redis returns null stream ID - fail-closed", async () => {
+      // Arrange
+      (mockRedis.xadd as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+
+      // Act & Assert
+      await expect(publisher.publish(mockEvent)).rejects.toThrow(
+        "Redis stream publish returned null stream ID"
+      );
+      expect(mockLogger.error).toHaveBeenCalled();
+    });
+
     it("should log event info at info level on successful publish", async () => {
       // Arrange
       const streamId = "1234567890-0";
@@ -186,17 +182,9 @@ describe("StreamPublisher", () => {
 
     it("should handle large event payload and return stream ID", async () => {
       // Arrange
-      const largePayload = {
-        quantity: 100,
-        unit: "requests",
-        occurredAt: new Date().toISOString(),
-        metadata: {
-          largeData: "x".repeat(500 * 1024) // 500KB of data
-        }
-      };
-      const largeEvent: TelemetryEventEnvelope = {
+      const largeEvent: StreamEvent = {
         ...mockEvent,
-        payload: largePayload as unknown as typeof mockEvent.payload
+        metadata: "x".repeat(500 * 1024) // 500KB of data
       };
       const streamId = "1234567890-0";
       (mockRedis.xadd as ReturnType<typeof vi.fn>).mockResolvedValueOnce(

@@ -7,6 +7,8 @@ import RedisClient from "ioredis";
 import { createLogger } from "@telemetry/shared-logger";
 import { DeduplicationService } from "../services/deduplication.service";
 import { StreamPublisher } from "../events/stream.publisher";
+import { IngestionService } from "../services/ingestion.service";
+import { EventsController } from "../controllers/events.controller";
 
 export interface AppContainer {
   readonly serviceName: string;
@@ -16,6 +18,8 @@ export interface AppContainer {
   readonly redis: Redis;
   readonly deduplication: DeduplicationService;
   readonly streamPublisher: StreamPublisher;
+  readonly ingestionService: IngestionService;
+  readonly eventsController: EventsController;
 }
 
 export const createContainer = (
@@ -39,6 +43,10 @@ export const createContainer = (
   });
 
   const containerLogger = logger ?? createLogger(serviceName);
+  const deduplication = new DeduplicationService(redisClient, containerLogger);
+  const streamPublisher = new StreamPublisher(redisClient, containerLogger, env);
+  const ingestionService = new IngestionService(deduplication, streamPublisher, containerLogger);
+  const eventsController = new EventsController(ingestionService, containerLogger);
 
   return {
     serviceName,
@@ -46,7 +54,9 @@ export const createContainer = (
     logger: containerLogger,
     prisma,
     redis: redisClient,
-    deduplication: new DeduplicationService(redisClient, containerLogger),
-    streamPublisher: new StreamPublisher(redisClient, containerLogger, env)
+    deduplication,
+    streamPublisher,
+    ingestionService,
+    eventsController
   };
 };

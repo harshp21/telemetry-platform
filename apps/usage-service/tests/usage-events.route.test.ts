@@ -1,5 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { FastifyInstance } from "fastify";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildUsageServiceApp } from "../src/app";
 import {
   USAGE_SERVICE_HEADERS,
@@ -8,12 +7,9 @@ import {
 } from "../src/constants";
 
 const TENANT_ID_A = "11111111-1111-4111-8111-111111111111";
-const TENANT_ID_B = "22222222-2222-4222-8222-222222222222";
-const EVENT_ID_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-const EVENT_ID_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 describe(`POST ${USAGE_SERVICE_ROUTES.USAGE_EVENTS}`, () => {
-  let app: FastifyInstance;
+  let app: ReturnType<typeof buildUsageServiceApp>;
 
   beforeEach(() => {
     app = buildUsageServiceApp();
@@ -24,25 +20,25 @@ describe(`POST ${USAGE_SERVICE_ROUTES.USAGE_EVENTS}`, () => {
   });
 
   it("accepts a valid event batch", async () => {
+    vi.spyOn(app.container.deduplication, "isNew").mockResolvedValueOnce(true);
+    vi.spyOn(app.container.streamPublisher, "publish").mockResolvedValueOnce(
+      "1700000000000-0"
+    );
+
+    const now = new Date().toISOString();
+
     const response = await app.inject({
       method: "POST",
       url: USAGE_SERVICE_ROUTES.USAGE_EVENTS,
       payload: {
         events: [
           {
-            eventId: EVENT_ID_A,
-            tenantId: TENANT_ID_A,
             eventType: "api.request",
-            occurredAt: "2026-01-01T00:00:00Z",
-            receivedAt: "2026-01-01T00:00:01Z",
-            source: "sdk-web",
+            quantity: 10,
+            unit: "request",
+            occurredAt: now,
             idempotencyKey: "idem_1",
-            version: 1,
-            payload: {
-              quantity: 10,
-              unit: "request",
-              occurredAt: "2026-01-01T00:00:00Z"
-            }
+            metadata: { sourceId: "sdk-web" }
           }
         ]
       },
@@ -53,10 +49,14 @@ describe(`POST ${USAGE_SERVICE_ROUTES.USAGE_EVENTS}`, () => {
 
     expect(response.statusCode).toBe(202);
     expect(response.json()).toMatchObject({
-      status: USAGE_SERVICE_RESPONSES.STATUS_ACCEPTED,
-      acceptedCount: 1,
-      version: USAGE_SERVICE_RESPONSES.VERSION_V1
+      data: {
+        accepted: 1,
+        duplicate: 0,
+        rejected: 0
+      }
     });
+    expect(app.container.deduplication.isNew).toHaveBeenCalledTimes(1);
+    expect(app.container.streamPublisher.publish).toHaveBeenCalledTimes(1);
   });
 
   it("returns validation error for malformed payload", async () => {
@@ -81,37 +81,52 @@ describe(`POST ${USAGE_SERVICE_ROUTES.USAGE_EVENTS}`, () => {
     });
   });
 
-  it("rejects tenant mismatch", async () => {
+  it("returns 401 when tenant header is missing", async () => {
+    const now = new Date().toISOString();
+
     const response = await app.inject({
       method: "POST",
       url: USAGE_SERVICE_ROUTES.USAGE_EVENTS,
       payload: {
         events: [
           {
-            eventId: EVENT_ID_B,
-            tenantId: TENANT_ID_B,
             eventType: "api.request",
-            occurredAt: "2026-01-01T00:00:00Z",
-            receivedAt: "2026-01-01T00:00:01Z",
-            source: "sdk-web",
-            idempotencyKey: "idem_1",
-            version: 1,
-            payload: {
-              quantity: 10,
-              unit: "request",
-              occurredAt: "2026-01-01T00:00:00Z"
-            }
+            quantity: 1,
+            unit: "request",
+            occurredAt: now,
+            idempotencyKey: "idem-missing-tenant"
           }
         ]
-      },
+      }
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({
+      code: USAGE_SERVICE_RESPONSES.CODE_TENANT_CONTEXT_MISSING
+    });
+  });
+
+  it("rejects batch larger than 100 events", async () => {
+    const events = Array.from({ length: 101 }, (_, i) => ({
+      eventType: "api.request",
+      quantity: 1,
+      unit: "request",
+      occurredAt: "2026-01-01T00:00:00Z",
+      idempotencyKey: `idem_${i}`
+    }));
+
+    const response = await app.inject({
+      method: "POST",
+      url: USAGE_SERVICE_ROUTES.USAGE_EVENTS,
+      payload: { events },
       headers: {
         [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A
       }
     });
 
-    expect(response.statusCode).toBe(403);
+    expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({
-      code: USAGE_SERVICE_RESPONSES.CODE_TENANT_MISMATCH
+      code: "BATCH_TOO_LARGE"
     });
   });
 
