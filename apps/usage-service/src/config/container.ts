@@ -1,6 +1,7 @@
 import type { Logger } from "pino";
 import type { PrismaClient } from "@prisma/client";
 import type Redis from "ioredis";
+import type { TenantId } from "@telemetry/shared-types";
 import type { ServiceEnv } from "./env";
 import { prisma } from "../lib/prisma";
 import RedisClient from "ioredis";
@@ -8,7 +9,10 @@ import { createLogger } from "@telemetry/shared-logger";
 import { DeduplicationService } from "../services/deduplication.service";
 import { StreamPublisher } from "../events/stream.publisher";
 import { IngestionService } from "../services/ingestion.service";
+import { UsageService, type UsageRepositoryFactory } from "../services/usage.service";
+import { UsageRepository } from "../repositories/usage.repository";
 import { EventsController } from "../controllers/events.controller";
+import { UsageController } from "../controllers/usage.controller";
 
 export interface AppContainer {
   readonly serviceName: string;
@@ -19,7 +23,10 @@ export interface AppContainer {
   readonly deduplication: DeduplicationService;
   readonly streamPublisher: StreamPublisher;
   readonly ingestionService: IngestionService;
+  readonly usageRepositoryFactory: UsageRepositoryFactory;
+  readonly usageService: UsageService;
   readonly eventsController: EventsController;
+  readonly usageController: UsageController;
 }
 
 export const createContainer = (
@@ -47,6 +54,11 @@ export const createContainer = (
   const streamPublisher = new StreamPublisher(redisClient, containerLogger, env);
   const ingestionService = new IngestionService(deduplication, streamPublisher, containerLogger);
   const eventsController = new EventsController(ingestionService, containerLogger);
+  // Tenant-scoped repositories are per-request, so the container exposes a factory.
+  const usageRepositoryFactory: UsageRepositoryFactory = (tenantId) =>
+    new UsageRepository(prisma, tenantId as TenantId, containerLogger);
+  const usageService = new UsageService(usageRepositoryFactory, containerLogger);
+  const usageController = new UsageController(usageService, containerLogger);
 
   return {
     serviceName,
@@ -57,6 +69,9 @@ export const createContainer = (
     deduplication,
     streamPublisher,
     ingestionService,
-    eventsController
+    usageRepositoryFactory,
+    usageService,
+    eventsController,
+    usageController
   };
 };

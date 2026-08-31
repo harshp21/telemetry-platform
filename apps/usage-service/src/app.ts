@@ -4,6 +4,7 @@ import { env, type ServiceEnv } from "./config/env";
 import { createContainer, type AppContainer } from "./config/container";
 import { registerUsageTenantContextMiddleware } from "./middleware";
 import { registerEventsRoutes } from "./routes/events.routes";
+import { registerUsageRoutes } from "./routes/usage.routes";
 import "./types";
 import {
   USAGE_SERVICE_NAME,
@@ -36,6 +37,9 @@ export const buildUsageServiceApp = (): FastifyInstance & { container: AppContai
 
   // Register events ingestion routes
   registerEventsRoutes(app, container.eventsController);
+
+  // Register usage reporting routes
+  registerUsageRoutes(app, container.usageController);
 
   return app as unknown as FastifyInstance & { container: AppContainer };
 };
