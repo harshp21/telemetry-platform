@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
-import { GATEWAY_GUARDS, GATEWAY_RESPONSES } from "../constants";
+import {
+  GATEWAY_GUARDS,
+  GATEWAY_HEADERS,
+  GATEWAY_RESPONSES,
+  GATEWAY_SPOOFABLE_HEADERS
+} from "../constants";
 
 const WRITE_METHODS = new Set<string>(["POST", "PUT", "PATCH"]);
 
@@ -40,15 +45,19 @@ const isJsonContentType = (request: FastifyRequest): boolean => {
   return mediaType === GATEWAY_GUARDS.JSON_CONTENT_TYPE;
 };
 
+// Every header an upstream is entitled to trust is removed here and re-set by the gateway from
+// its own verified state. `x-internal-secret` is in that set for the same reason the identity
+// headers are: usage-service reads it as proof the request came through the gateway (S-4), so
+// accepting one from outside would hand a caller exactly the claim the guard exists to check.
 const stripSpoofableIdentityHeaders = (request: FastifyRequest): void => {
-  delete request.headers["x-tenant-id"];
-  delete request.headers["x-user-id"];
-  delete request.headers["x-user-role"];
+  for (const header of GATEWAY_SPOOFABLE_HEADERS) {
+    delete request.headers[header];
+  }
 };
 
 const ensureRequestId = (request: FastifyRequest): void => {
-  if (!request.headers["x-request-id"]) {
-    request.headers["x-request-id"] = randomUUID();
+  if (!request.headers[GATEWAY_HEADERS.REQUEST_ID]) {
+    request.headers[GATEWAY_HEADERS.REQUEST_ID] = randomUUID();
   }
 };
 

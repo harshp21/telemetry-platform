@@ -10,10 +10,27 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/telemetry
+      # Runtime/default connection for every step that exercises application code:
+      # the least-privilege role, so RLS is actually enforcing in CI.
+      DATABASE_URL: postgresql://telemetry_app:telemetry_app_local_dev@localhost:5432/telemetry
+      # Admin/owner connection. Prisma reads this as `directUrl`, so `migrate deploy` and
+      # `migrate status` run as the owner -- which is what bootstraps telemetry_app in the
+      # first place (v1_4_app_role_non_superuser). Also used to seed integration fixtures.
+      DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/telemetry
+      # auth-service integration fixtures run against the admin role: auth's pre-tenant
+      # queries are blocked by RLS today. See S-7 in .claude/rules/known-gaps.md.
+      AUTH_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/telemetry
+      #
+      # NOTE: turbo runs tasks in strict env mode, so DATABASE_URL / DIRECT_DATABASE_URL
+      # declared here do NOT reach `pnpm test`, `pnpm lint`, `pnpm build` or `pnpm typecheck`
+      # unless they are also declared under `tasks.<task>.env` in turbo.json. Those suites
+      # take their values from each package's `tests/setup.ts` defaults, which are the same
+      # two roles. The vars above apply to the steps that bypass turbo: the Prisma steps and
+      # the auth coverage step.
       REDIS_URL: redis://localhost:6379
       OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
       JWT_SECRET: test-jwt-secret-value-with-at-least-32-characters
+      INTERNAL_API_SECRET: ci-internal-api-secret-with-at-least-32-chars
       JWT_REFRESH_SECRET: test-refresh-secret-value-with-at-least-32-chars
       JWT_ACCESS_TTL_SECONDS: "900"
       JWT_REFRESH_TTL_SECONDS: "604800"
@@ -70,6 +87,13 @@ jobs:
           rm -f apps/auth-service/schema.ci.prisma
 
       - name: Auth Coverage
+        # Runs as the admin role, not telemetry_app. This step bypasses turbo, so the job
+        # level DATABASE_URL would reach it -- and auth-service is the one service that
+        # cannot yet run as telemetry_app (S-7), while tests/rls.integration.test.ts seeds
+        # its fixtures through the same client it asserts with and so fails outright under
+        # RLS (S-3). Remove this override when S-3 and S-7 land.
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/telemetry
         run: pnpm --filter @telemetry/auth-service test:coverage
 
       - name: Lint
@@ -80,6 +104,11 @@ jobs:
 
       - name: Unit Tests
         run: pnpm test
+
+      - name: Verify RLS Is Enforcing
+        # Bypasses turbo deliberately so the job-level roles above are the ones under test.
+        # Fails if DATABASE_URL resolves to a superuser or a BYPASSRLS role.
+        run: pnpm --filter @telemetry/usage-service exec vitest run tests/rls.enforcement.integration.test.ts
 
       - name: Start Docker Compose Stack
         run: docker compose -f docker/docker-compose.yml up -d --build --wait

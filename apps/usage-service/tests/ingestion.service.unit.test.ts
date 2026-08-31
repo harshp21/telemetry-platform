@@ -4,6 +4,7 @@ import { IngestionService } from "../src/services/ingestion.service";
 import type { DeduplicationService } from "../src/services/deduplication.service";
 import type { StreamPublisher } from "../src/events/stream.publisher";
 import type { EventPayload } from "../src/validators/events.validator";
+import { DEDUP_CONSTANTS } from "../src/constants";
 
 describe("IngestionService", () => {
 	let mockDeduplication: Partial<DeduplicationService>;
@@ -39,7 +40,7 @@ describe("IngestionService", () => {
 				"stream-id-1"
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -65,7 +66,7 @@ describe("IngestionService", () => {
 			// Arrange
 			(mockDeduplication.isNew as ReturnType<typeof vi.fn>).mockResolvedValueOnce(false);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -87,7 +88,7 @@ describe("IngestionService", () => {
 
 		it("should return { rejected: 1 } for quantity out of range (0)", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -111,7 +112,7 @@ describe("IngestionService", () => {
 
 		it("should return { rejected: 2 } for quantity out of range", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -140,7 +141,7 @@ describe("IngestionService", () => {
 
 		it("should return { rejected: 1 } for occurredAt > now + 5min", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const futureTime = new Date(Date.now() + 600_000).toISOString();
 			const events: EventPayload[] = [
 				{
@@ -162,7 +163,7 @@ describe("IngestionService", () => {
 
 		it("should return { rejected: 1 } for occurredAt < now - 5min", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const pastTime = new Date(Date.now() - 600_000).toISOString();
 			const events: EventPayload[] = [
 				{
@@ -190,7 +191,7 @@ describe("IngestionService", () => {
 				"stream-id-1"
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const withinTime = new Date(Date.now() + 299_000).toISOString();
 			const events: EventPayload[] = [
 				{
@@ -217,7 +218,7 @@ describe("IngestionService", () => {
 				"stream-id-1"
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const withinPastTime = new Date(Date.now() - 299_000).toISOString();
 			const events: EventPayload[] = [
 				{
@@ -244,7 +245,7 @@ describe("IngestionService", () => {
 				"stream-id-1"
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -261,9 +262,17 @@ describe("IngestionService", () => {
 
 			// Assert
 			expect(result).toEqual({ accepted: 1, duplicate: 0, rejected: 0 });
+			// The tenant is passed as its own argument; DeduplicationService owns
+			// the namespace, so the derived key must NOT repeat the tenant segment.
 			expect(mockDeduplication.isNew).toHaveBeenCalledWith(
-				expect.stringContaining(`${tenantId}:api.request:source-1:`)
+				tenantId,
+				expect.stringContaining("api.request:source-1:")
 			);
+
+			const derivedKey = (mockDeduplication.isNew as ReturnType<typeof vi.fn>)
+				.mock.calls[0]![1] as string;
+			expect(derivedKey).not.toContain(tenantId);
+			expect(derivedKey).not.toContain(DEDUP_CONSTANTS.KEY_PREFIX);
 		});
 
 		it("should use provided idempotency key", async () => {
@@ -273,7 +282,7 @@ describe("IngestionService", () => {
 				"stream-id-1"
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const providedKey = "custom-key-1";
 			const events: EventPayload[] = [
@@ -291,7 +300,8 @@ describe("IngestionService", () => {
 
 			// Assert
 			expect(result).toEqual({ accepted: 1, duplicate: 0, rejected: 0 });
-			expect(mockDeduplication.isNew).toHaveBeenCalledWith(providedKey);
+			// Raw key plus tenant, never a pre-built Redis key.
+			expect(mockDeduplication.isNew).toHaveBeenCalledWith(tenantId, providedKey);
 		});
 
 		it("should publish event with correct structure", async () => {
@@ -301,7 +311,7 @@ describe("IngestionService", () => {
 				"stream-id-1"
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -338,7 +348,7 @@ describe("IngestionService", () => {
 			const dedupError = new Error("Redis connection failed");
 			(mockDeduplication.isNew as ReturnType<typeof vi.fn>).mockRejectedValueOnce(dedupError);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -366,7 +376,7 @@ describe("IngestionService", () => {
 				publishError
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -398,7 +408,7 @@ describe("IngestionService", () => {
 				"stream-id"
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -447,7 +457,7 @@ describe("IngestionService", () => {
 
 		it("should return { accepted: 0, duplicate: 0, rejected: 0 } for empty batch", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const events: EventPayload[] = [];
 
 			// Act
@@ -465,7 +475,7 @@ describe("IngestionService", () => {
 				.mockResolvedValueOnce(false)
 				.mockResolvedValueOnce(false);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -498,7 +508,7 @@ describe("IngestionService", () => {
 				"stream-id-1"
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -543,7 +553,7 @@ describe("IngestionService", () => {
 				"stream-id-1"
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events: EventPayload[] = [
 				{
@@ -584,6 +594,101 @@ describe("IngestionService", () => {
 			expect(publishedEvent.idempotencyKey).toBe("key-1");
 			expect(publishedEvent.eventId).not.toBe("spoofed-event-id");
 			expect(publishedEvent.timestamp).not.toBe("0");
+		});
+	});
+
+	describe("dedup key handoff (S-1)", () => {
+		it("should hand the same client key to different tenants as distinct (tenantId, key) pairs", async () => {
+			// Arrange: the attack shape — two tenants submit an identical idempotencyKey
+			(mockDeduplication.isNew as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+			(mockStreamPublisher.publish as ReturnType<typeof vi.fn>).mockResolvedValue(
+				"stream-id"
+			);
+
+			const clientKey = "abc";
+			const now = new Date().toISOString();
+			const event: EventPayload = {
+				eventType: "api.request",
+				quantity: 1,
+				unit: "request",
+				occurredAt: now,
+				idempotencyKey: clientKey
+			};
+
+			// Act
+			await service.ingestEvents("tenant-a", [event]);
+			await service.ingestEvents("tenant-b", [event]);
+
+			// Assert: the tenant travels separately, so the two calls cannot alias
+			const calls = (mockDeduplication.isNew as ReturnType<typeof vi.fn>).mock
+				.calls;
+			expect(calls).toHaveLength(2);
+			expect(calls[0]).toEqual(["tenant-a", clientKey]);
+			expect(calls[1]).toEqual(["tenant-b", clientKey]);
+			expect(calls[0]![0]).not.toBe(calls[1]![0]);
+		});
+
+		it("should not pre-namespace the client key before calling the deduplication service", async () => {
+			// Arrange
+			(mockDeduplication.isNew as ReturnType<typeof vi.fn>).mockResolvedValueOnce(true);
+			(mockStreamPublisher.publish as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+				"stream-id-1"
+			);
+
+			const tenantId = "11111111-1111-4111-8111-111111111111";
+			const clientKey = "custom-key-1";
+			const now = new Date().toISOString();
+
+			// Act
+			await service.ingestEvents(tenantId, [
+				{
+					eventType: "api.request",
+					quantity: 5,
+					unit: "request",
+					occurredAt: now,
+					idempotencyKey: clientKey
+				}
+			]);
+
+			// Assert: IngestionService passes components; it does not build Redis keys
+			const passedKey = (mockDeduplication.isNew as ReturnType<typeof vi.fn>).mock
+				.calls[0]![1] as string;
+			expect(passedKey).toBe(clientKey);
+			expect(passedKey).not.toContain(DEDUP_CONSTANTS.KEY_PREFIX);
+			expect(passedKey).not.toContain(tenantId);
+		});
+
+		it("should publish the raw idempotency key, not the Redis key shape", async () => {
+			// Arrange
+			(mockDeduplication.isNew as ReturnType<typeof vi.fn>).mockResolvedValueOnce(true);
+			(mockStreamPublisher.publish as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+				"stream-id-1"
+			);
+
+			const tenantId = "11111111-1111-4111-8111-111111111111";
+			const clientKey = "custom-key-1";
+			const now = new Date().toISOString();
+
+			// Act
+			await service.ingestEvents(tenantId, [
+				{
+					eventType: "api.request",
+					quantity: 5,
+					unit: "request",
+					occurredAt: now,
+					idempotencyKey: clientKey
+				}
+			]);
+
+			// Assert: Redis storage layout must not leak into the stream contract
+			const publishedEvent = (
+				mockStreamPublisher.publish as ReturnType<typeof vi.fn>
+			).mock.calls[0]![0] as Record<string, string | number | undefined>;
+			expect(publishedEvent.idempotencyKey).toBe(clientKey);
+			expect(String(publishedEvent.idempotencyKey)).not.toContain(
+				DEDUP_CONSTANTS.KEY_PREFIX
+			);
+			expect(publishedEvent.tenantId).toBe(tenantId);
 		});
 	});
 });

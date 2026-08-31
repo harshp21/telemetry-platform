@@ -107,13 +107,16 @@ export class IngestionService {
 					continue;
 				}
 
-				// Step 3: Generate or use provided idempotency key
+				// Step 3: Use the provided idempotency key, or derive one from the event.
+				// This is the RAW key only. DeduplicationService owns the Redis keyspace
+				// and adds the `dedup:` prefix and the tenant namespace itself, so the
+				// tenant is deliberately absent from the derived shape here.
 				const idempotencyKey =
 					event.idempotencyKey ||
-					`${tenantId}:${event.eventType}:${event.metadata?.sourceId || "unknown"}:${event.occurredAt}`;
+					`${event.eventType}:${event.metadata?.sourceId || INGESTION_CONSTANTS.UNKNOWN_SOURCE_ID}:${event.occurredAt}`;
 
-				// Step 4: Check deduplication
-				const isNew = await this.deduplication.isNew(idempotencyKey);
+				// Step 4: Check deduplication, scoped to this tenant
+				const isNew = await this.deduplication.isNew(tenantId, idempotencyKey);
 				if (!isNew) {
 					result.duplicate++;
 					this.logger.debug(

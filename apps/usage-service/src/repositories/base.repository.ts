@@ -48,7 +48,10 @@ interface Logger {
  *
  * - ✅ `where()` compile-error if caller tries to pass `tenantId` (via `{ tenantId?: never }` constraint)
  * - ✅ `withTenant()` scopes RLS context to transaction only (`is_local = true`)
- * - ✅ RLS policies use FORCE RLS to prevent superuser bypass
+ * - ✅ RLS actually enforces because the runtime role (`telemetry_app`) is
+ *   NOSUPERUSER, NOBYPASSRLS and owns no tables. `FORCE ROW LEVEL SECURITY` alone would
+ *   NOT stop a superuser — it only removes the *table owner's* exemption. See
+ *   `prisma/migrations/v1_4_app_role_non_superuser/migration.sql`.
  * - ✅ Transaction errors logged with tenant context for observability
  * - ✅ Two-layer defense: app + DB isolation
  *

@@ -76,7 +76,21 @@ export const INTERNAL_AUTH_HEADERS = {
 } as const;
 
 export const INTERNAL_AUTH_RESPONSES = {
-	CODE_UNAUTHORIZED: "UNAUTHORIZED"
+	CODE_UNAUTHORIZED: "UNAUTHORIZED",
+	// Deliberately identical for a missing and for a wrong secret: telling the two apart
+	// tells an unauthenticated caller whether it even guessed the header name.
+	MESSAGE_UNAUTHORIZED: "A valid X-Internal-Secret header is required"
+} as const;
+
+/**
+ * Shared constraints for service-to-service authentication.
+ *
+ * `SECRET_MIN_LENGTH` is the minimum accepted length of `INTERNAL_API_SECRET`. It lives here
+ * because more than one service's env schema enforces it -- see `.claude/rules/constants.md`
+ * ("before adding a third copy of a literal, promote it").
+ */
+export const INTERNAL_AUTH_CONSTANTS = {
+	SECRET_MIN_LENGTH: 32
 } as const;
 
 export const ERROR_RESPONSES = {

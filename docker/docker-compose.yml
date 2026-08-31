@@ -1,6 +1,8 @@
 x-common-app-env: &common-app-env
   NODE_ENV: production
-  DATABASE_URL: postgresql://postgres:postgres@postgres:5432/telemetry
+  # Least-privilege role (NOSUPERUSER, NOBYPASSRLS, non-owner) so RLS enforces.
+  # Created by docker/postgres/init/01-app-role.sql on first container start.
+  DATABASE_URL: postgresql://telemetry_app:telemetry_app_local_dev@postgres:5432/telemetry
   REDIS_URL: redis://redis:6379
   OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4318
   LOG_LEVEL: info
@@ -24,6 +26,10 @@ services:
       POSTGRES_DB: telemetry
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Creates the telemetry_app role on first start. Nothing in this stack runs Prisma
+      # migrations, so the role cannot come from v1_4_app_role_non_superuser here.
+      # Re-run requires `docker compose -f docker/docker-compose.yml down -v`.
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -48,6 +54,10 @@ services:
         SERVICE_NAME: auth-service
     environment:
       <<: *common-app-env
+      # Overrides the common least-privilege URL: auth-service's pre-authentication
+      # queries have no tenant context and are blocked by RLS. See S-7 in
+      # .claude/rules/known-gaps.md.
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/telemetry
       PORT: "3001"
       JWT_SECRET: test-jwt-secret-value-with-at-least-32-characters
       JWT_REFRESH_SECRET: test-refresh-secret-value-with-at-least-32-chars
@@ -74,6 +84,7 @@ services:
     environment:
       <<: *common-app-env
       PORT: "3002"
+      INTERNAL_API_SECRET: ci-internal-api-secret-with-at-least-32-chars
     ports:
       - "3002:3002"
     depends_on:
@@ -92,7 +103,7 @@ services:
     environment:
       <<: *common-app-env
       PORT: "3004"
-      INTERNAL_API_SECRET: test-internal-secret
+      INTERNAL_API_SECRET: ci-internal-api-secret-with-at-least-32-chars
     ports:
       - "3004:3004"
     depends_on:
@@ -129,7 +140,7 @@ services:
     environment:
       <<: *common-app-env
       PORT: "3003"
-      INTERNAL_API_SECRET: test-internal-secret
+      INTERNAL_API_SECRET: ci-internal-api-secret-with-at-least-32-chars
     ports:
       - "3003:3003"
     depends_on:
@@ -152,6 +163,7 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4318
       LOG_LEVEL: info
       JWT_SECRET: test-jwt-secret-value-with-at-least-32-characters
+      INTERNAL_API_SECRET: ci-internal-api-secret-with-at-least-32-chars
       AUTH_SERVICE_URL: http://auth-service:3001
       USAGE_SERVICE_URL: http://usage-service:3002
       BILLING_SERVICE_URL: http://billing-service:3004

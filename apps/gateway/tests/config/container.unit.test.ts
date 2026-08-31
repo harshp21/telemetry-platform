@@ -11,6 +11,7 @@ const mockEnv: ServiceEnv = {
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318",
   LOG_LEVEL: "debug",
   JWT_SECRET: "test-secret-" + "x".repeat(32),
+  INTERNAL_API_SECRET: "test-internal-secret-" + "x".repeat(32),
   AUTH_SERVICE_URL: "http://auth-service:3000",
   USAGE_SERVICE_URL: "http://usage-service:3001",
   BILLING_SERVICE_URL: "http://billing-service:3002",

@@ -156,10 +156,15 @@ Tenant-scoped repositories are **per-request by construction** (`tenantId` is a 
 argument). Register them in the container as a *factory*, never a singleton — a singleton
 pins one tenant process-wide.
 
-**Known gap:** the app connects to Postgres as a superuser with `rolbypassrls`, and
-`FORCE ROW LEVEL SECURITY` does **not** stop superusers — it only removes the table owner's
-exemption. RLS is therefore not currently enforcing; app-layer `WHERE tenantId` is what is
-actually protecting data. Do not treat a passing RLS test as evidence unless it runs as a
+RLS **is** enforcing: services connect as `telemetry_app` (`NOSUPERUSER`, `NOBYPASSRLS`,
+owns no table), created by `prisma/migrations/v1_4_app_role_non_superuser`. Note that
+`FORCE ROW LEVEL SECURITY` is *not* what does this — it only removes the table owner's
+exemption and does nothing to a superuser. Migrations run separately as the owner through
+`DIRECT_DATABASE_URL` (Prisma `directUrl`); never point a running service at it.
+
+**Known gap:** auth-service still connects as the admin role, because its
+pre-authentication queries have no tenant to scope to — RLS is inert for that one service
+(S-7). Do not treat a passing RLS test as evidence unless it runs as a
 `NOSUPERUSER NOBYPASSRLS` role. Full detail: `.claude/rules/tenant-isolation.md`.
 
 ### Raw SQL

@@ -1,7 +1,11 @@
 // Vitest setup file - set up environment variables before tests run
 process.env.NODE_ENV ??= "test";
 process.env.PORT ??= "3001";
+// Deliberately the ADMIN role, not telemetry_app: auth-service's pre-authentication
+// queries are blocked by RLS today. See S-7 in .claude/rules/known-gaps.md.
 process.env.DATABASE_URL ??= "postgresql://postgres:postgres@localhost:5432/telemetry";
+process.env.DIRECT_DATABASE_URL ??= "postgresql://postgres:postgres@localhost:5432/telemetry";
+process.env.RLS_PROBE_DATABASE_URL ??= "postgresql://telemetry_app:telemetry_app_local_dev@localhost:5432/telemetry";
 process.env.REDIS_URL ??= "redis://localhost:6379";
 process.env.OTEL_EXPORTER_OTLP_ENDPOINT ??= "http://localhost:4318";
 process.env.LOG_LEVEL ??= "silent";

@@ -9,6 +9,7 @@ import {
   type TelemetryEventEnvelope,
   AppError,
   ERROR_RESPONSES,
+  INTERNAL_AUTH_CONSTANTS,
   INTERNAL_AUTH_HEADERS,
   INTERNAL_AUTH_RESPONSES,
   type TenantId
@@ -18,6 +19,10 @@ describe("shared-types", () => {
   it("exposes shared internal auth constants", () => {
     expect(INTERNAL_AUTH_HEADERS.INTERNAL_SECRET).toBe("x-internal-secret");
     expect(INTERNAL_AUTH_RESPONSES.CODE_UNAUTHORIZED).toBe("UNAUTHORIZED");
+    expect(INTERNAL_AUTH_RESPONSES.MESSAGE_UNAUTHORIZED).toBe(
+      "A valid X-Internal-Secret header is required"
+    );
+    expect(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH).toBe(32);
   });
 
   it("models application errors with stable code and status", () => {

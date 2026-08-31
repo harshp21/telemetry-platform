@@ -16,6 +16,21 @@ Use this checklist for service-level changes in this repository.
 - Internal endpoints must require `X-Internal-Secret`.
 - Services with internal-only routes must fail fast if `INTERNAL_API_SECRET` is missing.
 - Tenant-sensitive request paths must validate tenant context against headers/auth context.
+- Compare secrets in constant time (`crypto.timingSafeEqual` over SHA-256 digests), never with
+  `===` or `!==` — string comparison short-circuits and leaks how many leading bytes matched.
+- Tenant ids are UUIDs (`Tenant.id` is `String @default(uuid())`). Validate the header, do not
+  merely check it is non-empty.
+
+Current compliance (keep this table honest; the open items are in `.claude/rules/known-gaps.md`):
+
+| Service | `X-Internal-Secret` guard | Fails fast on missing secret | Timing-safe |
+|---|---|---|---|
+| gateway | n/a — it is the caller; injects the header on every proxied request | yes (env schema) | n/a |
+| usage-service | yes, `onRequest`, `/health` exempt | yes (env schema) | yes |
+| billing-service | yes, but `preHandler` on the internal route group only | partly — `process.env` + `.trim()`, no minimum length (S-8) | no (S-8) |
+| worker-service | as billing-service (S-8) | partly (S-8) | no (S-8) |
+| analytics-service | no — `/health` only today (S-9) | no (S-9) | n/a |
+| auth-service | n/a — deliberately public (`/v1/auth/register\|login\|refresh`) | n/a | n/a |
 
 4. Tests
 - Prefer app injection tests over placeholder smoke tests.

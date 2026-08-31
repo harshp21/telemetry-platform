@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildUsageServiceApp } from "../src/app";
+import { env } from "../src/config/env";
 import {
   USAGE_SERVICE_HEADERS,
   USAGE_SERVICE_RESPONSES,
@@ -10,6 +11,14 @@ import {
 
 const TENANT_ID_A = "11111111-1111-4111-8111-111111111111";
 const TENANT_ID_B = "22222222-2222-4222-8222-222222222222";
+
+// S-4: the gateway now proves it is the caller on every proxied request.
+const internalHeaders = (
+  extra: Record<string, string> = {}
+): Record<string, string> => ({
+  [USAGE_SERVICE_HEADERS.INTERNAL_SECRET]: env.INTERNAL_API_SECRET,
+  ...extra
+});
 
 const FROM = "2026-01-01T00:00:00.000Z";
 const TO = "2026-01-08T00:00:00.000Z";
@@ -61,7 +70,7 @@ describe(`GET ${USAGE_SERVICE_ROUTES.USAGE_SUMMARY}`, () => {
     const response = await app.inject({
       method: "GET",
       url: summaryUrl(),
-      headers: { [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A }
+      headers: internalHeaders({ [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A })
     });
 
     expect(response.statusCode).toBe(USAGE_SERVICE_RESPONSES.HTTP_STATUS_OK);
@@ -76,7 +85,7 @@ describe(`GET ${USAGE_SERVICE_ROUTES.USAGE_SUMMARY}`, () => {
     const response = await app.inject({
       method: "GET",
       url: summaryUrl(),
-      headers: { [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A }
+      headers: internalHeaders({ [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A })
     });
 
     expect(response.statusCode).toBe(USAGE_SERVICE_RESPONSES.HTTP_STATUS_OK);
@@ -97,7 +106,7 @@ describe(`GET ${USAGE_SERVICE_ROUTES.USAGE_SUMMARY}`, () => {
     const response = await app.inject({
       method: "GET",
       url: summaryUrl({ pageSize: String(USAGE_SUMMARY_CONSTANTS.MAX_PAGE_SIZE + 1) }),
-      headers: { [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A }
+      headers: internalHeaders({ [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A })
     });
 
     expect(response.statusCode).toBe(USAGE_SERVICE_RESPONSES.HTTP_STATUS_BAD_REQUEST);
@@ -115,7 +124,7 @@ describe(`GET ${USAGE_SERVICE_ROUTES.USAGE_SUMMARY}`, () => {
     const response = await app.inject({
       method: "GET",
       url: summaryUrl({ granularity: "month" }),
-      headers: { [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A }
+      headers: internalHeaders({ [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A })
     });
 
     expect(response.statusCode).toBe(USAGE_SERVICE_RESPONSES.HTTP_STATUS_BAD_REQUEST);
@@ -131,7 +140,7 @@ describe(`GET ${USAGE_SERVICE_ROUTES.USAGE_SUMMARY}`, () => {
     const response = await app.inject({
       method: "GET",
       url: summaryUrl(),
-      headers: { [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A }
+      headers: internalHeaders({ [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A })
     });
 
     expect(response.statusCode).toBe(USAGE_SERVICE_RESPONSES.HTTP_STATUS_OK);
@@ -146,7 +155,7 @@ describe(`GET ${USAGE_SERVICE_ROUTES.USAGE_SUMMARY}`, () => {
     await app.inject({
       method: "GET",
       url: summaryUrl(),
-      headers: { [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_B }
+      headers: internalHeaders({ [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_B })
     });
 
     expect(spy).toHaveBeenCalledTimes(1);
@@ -157,12 +166,66 @@ describe(`GET ${USAGE_SERVICE_ROUTES.USAGE_SUMMARY}`, () => {
   it("returns 401 when the tenant header is missing", async () => {
     const response = await app.inject({
       method: "GET",
-      url: summaryUrl()
+      url: summaryUrl(),
+      headers: internalHeaders()
     });
 
     expect(response.statusCode).toBe(USAGE_SERVICE_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
     expect(response.json()).toMatchObject({
       code: USAGE_SERVICE_RESPONSES.CODE_TENANT_CONTEXT_MISSING
     });
+  });
+
+  it("returns 401 UNAUTHORIZED and never queries when the internal secret is absent", async () => {
+    const spy = vi.spyOn(app.container.usageService, "getUsageSummary").mockResolvedValue(emptyPage);
+
+    const response = await app.inject({
+      method: "GET",
+      url: summaryUrl(),
+      headers: { [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A }
+    });
+
+    expect(response.statusCode).toBe(USAGE_SERVICE_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
+    expect(response.json()).toMatchObject({
+      code: USAGE_SERVICE_RESPONSES.CODE_UNAUTHORIZED
+    });
+    // T-035 made direct reachability a cross-tenant READ path. This is the assertion that the
+    // read never happens for an unauthenticated caller.
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 UNAUTHORIZED and never queries when the internal secret is wrong", async () => {
+    const spy = vi.spyOn(app.container.usageService, "getUsageSummary").mockResolvedValue(emptyPage);
+
+    const response = await app.inject({
+      method: "GET",
+      url: summaryUrl(),
+      headers: {
+        [USAGE_SERVICE_HEADERS.INTERNAL_SECRET]: `${env.INTERNAL_API_SECRET}-wrong`,
+        [USAGE_SERVICE_HEADERS.TENANT_ID]: TENANT_ID_A
+      }
+    });
+
+    expect(response.statusCode).toBe(USAGE_SERVICE_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
+    expect(response.json()).toMatchObject({
+      code: USAGE_SERVICE_RESPONSES.CODE_UNAUTHORIZED
+    });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 TENANT_CONTEXT_INVALID and never queries for a non-UUID tenant id", async () => {
+    const spy = vi.spyOn(app.container.usageService, "getUsageSummary").mockResolvedValue(emptyPage);
+
+    const response = await app.inject({
+      method: "GET",
+      url: summaryUrl(),
+      headers: internalHeaders({ [USAGE_SERVICE_HEADERS.TENANT_ID]: "tenant-1" })
+    });
+
+    expect(response.statusCode).toBe(USAGE_SERVICE_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
+    expect(response.json()).toMatchObject({
+      code: USAGE_SERVICE_RESPONSES.CODE_TENANT_CONTEXT_INVALID
+    });
+    expect(spy).not.toHaveBeenCalled();
   });
 });

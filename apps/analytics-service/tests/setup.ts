@@ -1,7 +1,11 @@
 // Vitest setup file - set up environment variables before tests run
 process.env.NODE_ENV ??= "test";
 process.env.PORT ??= "3005";
-process.env.DATABASE_URL ??= "postgresql://postgres:postgres@localhost:5432/telemetry";
+// Runtime role: NOSUPERUSER / NOBYPASSRLS, so any test that reaches a live database
+// exercises RLS the way production does. Do not point this at the admin role.
+process.env.DATABASE_URL ??=
+  "postgresql://telemetry_app:telemetry_app_local_dev@localhost:5432/telemetry";
+process.env.DIRECT_DATABASE_URL ??= "postgresql://postgres:postgres@localhost:5432/telemetry";
 process.env.REDIS_URL ??= "redis://localhost:6379";
 process.env.OTEL_EXPORTER_OTLP_ENDPOINT ??= "http://localhost:4318";
 process.env.LOG_LEVEL ??= "silent";

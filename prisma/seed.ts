@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { PrismaClient, Plan, Role } from "@prisma/client";
 
-const prisma = new PrismaClient();
+// Seeding creates tenants before any tenant context exists, so it must run through the
+// admin/owner connection -- the runtime role (telemetry_app) is blocked by the RLS
+// WITH CHECK on "Tenant". See .claude/rules/tenant-isolation.md.
+const prisma = new PrismaClient({ datasourceUrl: process.env.DIRECT_DATABASE_URL });
 
 const DEV_TENANT_ID = "11111111-1111-1111-1111-111111111111";
 const DEV_OWNER_ID = "22222222-2222-2222-2222-222222222222";

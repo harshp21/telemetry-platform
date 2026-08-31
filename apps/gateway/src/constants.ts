@@ -1,4 +1,29 @@
+import { INTERNAL_AUTH_HEADERS } from "@telemetry/shared-types";
+
 export const GATEWAY_SERVICE_NAME = "gateway";
+
+/**
+ * Headers the gateway owns end to end.
+ *
+ * Everything in `SPOOFABLE` is stripped from the inbound request and re-set by the gateway from
+ * its own verified state, so an upstream service can trust them. `x-internal-secret` belongs in
+ * that set for the same reason the identity headers do: usage-service treats it as proof the
+ * request came through the gateway, so it must never be accepted from outside.
+ */
+export const GATEWAY_HEADERS = {
+  TENANT_ID: "x-tenant-id",
+  USER_ID: "x-user-id",
+  USER_ROLE: "x-user-role",
+  REQUEST_ID: "x-request-id",
+  INTERNAL_SECRET: INTERNAL_AUTH_HEADERS.INTERNAL_SECRET
+} as const;
+
+export const GATEWAY_SPOOFABLE_HEADERS = [
+  GATEWAY_HEADERS.TENANT_ID,
+  GATEWAY_HEADERS.USER_ID,
+  GATEWAY_HEADERS.USER_ROLE,
+  GATEWAY_HEADERS.INTERNAL_SECRET
+] as const;
 
 export const GATEWAY_ROUTES = {
   HEALTH: "/health",

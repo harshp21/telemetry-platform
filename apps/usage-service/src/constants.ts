@@ -1,3 +1,8 @@
+import {
+  INTERNAL_AUTH_HEADERS,
+  INTERNAL_AUTH_RESPONSES
+} from "@telemetry/shared-types";
+
 export const USAGE_SERVICE_NAME = "usage-service";
 
 export const USAGE_SERVICE_ROUTES = {
@@ -7,7 +12,8 @@ export const USAGE_SERVICE_ROUTES = {
 } as const;
 
 export const USAGE_SERVICE_HEADERS = {
-  TENANT_ID: "x-tenant-id"
+  TENANT_ID: "x-tenant-id",
+  INTERNAL_SECRET: INTERNAL_AUTH_HEADERS.INTERNAL_SECRET
 } as const;
 
 export const USAGE_SERVICE_RESPONSES = {
@@ -19,6 +25,10 @@ export const USAGE_SERVICE_RESPONSES = {
   MESSAGE_TENANT_MISMATCH: "Event tenantId does not match authenticated tenant context",
   CODE_TENANT_CONTEXT_MISSING: "TENANT_CONTEXT_MISSING",
   MESSAGE_TENANT_CONTEXT_MISSING: "X-Tenant-Id header is required",
+  CODE_TENANT_CONTEXT_INVALID: "TENANT_CONTEXT_INVALID",
+  MESSAGE_TENANT_CONTEXT_INVALID: "X-Tenant-Id header must be a valid UUID",
+  CODE_UNAUTHORIZED: INTERNAL_AUTH_RESPONSES.CODE_UNAUTHORIZED,
+  MESSAGE_UNAUTHORIZED: INTERNAL_AUTH_RESPONSES.MESSAGE_UNAUTHORIZED,
   CODE_INTERNAL_ERROR: "INTERNAL_ERROR",
   MESSAGE_INTERNAL_ERROR: "Internal server error",
   MESSAGE_TENANT_CONTEXT_REQUIRED: "Missing tenantId from context",

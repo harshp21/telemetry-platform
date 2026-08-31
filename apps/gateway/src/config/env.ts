@@ -1,4 +1,5 @@
 import { parseEnv } from "@telemetry/shared-config";
+import { INTERNAL_AUTH_CONSTANTS } from "@telemetry/shared-types";
 import { z } from "zod";
 
 export const EnvSchema = z.object({
@@ -8,6 +9,9 @@ export const EnvSchema = z.object({
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().min(1),
   LOG_LEVEL: z.string().default("info"),
   JWT_SECRET: z.string().min(32),
+  // The gateway proves it is the caller to every upstream it proxies to (S-4). Required with
+  // no default, for the same fail-fast reason as JWT_SECRET.
+  INTERNAL_API_SECRET: z.string().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH),
   AUTH_SERVICE_URL: z.string().url(),
   USAGE_SERVICE_URL: z.string().url(),
   BILLING_SERVICE_URL: z.string().url(),

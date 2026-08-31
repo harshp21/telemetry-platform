@@ -2,7 +2,10 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { env, type ServiceEnv } from "./config/env";
 import { createContainer, type AppContainer } from "./config/container";
-import { registerUsageTenantContextMiddleware } from "./middleware";
+import {
+  registerUsageInternalAuthMiddleware,
+  registerUsageTenantContextMiddleware
+} from "./middleware";
 import { registerEventsRoutes } from "./routes/events.routes";
 import { registerUsageRoutes } from "./routes/usage.routes";
 import "./types";
@@ -18,6 +21,10 @@ export const buildUsageServiceApp = (): FastifyInstance & { container: AppContai
   app.decorate("container", container);
 
   registerGlobalErrorHandler(app);
+  // Order is the security contract (S-4): Fastify runs onRequest hooks in registration order,
+  // so the service-to-service secret is checked before any tenant work happens. A caller that
+  // has not proved it is the gateway must not cause tenant context to be derived at all.
+  registerUsageInternalAuthMiddleware(app, env.INTERNAL_API_SECRET);
   registerUsageTenantContextMiddleware(app);
 
   // Add cleanup hook for Redis connection

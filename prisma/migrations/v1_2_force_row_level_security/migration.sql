@@ -1,5 +1,10 @@
 -- Enable FORCE ROW LEVEL SECURITY on all tenant-scoped tables
--- This prevents superusers or certain roles from bypassing RLS policies
+-- CORRECTION (v1_4_app_role_non_superuser): FORCE ROW LEVEL SECURITY does NOT stop a
+-- superuser, and does not stop a role holding BYPASSRLS. All it does is remove the
+-- *table owner's* exemption, so the owner is subject to its own policies too.
+-- Stopping a superuser is not possible with any table-level setting; the only fix is to
+-- connect as a NOSUPERUSER NOBYPASSRLS non-owner role. That role is telemetry_app,
+-- created in v1_4_app_role_non_superuser.
 -- Required for multi-tenant SaaS data isolation
 
 ALTER TABLE "Tenant" FORCE ROW LEVEL SECURITY;

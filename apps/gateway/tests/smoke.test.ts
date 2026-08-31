@@ -5,6 +5,7 @@ import { GATEWAY_RESPONSES, GATEWAY_ROUTES, GATEWAY_RUNTIME, GATEWAY_SERVICE_NAM
 const GATEWAY_SMOKE_ENV_KEYS = [
   "NODE_ENV",
   "JWT_SECRET",
+  "INTERNAL_API_SECRET",
   "REDIS_URL",
   "OTEL_EXPORTER_OTLP_ENDPOINT",
   "AUTH_SERVICE_URL",
@@ -19,6 +20,7 @@ const GATEWAY_SMOKE_ENV_KEYS = [
 const GATEWAY_SMOKE_ENV: Record<(typeof GATEWAY_SMOKE_ENV_KEYS)[number], string> = {
   NODE_ENV: "test",
   JWT_SECRET: "test-jwt-secret-value-with-at-least-32-characters",
+  INTERNAL_API_SECRET: "test-internal-secret-value-with-at-least-32-chars",
   REDIS_URL: "redis://127.0.0.1:6379",
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:4318",
   AUTH_SERVICE_URL: "http://127.0.0.1:4101",

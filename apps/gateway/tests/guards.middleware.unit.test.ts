@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { randomUUID } from "node:crypto";
 import { gatewayRequestGuardsPreHandler } from "../src/middleware/guards.middleware";
+import { GATEWAY_HEADERS, GATEWAY_SPOOFABLE_HEADERS } from "../src/constants";
 
 vi.mock("node:crypto", () => {
   return {
@@ -156,18 +157,26 @@ describe("gateway request guards pre-handler", () => {
     const request = createRequest({
       method: "GET",
       headers: {
-        "x-tenant-id": "spoofed-tenant",
-        "x-user-id": "spoofed-user",
-        "x-user-role": "spoofed-role"
+        [GATEWAY_HEADERS.TENANT_ID]: "spoofed-tenant",
+        [GATEWAY_HEADERS.USER_ID]: "spoofed-user",
+        [GATEWAY_HEADERS.USER_ROLE]: "spoofed-role",
+        // S-4: usage-service treats this as proof the request came through the gateway, so it
+        // is exactly as spoofable as the identity headers and must never survive ingress.
+        [GATEWAY_HEADERS.INTERNAL_SECRET]: "spoofed-internal-secret"
       }
     });
     const { reply } = createReplyRecorder();
 
     await gatewayRequestGuardsPreHandler(request, reply);
 
-    expect(request.headers["x-tenant-id"]).toBeUndefined();
-    expect(request.headers["x-user-id"]).toBeUndefined();
-    expect(request.headers["x-user-role"]).toBeUndefined();
+    for (const header of GATEWAY_SPOOFABLE_HEADERS) {
+      expect(request.headers[header]).toBeUndefined();
+    }
+    // Named explicitly too, so a header silently dropped from the set above still fails here.
+    expect(request.headers[GATEWAY_HEADERS.TENANT_ID]).toBeUndefined();
+    expect(request.headers[GATEWAY_HEADERS.USER_ID]).toBeUndefined();
+    expect(request.headers[GATEWAY_HEADERS.USER_ROLE]).toBeUndefined();
+    expect(request.headers[GATEWAY_HEADERS.INTERNAL_SECRET]).toBeUndefined();
   });
 
   it("injects x-request-id when missing", async () => {

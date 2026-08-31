@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { INTERNAL_AUTH_CONSTANTS } from "@telemetry/shared-types";
 import { EnvSchema } from "../src/config/env";
+
+const VALID_INTERNAL_API_SECRET = "s-004-base-internal-secret-at-least-32-chars";
 
 const buildBaseEnv = (): Record<string, string> => ({
   NODE_ENV: "test",
@@ -7,7 +10,8 @@ const buildBaseEnv = (): Record<string, string> => ({
   DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/telemetry",
   REDIS_URL: "redis://localhost:6379",
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318",
-  LOG_LEVEL: "silent"
+  LOG_LEVEL: "silent",
+  INTERNAL_API_SECRET: VALID_INTERNAL_API_SECRET
 });
 
 describe("usage service env schema", () => {
@@ -129,6 +133,85 @@ describe("usage service env schema", () => {
       if (parsedMax.success) {
         expect(parsedMax.data.INGEST_BATCH_MAX).toBe(100);
       }
+    });
+  });
+
+  // S-4: docs/reviewer-checklist.md section 3 requires a service with internal-only routes to
+  // fail fast when INTERNAL_API_SECRET is missing. `parseEnv` throws at module load, so the
+  // process never reaches `app.listen`.
+  describe("internal service auth configuration", () => {
+    const previousSecret = process.env.INTERNAL_API_SECRET;
+
+    afterEach(() => {
+      if (previousSecret === undefined) {
+        delete process.env.INTERNAL_API_SECRET;
+      } else {
+        process.env.INTERNAL_API_SECRET = previousSecret;
+      }
+      vi.resetModules();
+    });
+
+    it("rejects an env with no INTERNAL_API_SECRET", () => {
+      const { INTERNAL_API_SECRET: _omitted, ...withoutSecret } = buildBaseEnv();
+      void _omitted;
+
+      const parsed = EnvSchema.safeParse(withoutSecret);
+
+      expect(parsed.success).toBe(false);
+
+      if (!parsed.success) {
+        expect(parsed.error.issues.some((issue) => issue.path[0] === "INTERNAL_API_SECRET")).toBe(
+          true
+        );
+      }
+    });
+
+    it("rejects an INTERNAL_API_SECRET shorter than the shared minimum", () => {
+      const parsed = EnvSchema.safeParse({
+        ...buildBaseEnv(),
+        INTERNAL_API_SECRET: "x".repeat(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH - 1)
+      });
+
+      expect(parsed.success).toBe(false);
+    });
+
+    it("rejects an empty INTERNAL_API_SECRET", () => {
+      const parsed = EnvSchema.safeParse({
+        ...buildBaseEnv(),
+        INTERNAL_API_SECRET: ""
+      });
+
+      expect(parsed.success).toBe(false);
+    });
+
+    it("accepts an INTERNAL_API_SECRET exactly at the shared minimum length", () => {
+      const atMinimum = "x".repeat(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH);
+      const parsed = EnvSchema.safeParse({
+        ...buildBaseEnv(),
+        INTERNAL_API_SECRET: atMinimum
+      });
+
+      expect(parsed.success).toBe(true);
+
+      if (parsed.success) {
+        expect(parsed.data.INTERNAL_API_SECRET).toBe(atMinimum);
+      }
+    });
+
+    it("fails fast at module load when INTERNAL_API_SECRET is absent", async () => {
+      vi.resetModules();
+      delete process.env.INTERNAL_API_SECRET;
+
+      await expect(import("../src/config/env")).rejects.toThrow(/INTERNAL_API_SECRET/);
+    });
+
+    it("loads at module load when INTERNAL_API_SECRET is present", async () => {
+      vi.resetModules();
+      process.env.INTERNAL_API_SECRET = VALID_INTERNAL_API_SECRET;
+
+      const loaded = (await import("../src/config/env")) as { env: { INTERNAL_API_SECRET: string } };
+
+      expect(loaded.env.INTERNAL_API_SECRET).toBe(VALID_INTERNAL_API_SECRET);
     });
   });
 });

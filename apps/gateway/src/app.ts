@@ -56,7 +56,8 @@ export const buildGatewayApp = (): FastifyInstance & { container: AppContainer }
     authServiceUrl: config.AUTH_SERVICE_URL,
     usageServiceUrl: config.USAGE_SERVICE_URL,
     billingServiceUrl: config.BILLING_SERVICE_URL,
-    analyticsServiceUrl: config.ANALYTICS_SERVICE_URL
+    analyticsServiceUrl: config.ANALYTICS_SERVICE_URL,
+    internalApiSecret: config.INTERNAL_API_SECRET
   });
 
   return app as unknown as FastifyInstance & { container: AppContainer };

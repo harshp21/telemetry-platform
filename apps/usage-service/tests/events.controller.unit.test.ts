@@ -83,7 +83,7 @@ describe("EventsController", () => {
 				rejected: 2
 			});
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const events = Array(10)
 				.fill(null)
@@ -117,7 +117,7 @@ describe("EventsController", () => {
 
 		it("should return 400 VALIDATION_ERROR for malformed eventType", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const request = {
 				tenantId,
 				body: {
@@ -150,7 +150,7 @@ describe("EventsController", () => {
 
 		it("should return 400 BATCH_TOO_LARGE for >100 events", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const largeEvents = Array(101)
 				.fill(null)
@@ -184,7 +184,7 @@ describe("EventsController", () => {
 
 		it("should return 400 VALIDATION_ERROR for empty events array", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const request = {
 				tenantId,
 				body: { events: [] }
@@ -207,7 +207,7 @@ describe("EventsController", () => {
 
 		it("should return 400 for quantity out of range (0 or 101)", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const request = {
 				tenantId,
@@ -248,7 +248,7 @@ describe("EventsController", () => {
 
 		it("should return 400 FUTURE_CLOCK_SKEW for occurredAt > now + 5min", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const futureTime = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // +10min
 			const request = {
 				tenantId,
@@ -282,7 +282,7 @@ describe("EventsController", () => {
 
 		it("should return 400 FUTURE_CLOCK_SKEW for occurredAt < now - 5min", async () => {
 			// Arrange
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const pastTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
 			const request = {
 				tenantId,
@@ -320,7 +320,7 @@ describe("EventsController", () => {
 				mockIngestionService.ingestEvents as ReturnType<typeof vi.fn>
 			).mockRejectedValueOnce(new Error("Redis connection failed"));
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const request = {
 				tenantId,
@@ -361,7 +361,7 @@ describe("EventsController", () => {
 				new AppError("VALIDATION_ERROR", 400, "Invalid quantity")
 			);
 
-			const tenantId = "tenant-1";
+			const tenantId = "11111111-1111-4111-8111-111111111111";
 			const now = new Date().toISOString();
 			const request = {
 				tenantId,
