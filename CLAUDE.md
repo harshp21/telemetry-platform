@@ -162,9 +162,15 @@ owns no table), created by `prisma/migrations/v1_4_app_role_non_superuser`. Note
 exemption and does nothing to a superuser. Migrations run separately as the owner through
 `DIRECT_DATABASE_URL` (Prisma `directUrl`); never point a running service at it.
 
-**Known gap:** auth-service still connects as the admin role, because its
-pre-authentication queries have no tenant to scope to — RLS is inert for that one service
-(S-7). Do not treat a passing RLS test as evidence unless it runs as a
+auth-service connects as `telemetry_auth_app` — a second least-privilege role holding **less**
+than `telemetry_app`: DML on `"Tenant"`, `"User"` and `"RefreshToken"` only, and no default
+grant, so a future table must be granted deliberately. It exists so that `EXECUTE` on its two
+pre-auth resolvers can be granted to auth-service alone. Those lookups — login, the
+duplicate-email check, refresh rotation — go through narrow `SECURITY DEFINER` functions
+(`prisma/migrations/v1_5_auth_tenant_resolvers`) that return the **tenant id only**; the
+credentials come back through an ordinary policy-enforced read. The functions' owner is
+`NOBYPASSRLS` and reads past the tenant policy through two targeted `FOR SELECT` policies, not
+through a role attribute. Do not treat a passing RLS test as evidence unless it runs as a
 `NOSUPERUSER NOBYPASSRLS` role. Full detail: `.claude/rules/tenant-isolation.md`.
 
 ### Raw SQL

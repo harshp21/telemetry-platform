@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { AUTH_TOKENS, AUTH_VALIDATION } from "../src/constants";
 import { EnvSchema } from "../src/config/env";
+import { TEST_DATABASE_URLS } from "./database-urls";
 
 const buildBaseEnv = (): Record<string, string> => ({
   NODE_ENV: "test",
   PORT: "3001",
-  DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/telemetry",
+  DATABASE_URL: TEST_DATABASE_URLS.AUTH_APP,
   REDIS_URL: "redis://localhost:6379",
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318",
   LOG_LEVEL: "silent",

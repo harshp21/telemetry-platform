@@ -1,11 +1,15 @@
 // Vitest setup file - set up environment variables before tests run
+import { TEST_DATABASE_URLS } from "./database-urls";
+
 process.env.NODE_ENV ??= "test";
 process.env.PORT ??= "3001";
-// Deliberately the ADMIN role, not telemetry_app: auth-service's pre-authentication
-// queries are blocked by RLS today. See S-7 in .claude/rules/known-gaps.md.
-process.env.DATABASE_URL ??= "postgresql://postgres:postgres@localhost:5432/telemetry";
-process.env.DIRECT_DATABASE_URL ??= "postgresql://postgres:postgres@localhost:5432/telemetry";
-process.env.RLS_PROBE_DATABASE_URL ??= "postgresql://telemetry_app:telemetry_app_local_dev@localhost:5432/telemetry";
+// auth-service's own least-privilege role: NOSUPERUSER, NOBYPASSRLS, owner of no table, and
+// the only role that may EXECUTE the pre-authentication resolvers created by
+// prisma/migrations/v1_5_auth_tenant_resolvers -- which must be applied first. This is what
+// makes the RLS policies enforce for auth-service, and what the integration suites assert
+// through.
+process.env.DATABASE_URL ??= TEST_DATABASE_URLS.AUTH_APP;
+process.env.DIRECT_DATABASE_URL ??= TEST_DATABASE_URLS.ADMIN;
 process.env.REDIS_URL ??= "redis://localhost:6379";
 process.env.OTEL_EXPORTER_OTLP_ENDPOINT ??= "http://localhost:4318";
 process.env.LOG_LEVEL ??= "silent";

@@ -15,35 +15,6 @@ numbering. A missing id means "fixed", not "never existed" — the plan and revi
 
 ---
 
-## S-3 · `rls.integration.test.ts` encodes the S-2 bug as expected behaviour — **HIGH, open**
-
-`apps/auth-service/tests/rls.integration.test.ts`. S-2 is fixed, so the
-`if (isCurrentUserSuperuser) return;` guards at lines 78/96/109 no longer fire for any
-service that runs as `telemetry_app` — but the file is now broken in two new ways, both
-verified by running it against `telemetry_app`:
-
-1. `beforeAll` seeds through the **same** client it asserts with, so
-   `prisma.tenant.create()` (line 30) fails with
-   `42501 new row violates row-level security policy for table "Tenant"` and all four tests
-   are reported *skipped*. The suite is red and asserts nothing.
-2. With the fixture seeded through an admin client instead (probed out of tree), the two
-   real isolation assertions at lines 78 and 96 **pass** — RLS genuinely enforces — and the
-   third, `without set_config, query sees all rows (no RLS enforcement)` (line 110,
-   `expect(events.length).toBeGreaterThanOrEqual(1)`), **fails with `expected 0 to be
-   greater than or equal to 1`**. That assertion asserts the vulnerability: under enforcing
-   RLS an unscoped query must return **zero** rows.
-
-Left unfixed deliberately: rewriting this file is S-3's own task, not S-2's.
-`apps/usage-service/tests/rls.enforcement.integration.test.ts` is the automated proof that
-RLS enforces in the meantime.
-
-**Fix direction:** seed fixtures through `DIRECT_DATABASE_URL` (admin), assert through
-`DATABASE_URL` (`telemetry_app`), delete the three `isCurrentUserSuperuser` guards, invert
-the line-110 assertion to expect zero rows, and **fail** rather than skip if the asserting
-role is not `NOSUPERUSER NOBYPASSRLS`.
-
----
-
 ## S-5 · Clock-skew window is symmetric — backfill impossible — **MEDIUM, open**
 
 `events.validator.ts:9` sets `CLOCK_SKEW_TOLERANCE_SECONDS: 5 * 60`, and the controller
@@ -62,43 +33,6 @@ in the service is the dedup TTL.
 `apps/usage-service/src/config/env.ts:14` defines and validates `INGEST_BATCH_MAX`; no
 production code reads it. The enforced cap is a hard-coded `BATCH_SIZE_MAX: 100` in
 `events.validator.ts:6`. Operators setting the env var get no effect and no warning.
-
----
-
-## S-7 · auth-service still connects as the admin role — RLS inert for it — **HIGH, open**
-
-Introduced by the S-2 fix, and scoped out of it deliberately.
-
-Every service except auth-service now connects as `telemetry_app`
-(`NOSUPERUSER NOBYPASSRLS`, owns nothing), so RLS enforces. auth-service still connects as
-`postgres` in `apps/auth-service/.env.example`, `docker/docker-compose.yml`, and CI's
-`AUTH_TEST_DATABASE_URL`, so for auth-service the DB layer is still inert and app-layer
-predicates remain the only protection for `"User"` and `"Tenant"`.
-
-Why it could not simply be flipped: `apps/auth-service/src/repositories/user.repository.ts`
-does its work **before** a tenant is known, and the v1_0 policies have no way to allow that.
-Verified against `telemetry_app`:
-
-- `findUserForLogin` / the duplicate-email check select `"User"` by e-mail with no tenant
-  context. `USING ("tenantId" = current_setting('app.tenant_id', true))` evaluates to NULL,
-  so **login silently returns "no such user" for every account**.
-- `createUserWithTenantIfEmailAvailable` INSERTs a `"Tenant"` before any tenant exists →
-  `ERROR: new row violates row-level security policy for table "Tenant"` → **registration
-  returns 500**. Reproduced: `AUTH_TEST_DATABASE_URL=<telemetry_app> vitest run
-  tests/auth.integration.test.ts` → 9 failed | 6 passed.
-- `findRefreshTokenForRotation` joins `"User"`, so refresh breaks the same way.
-  (`"RefreshToken"` itself is unaffected: v1_2 `FORCE`s it but v1_0 never `ENABLE`d RLS on
-  it, so it has no active policy.)
-
-The fix is **not** a policy that lets any role read every user — that is S-2 by another
-route.
-
-**Fix direction:** move the three pre-tenant lookups behind `SECURITY DEFINER` functions
-owned by the migration role, each returning only the columns auth needs
-(`id`, `tenantId`, `passwordHash`, `role`) for exactly one e-mail or token hash; and wrap
-registration in a transaction that generates the tenant id application-side and
-`set_config('app.tenant_id', …, true)` before the INSERT. Then flip auth-service's
-`DATABASE_URL` to `telemetry_app` and drop the overrides listed above.
 
 ---
 
@@ -140,3 +74,115 @@ there, it is S-4 again with a different service name.
 
 **Fix direction:** add the guard *before* the first tenant-scoped route, not after — mirror
 `apps/usage-service/src/middleware/internal-auth.middleware.ts` and its env-schema entry.
+
+---
+
+## S-10 · `"RefreshToken"` has RLS `FORCE`d but never `ENABLE`d — policies are inert — **MEDIUM, open**
+
+Found while landing S-7, and deliberately not folded into it: that change already flips the
+connection role for login and registration, which is the highest-blast-radius path in the
+platform.
+
+`prisma/migrations/v1_0_initial_tenant_usage_rls/migration.sql` omits `"RefreshToken"` from its
+`ENABLE ROW LEVEL SECURITY` block and writes no policy for it; `v1_2` then `FORCE`s it, which
+is a no-op without `ENABLE`. Live `pg_class`: `relrowsecurity = false`,
+`relforcerowsecurity = true`, and the only policy is `refreshtoken_auth_definer_read`, which is
+scoped to a `NOLOGIN` role and inert while RLS is disabled. Any holder of the `telemetry_app`
+or `telemetry_auth_app` credential can therefore read, insert and revoke refresh tokens for
+**every** tenant.
+
+`"InvoiceLineItem"` has the same shape. It has no `tenantId` column of its own either; a policy
+for it would have to join `"Invoice"`.
+
+Consequence for anyone reading auth-service's tests: the `withTenantContext` wrapper around
+every `"RefreshToken"` query cannot currently fail — a version that never set the context would
+behave identically. So the application-layer predicate is doing all the work, and
+`rotateRefreshToken` / `revokeActiveRefreshTokens` carry one explicitly, through Prisma's
+`user: { tenantId }` relation filter (it compiles to a real
+`EXISTS (SELECT … FROM "User" WHERE "tenantId" = $n …)`). `storeRefreshToken` is the exception
+and cannot be fixed the same way: an INSERT has no `where`. Do not remove those relation
+filters on the grounds that the tenant context is set — until this gap closes, they are the
+only tenant control those writes have.
+
+For the same reason the logout test asserts revocation by reading the rows back through an
+**admin** client rather than trusting the `204`. Keep that shape; without it the assertion is
+tautological.
+
+**Fix direction:** add a `tenantId` column to `"RefreshToken"` with a backfill (the better
+long-term shape, and it also removes the need for
+`auth_resolve_tenant_by_refresh_token_hash`), or write a policy joining `"User"`. Then
+`ENABLE ROW LEVEL SECURITY` on both tables. Note that `v1_5` already creates
+`refreshtoken_auth_definer_read`, the `FOR SELECT` policy the resolver's owner needs, so
+enabling RLS will not break refresh rotation. Every `"RefreshToken"` query is already inside
+tenant context, so this is a migration rather than a code change.
+
+---
+
+## S-11 · A `SECURITY DEFINER` function created by a role other than the migration role is `PUBLIC`-executable — **LOW, open**
+
+PostgreSQL grants `EXECUTE` on every new function to `PUBLIC`, and every application role is in
+`PUBLIC`. `prisma/migrations/v1_5_auth_tenant_resolvers` closes that with a **database-scoped**
+default privilege — `ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` — so a
+function created by the migration role now comes out `{owner=X/owner}` with neither `PUBLIC` nor
+`telemetry_app` able to execute it. Verified on PG 16.13.
+
+**The residual, under-restriction:** `ALTER DEFAULT PRIVILEGES` is recorded *per creating role*. A
+function created by any other role — a DBA at a psql prompt, a different migration identity — still
+comes out `proacl = NULL` with `PUBLIC` holding `EXECUTE`. That is the open part.
+
+**The residual, over-restriction:** the entry is database-scoped (`defaclnamespace = 0`), so it also
+covers every function the migration role creates *anywhere* in the database, including plain
+functions and other schemas. `CREATE EXTENSION pgcrypto` as that role yields `crypt`, `armor`,
+`dearmor` as `{owner=X/owner}`, which `telemetry_app` cannot execute — so the five services sharing
+that role fail with `42501 permission denied for function` until someone grants `EXECUTE`
+explicitly. Fails closed, but silently until a query runs. Both directions come from the same
+statement, which is why they share an id; see the release note for the operator-facing version.
+
+**The trap, which cost a review round:** adding `IN SCHEMA "public"` makes the statement do
+**nothing at all**. A schema-scoped `pg_default_acl` row is *merged with* `acldefault()`, which
+contains `=X` for `PUBLIC`, so a schema-scoped revoke can never subtract it — no row is even
+created, and a function made afterwards is still world-executable. Only the database-scoped form
+replaces the default. Do not "tidy" the statement by scoping it.
+
+**What catches the residual:**
+- `migration.sql` section 7 loops every `prosecdef` function in `public` and raises if `PUBLIC` or
+  `telemetry_app` can execute it — at apply time.
+- `apps/auth-service/tests/rls.integration.test.ts` asserts the same invariant, and the exact set
+  of definer functions, on every `pnpm test`.
+
+**When adding one:** `REVOKE ALL ON FUNCTION … FROM PUBLIC` explicitly anyway, grant `EXECUTE` to
+`telemetry_auth_app` rather than `telemetry_app`, and extend the standing test's expected list.
+
+---
+
+## S-12 · `pnpm format:check` cannot pass — **LOW, open**
+
+`.prettierrc` sets `tabWidth: 2` with no `useTabs`, against a tab-indented codebase, so
+`pnpm format:check` reports style issues in ~250 files — including files untouched for months.
+`CLAUDE.md`'s command list therefore advertises a gate that no revision of this repository has
+ever satisfied.
+
+There is no format step in `.github/workflows/ci.yml`, so nothing is actually blocked. Left open
+rather than fixed because `prettier --write` across 250 files would bury every real diff it
+touched.
+
+**Fix direction:** either set `"useTabs": true` in `.prettierrc` and reformat in one commit that
+does nothing else, or drop the `format:check` script and its mention in `CLAUDE.md`. Do not
+reformat as a side effect of a feature change.
+
+---
+
+## S-13 · `prisma/seed.ts` targets a compound unique the schema does not define — **LOW, open**
+
+`prisma/seed.ts:36` upserts `"User"` by `where: { tenantId_email: { tenantId, email } }`. No such
+compound unique exists: `v1_1_user_email_global_unique` made `email` globally unique, and
+`prisma/schema.prisma` declares `@@unique` only on `Meter`, `Invoice` and `MetricRollup`. The seed
+script therefore cannot run.
+
+Found during the S-7 review rounds and left out of that change deliberately — a seed fix has
+nothing to do with the connection role, and `pnpm test` does not run the seed, so nothing is
+currently red because of it.
+
+**Fix direction:** change the upsert to `where: { email }`, matching the unique that actually
+exists. Check the rest of the file against the current schema at the same time; it has not been
+run since `v1_1`.

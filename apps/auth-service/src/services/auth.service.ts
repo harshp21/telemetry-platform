@@ -1,5 +1,6 @@
 import { compare, hash } from "bcryptjs";
 import type { TenantId, UserId } from "@telemetry/shared-types";
+import type { AuthRole } from "../constants";
 import { AUTH_SECURITY, AUTH_VALIDATION } from "../constants";
 import { env } from "../config/env";
 import {
@@ -42,7 +43,7 @@ interface AuthSessionResult {
 	user: {
 		userId: UserId;
 		tenantId: TenantId;
-		role: "OWNER" | "ADMIN" | "MEMBER";
+		role: AuthRole;
 	};
 }
 
@@ -96,6 +97,7 @@ export class AuthService {
 		const refreshTokenResult = this.tokenService.createRefreshToken();
 
 		await this.userRepository.storeRefreshToken({
+			tenantId: user.tenantId,
 			userId: user.userId,
 			refreshTokenHash: refreshTokenResult.refreshTokenHash,
 			expiresAt: refreshTokenResult.expiresAt
@@ -135,6 +137,7 @@ export class AuthService {
 		const newRefreshTokenResult = this.tokenService.createRefreshToken();
 
 		await this.userRepository.rotateRefreshToken({
+			tenantId: currentRefreshToken.tenantId,
 			currentRefreshTokenId: currentRefreshToken.refreshTokenId,
 			userId: currentRefreshToken.userId,
 			newRefreshTokenHash: newRefreshTokenResult.refreshTokenHash,
@@ -158,6 +161,9 @@ export class AuthService {
 		const ttlSeconds = Math.max(1, input.expiresAt - Math.floor(Date.now() / 1000));
 
 		await this.tokenDenylistService.denylistTokenJti(input.jti, ttlSeconds);
-		await this.userRepository.revokeActiveRefreshTokens(input.userId as UserId);
+		await this.userRepository.revokeActiveRefreshTokens({
+			tenantId: input.tenantId,
+			userId: input.userId
+		});
 	}
 }

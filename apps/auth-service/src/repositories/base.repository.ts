@@ -48,12 +48,17 @@ interface Logger {
  *
  * - ✅ `where()` compile-error if caller tries to pass `tenantId` (via `{ tenantId?: never }` constraint)
  * - ✅ `withTenant()` scopes RLS context to transaction only (`is_local = true`)
- * - ⚠️  RLS enforces only for services that connect as `telemetry_app` (NOSUPERUSER,
- *   NOBYPASSRLS, non-owner). `FORCE ROW LEVEL SECURITY` alone would NOT stop a superuser
- *   — it only removes the *table owner's* exemption. auth-service still connects as the
- *   admin role because its pre-authentication queries have no tenant context, so for THIS
- *   service the DB layer below is not currently enforcing. See S-7 in
- *   `.claude/rules/known-gaps.md` and `prisma/migrations/v1_4_app_role_non_superuser/`.
+ * - ⚠️  RLS enforces only for services that connect as a NOSUPERUSER, NOBYPASSRLS, non-owner
+ *   role. `FORCE ROW LEVEL SECURITY` alone would NOT stop a superuser — it only removes the
+ *   *table owner's* exemption. Five services connect as `telemetry_app`
+ *   (`prisma/migrations/v1_4_app_role_non_superuser/`) and auth-service as
+ *   `telemetry_auth_app` (`prisma/migrations/v1_5_auth_tenant_resolvers/`), which has the same
+ *   role attributes, *narrower* table privileges — DML on `"Tenant"`, `"User"` and
+ *   `"RefreshToken"` only — and additionally holds EXECUTE on the two pre-auth tenant resolvers.
+ * - ℹ️  `UserRepository` deliberately does NOT extend this class: it is constructed before
+ *   any tenant exists, so it cannot take `tenantId` as a constructor argument. It uses a
+ *   local `withTenantContext(tenantId, fn)` helper that issues the same `set_config`. The
+ *   reasoning is on that method and in `.claude/rules/tenant-isolation.md`.
  * - ✅ Transaction errors logged with tenant context for observability
  * - ✅ Two-layer defense: app + DB isolation
  *

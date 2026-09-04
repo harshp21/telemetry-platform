@@ -1,5 +1,8 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { errors as JoseErrors, jwtVerify } from "jose";
+import type { TenantId, UserId } from "@telemetry/shared-types";
+import type { AuthRole } from "../constants";
+import { AUTH_ROLES } from "../constants";
 import {
 	ExpiredTokenError,
 	InvalidTokenError,
@@ -12,7 +15,7 @@ import type { AuthenticatedRequestContext } from "./index";
 interface AccessJwtPayload {
 	sub?: string;
 	tenantId?: string;
-	role?: "OWNER" | "ADMIN" | "MEMBER";
+	role?: AuthRole;
 	jti?: string;
 	exp?: number;
 }
@@ -47,14 +50,32 @@ const extractBearerToken = (authorizationHeader: string | undefined): string => 
 	return token;
 };
 
+/**
+ * `jwtVerify<AccessJwtPayload>` is a *shape assertion*, not validation — a signed token carrying
+ * `role: "SUPERADMIN"` would otherwise reach `AuthenticatedRequestContext` typed as `AuthRole`.
+ *
+ * `role` is the only claim narrowed by value. `sub`, `tenantId`, `jti` and `exp` are checked for
+ * presence only, so a token with `exp: "abc"` still reaches `expiresAt: number` — pre-existing,
+ * and unreachable without `JWT_SECRET`, but do not read the presence check as validation.
+ */
+const isAuthRole = (value: unknown): value is AuthRole =>
+	(Object.values(AUTH_ROLES) as unknown[]).includes(value);
+
 const toAuthenticatedContext = (payload: AccessJwtPayload): AuthenticatedRequestContext => {
-	if (!payload.sub || !payload.tenantId || !payload.role || !payload.jti || !payload.exp) {
+	if (!payload.sub || !payload.tenantId || !payload.jti || !payload.exp) {
 		throw new InvalidTokenError();
 	}
 
+	if (!isAuthRole(payload.role)) {
+		throw new InvalidTokenError();
+	}
+
+	// The brands are applied here, at the only trust boundary: the caller has already verified
+	// the signature against JWT_SECRET, so both ids come from one server-signed payload and
+	// cannot be mismatched. Downstream layers take `UserId` / `TenantId` and need no cast.
 	return {
-		userId: payload.sub,
-		tenantId: payload.tenantId,
+		userId: payload.sub as UserId,
+		tenantId: payload.tenantId as TenantId,
 		role: payload.role,
 		jti: payload.jti,
 		expiresAt: payload.exp

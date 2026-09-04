@@ -21,9 +21,21 @@ Epic tasks use pseudo-TDD — `docs/task-implementer-workflow.md`. Skeletons →
 Use `pnpm --filter <pkg> exec vitest run <file>`.
 
 ## Integration tests
-`*.integration.test.ts` need real Postgres and Redis. They are excluded from the default
-vitest config and run via their own script and CI step — separate from `pnpm test`, but never
-silently outside the gate.
+`*.integration.test.ts` need real Postgres and Redis, **and they run inside `pnpm test`**. The
+five services that have a `vitest.config.mjs` (`analytics`, `auth`, `billing`, `usage`, `worker`)
+all set `include: ["tests/**/*.test.ts"]` with no `test.exclude` — the `exclude` in those files is
+under `coverage`, which is a different thing — and the remaining packages have no config and use
+vitest's defaults, which also collect them. So `pnpm test` requires a live database, and CI
+applies migrations before any test step for exactly that reason.
+
+Two suites additionally get their own CI step, deliberately, because they must run against the
+job-level connection roles rather than each package's `tests/setup.ts` defaults (turbo's strict
+env mode does not pass those through): `usage-service`'s `rls.enforcement.integration.test.ts`
+and auth-service's coverage run. That is a *duplicate* of the `pnpm test` run under different
+roles, not a replacement for it.
+
+Do not describe these suites as excluded or opt-in. If that ever becomes true, change the
+configs and this rule in the same commit.
 
 ## Before handoff
 Task-scoped lint/typecheck/test/build, then the full root gate across all 13 packages.

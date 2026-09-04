@@ -44,8 +44,10 @@ State explicitly **what you could not verify and why** (e.g. needs a live databa
 - Tests that assert a mock's own return value rather than behaviour.
 - Helpers that pass vacuously when the thing they look for is absent (they must throw).
 - Tests that **short-circuit** — an early `return` or `skip` on a condition that is true
-  exactly when the bug is present. This is an inverted signal, not a coverage gap
-  (`known-gaps.md` S-3 is a live example).
+  exactly when the bug is present. This is an inverted signal, not a coverage gap.
+  Historically S-3 — the id is gone from `known-gaps.md` because it was fixed; the record is
+  `docs/reviews/s-007-auth-service-restricted-role.md`, and the `beforeAll` throw in
+  `apps/auth-service/tests/rls.integration.test.ts` is the shape that replaced it.
 - Regression tests that were never confirmed to fail before the fix.
 - Implemented logic with no test; error paths with no test.
 

@@ -17,16 +17,17 @@ jobs:
       # `migrate status` run as the owner -- which is what bootstraps telemetry_app in the
       # first place (v1_4_app_role_non_superuser). Also used to seed integration fixtures.
       DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/telemetry
-      # auth-service integration fixtures run against the admin role: auth's pre-tenant
-      # queries are blocked by RLS today. See S-7 in .claude/rules/known-gaps.md.
-      AUTH_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/telemetry
+      # auth-service's own least-privilege role. Same attributes as telemetry_app, but it is
+      # the only role granted EXECUTE on the pre-authentication resolvers (v1_5), which read
+      # past the "User" tenant policy by design. Created by that migration.
+      AUTH_DATABASE_URL: postgresql://telemetry_auth_app:telemetry_auth_app_local_dev@localhost:5432/telemetry
       #
-      # NOTE: turbo runs tasks in strict env mode, so DATABASE_URL / DIRECT_DATABASE_URL
-      # declared here do NOT reach `pnpm test`, `pnpm lint`, `pnpm build` or `pnpm typecheck`
-      # unless they are also declared under `tasks.<task>.env` in turbo.json. Those suites
-      # take their values from each package's `tests/setup.ts` defaults, which are the same
-      # two roles. The vars above apply to the steps that bypass turbo: the Prisma steps and
-      # the auth coverage step.
+      # NOTE: turbo runs tasks in strict env mode, so the connection strings declared here do
+      # NOT reach `pnpm test`, `pnpm lint`, `pnpm build` or `pnpm typecheck` unless they are
+      # also declared under `tasks.<task>.env` in turbo.json. Those suites take their values
+      # from each package's `tests/setup.ts` defaults, which are the same three roles. The
+      # vars above apply to the steps that bypass turbo: the Prisma steps and the auth
+      # coverage step.
       REDIS_URL: redis://localhost:6379
       OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
       JWT_SECRET: test-jwt-secret-value-with-at-least-32-characters
@@ -87,13 +88,14 @@ jobs:
           rm -f apps/auth-service/schema.ci.prisma
 
       - name: Auth Coverage
-        # Runs as the admin role, not telemetry_app. This step bypasses turbo, so the job
-        # level DATABASE_URL would reach it -- and auth-service is the one service that
-        # cannot yet run as telemetry_app (S-7), while tests/rls.integration.test.ts seeds
-        # its fixtures through the same client it asserts with and so fails outright under
-        # RLS (S-3). Remove this override when S-3 and S-7 land.
+        # This step bypasses turbo, so the job-level DATABASE_URL would reach it -- and that
+        # is the shared telemetry_app role, which deliberately cannot EXECUTE the resolvers.
+        # Overridden to auth-service's own role, so the whole auth surface -- register,
+        # login, refresh, logout -- is exercised against the role the service really uses,
+        # and RLS is enforcing throughout. This is a least-privilege role, not an escape
+        # hatch: it fails if the resolvers or their grant are missing.
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/telemetry
+          DATABASE_URL: ${{ env.AUTH_DATABASE_URL }}
         run: pnpm --filter @telemetry/auth-service test:coverage
 
       - name: Lint

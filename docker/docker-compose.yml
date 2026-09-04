@@ -54,10 +54,16 @@ services:
         SERVICE_NAME: auth-service
     environment:
       <<: *common-app-env
-      # Overrides the common least-privilege URL: auth-service's pre-authentication
-      # queries have no tenant context and are blocked by RLS. See S-7 in
-      # .claude/rules/known-gaps.md.
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/telemetry
+      # auth-service has its own least-privilege role rather than the shared telemetry_app:
+      # it is the only role granted EXECUTE on the pre-authentication resolvers, which read
+      # past the "User" tenant policy by design. Created by
+      # docker/postgres/init/01-app-role.sql on first container start.
+      #
+      # The resolvers themselves are NOT created in this stack -- nothing here runs
+      # migrations, and the tables do not exist either -- so auth's database paths are
+      # non-functional in compose. /health, the only thing test:smoke:compose exercises,
+      # does not touch the database.
+      DATABASE_URL: postgresql://telemetry_auth_app:telemetry_auth_app_local_dev@postgres:5432/telemetry
       PORT: "3001"
       JWT_SECRET: test-jwt-secret-value-with-at-least-32-characters
       JWT_REFRESH_SECRET: test-refresh-secret-value-with-at-least-32-chars

@@ -1,21 +1,36 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { PrismaClient } from "@prisma/client";
 import type { FastifyInstance } from "fastify";
 import { SignJWT } from "jose";
 import {
   AUTH_COOKIES,
+  AUTH_ROLES,
   AUTH_HTTP_STATUS,
   AUTH_MESSAGES,
   AUTH_RESPONSES,
   AUTH_ROUTES
 } from "../src/constants";
+import { TEST_DATABASE_URLS } from "./database-urls";
+
+// The service under test connects as telemetry_auth_app (NOSUPERUSER, NOBYPASSRLS), so every
+// assertion below is made against a connection on which RLS is actually enforcing.
+//
+// Fixtures are read and reset through the owner connection instead. As the runtime role,
+// `user.deleteMany()` and `tenant.deleteMany()` delete zero rows and raise no error, so a
+// reset issued through the service's own client would silently stop resetting -- and a
+// revocation assertion made through it would pass without proving anything.
+
+// Every address this suite creates lives under a domain unique to this run, so the fixture
+// reset can be scoped to rows this file owns instead of truncating tables that
+// rls.integration.test.ts may be using in a parallel worker.
+const SUITE_ID = randomUUID();
+const SUITE_EMAIL_DOMAIN = `@auth-integration-${SUITE_ID}.test`;
 
 const TEST_ENV = {
   NODE_ENV: "test",
   PORT: "3001",
-  DATABASE_URL:
-    process.env.AUTH_TEST_DATABASE_URL ??
-    "postgresql://postgres:postgres@localhost:5432/telemetry",
+  DATABASE_URL: process.env.DATABASE_URL ?? TEST_DATABASE_URLS.AUTH_APP,
   REDIS_URL: "redis://localhost:6379",
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318",
   LOG_LEVEL: "silent",
@@ -39,15 +54,6 @@ type InjectResponse = Awaited<ReturnType<FastifyInstance["inject"]>>;
 type BuildAuthServiceAppFn = () => FastifyInstance;
 
 type PrismaClientLike = {
-  refreshToken: {
-    deleteMany: () => Promise<unknown>;
-  };
-  user: {
-    deleteMany: () => Promise<unknown>;
-  };
-  tenant: {
-    deleteMany: () => Promise<unknown>;
-  };
   $disconnect: () => Promise<void>;
 };
 
@@ -63,6 +69,7 @@ describe.sequential("auth-service integration", () => {
   let app: FastifyInstance | undefined;
   let buildAuthServiceApp: BuildAuthServiceAppFn;
   let prisma: PrismaClientLike | undefined;
+  let admin: PrismaClient | undefined;
 
   const applyTestEnv = (): void => {
     for (const [key, value] of Object.entries(TEST_ENV)) {
@@ -114,9 +121,16 @@ describe.sequential("auth-service integration", () => {
   };
 
   const resetAuthState = async (): Promise<void> => {
-    await getPrisma().refreshToken.deleteMany();
-    await getPrisma().user.deleteMany();
-    await getPrisma().tenant.deleteMany();
+    const users = await getAdmin().user.findMany({
+      where: { email: { endsWith: SUITE_EMAIL_DOMAIN } },
+      select: { id: true, tenantId: true }
+    });
+    const userIds = users.map((user) => user.id);
+    const tenantIds = users.map((user) => user.tenantId);
+
+    await getAdmin().refreshToken.deleteMany({ where: { userId: { in: userIds } } });
+    await getAdmin().user.deleteMany({ where: { id: { in: userIds } } });
+    await getAdmin().tenant.deleteMany({ where: { id: { in: tenantIds } } });
   };
 
   const parseJsonBody = <T>(response: InjectResponse): T => {
@@ -131,12 +145,12 @@ describe.sequential("auth-service integration", () => {
     return app;
   };
 
-  const getPrisma = (): PrismaClientLike => {
-    if (!prisma) {
-      throw new Error("Prisma client is not initialized");
+  const getAdmin = (): PrismaClient => {
+    if (!admin) {
+      throw new Error("Admin Prisma client is not initialized");
     }
 
-    return prisma;
+    return admin;
   };
 
   const registerUser = async (email: string): Promise<void> => {
@@ -163,6 +177,11 @@ describe.sequential("auth-service integration", () => {
     const prismaModule = (await import("../src/lib/prisma")) as PrismaModuleShape;
     prisma = prismaModule.prisma;
 
+    admin = new PrismaClient({
+      datasourceUrl: process.env.DIRECT_DATABASE_URL ?? TEST_DATABASE_URLS.ADMIN,
+      log: ["error"]
+    });
+
     app = buildAuthServiceApp();
   });
 
@@ -179,13 +198,17 @@ describe.sequential("auth-service integration", () => {
       await prisma.$disconnect();
     }
 
+    if (admin) {
+      await admin.$disconnect();
+    }
+
     const globalRedis = (globalThis as { authRedis?: RedisClientWithDisconnect }).authRedis;
     globalRedis?.disconnect?.();
     (globalThis as { authRedis?: RedisClientWithDisconnect }).authRedis = undefined;
   });
 
   it("registers a user and rejects duplicate email", async () => {
-    const email = `owner-${randomUUID()}@example.com`;
+    const email = `owner-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
 
     const firstResponse: InjectResponse = await getApp().inject({
       method: "POST",
@@ -226,7 +249,7 @@ describe.sequential("auth-service integration", () => {
   });
 
   it("logs in successfully with cookie session and rejects wrong password", async () => {
-    const email = `owner-${randomUUID()}@example.com`;
+    const email = `owner-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
     await registerUser(email);
 
     const loginResponse: InjectResponse = await getApp().inject({
@@ -264,7 +287,7 @@ describe.sequential("auth-service integration", () => {
     expect(loginBody.data.user.userId.length).toBeGreaterThan(0);
     expect(typeof loginBody.data.user.tenantId).toBe("string");
     expect(loginBody.data.user.tenantId.length).toBeGreaterThan(0);
-    expect(loginBody.data.user.role).toBe("OWNER");
+    expect(loginBody.data.user.role).toBe(AUTH_ROLES.OWNER);
 
     const wrongPasswordResponse: InjectResponse = await getApp().inject({
       method: "POST",
@@ -282,8 +305,50 @@ describe.sequential("auth-service integration", () => {
     });
   });
 
+  it("keeps the fixture reset scoped to this suite's own rows, and actually resets", async () => {
+    // The reset no longer truncates the tables; it deletes only rows whose e-mail ends with
+    // this run's domain. That predicate is itself capable of silently matching nothing --
+    // every test uses a random address, so a reset that deleted zero rows would leave the
+    // suite green. Prove both halves: the predicate finds what this suite creates, and the
+    // reset removes it.
+    const email = `reset-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
+    await registerUser(email);
+
+    const beforeReset = await getAdmin().user.count({
+      where: { email: { endsWith: SUITE_EMAIL_DOMAIN } }
+    });
+    expect(beforeReset).toBeGreaterThan(0);
+
+    await resetAuthState();
+
+    const afterReset = await getAdmin().user.count({
+      where: { email: { endsWith: SUITE_EMAIL_DOMAIN } }
+    });
+    expect(afterReset).toBe(0);
+  });
+
+  it("rejects login for an unknown email with 401, not 500", async () => {
+    // The pre-tenant e-mail resolver returns NULL for an address that does not exist. That
+    // must degrade to the ordinary invalid-credentials answer -- same code, same message as a
+    // wrong password -- and must not surface as a database error.
+    const response: InjectResponse = await getApp().inject({
+      method: "POST",
+      url: `${AUTH_ROUTES.V1_AUTH}${AUTH_ROUTES.LOGIN}`,
+      payload: {
+        email: `unknown-${randomUUID()}${SUITE_EMAIL_DOMAIN}`,
+        password: "StrongPass123"
+      }
+    });
+
+    expect(response.statusCode).toBe(AUTH_HTTP_STATUS.UNAUTHORIZED);
+    expect(parseJsonBody<{ code: string; message: string }>(response)).toEqual({
+      code: AUTH_RESPONSES.CODE_INVALID_CREDENTIALS,
+      message: AUTH_MESSAGES.INVALID_CREDENTIALS
+    });
+  });
+
   it("refreshes session token with valid cookie and csrf, and rejects revoked token reuse", async () => {
-    const email = `owner-${randomUUID()}@example.com`;
+    const email = `owner-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
     await registerUser(email);
 
     const loginResponse: InjectResponse = await getApp().inject({
@@ -340,7 +405,7 @@ describe.sequential("auth-service integration", () => {
   });
 
   it("rejects refresh request without csrf header", async () => {
-    const email = `owner-${randomUUID()}@example.com`;
+    const email = `owner-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
     await registerUser(email);
 
     const loginResponse: InjectResponse = await getApp().inject({
@@ -370,7 +435,7 @@ describe.sequential("auth-service integration", () => {
   });
 
   it("logs out with valid cookie and csrf, then rejects the same access token", async () => {
-    const email = `owner-${randomUUID()}@example.com`;
+    const email = `owner-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
     await registerUser(email);
 
     const loginResponse: InjectResponse = await getApp().inject({
@@ -385,6 +450,7 @@ describe.sequential("auth-service integration", () => {
     const loginBody = parseJsonBody<{
       data: {
         accessToken: string;
+        user: { userId: string };
       };
     }>(loginResponse);
     const sessionCookies: CookieMap = parseSetCookieValues(extractSetCookies(loginResponse));
@@ -423,6 +489,17 @@ describe.sequential("auth-service integration", () => {
       code: AUTH_RESPONSES.CODE_TOKEN_REVOKED,
       message: AUTH_MESSAGES.TOKEN_REVOKED
     });
+
+    // Non-tautological half. "RefreshToken" has RLS FORCEd but never ENABLEd (S-10), so a
+    // tenant-context wrapper that never fires still returns 204 -- the HTTP response proves
+    // nothing about the database. Read the rows back through the owner connection instead.
+    const storedTokens = await getAdmin().refreshToken.findMany({
+      where: { userId: loginBody.data.user.userId },
+      select: { revokedAt: true }
+    });
+
+    expect(storedTokens.length).toBeGreaterThan(0);
+    expect(storedTokens.every((token) => token.revokedAt !== null)).toBe(true);
   });
 
   it("rejects expired access token with TOKEN_EXPIRED", async () => {
@@ -455,7 +532,7 @@ describe.sequential("auth-service integration", () => {
 
   describe("register endpoint (T-018)", () => {
     it("registers a new user with valid input and returns 201 with userId and tenantId", async () => {
-      const email = `valid-${randomUUID()}@example.com`;
+      const email = `valid-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
 
       const response: InjectResponse = await getApp().inject({
         method: "POST",
@@ -475,10 +552,26 @@ describe.sequential("auth-service integration", () => {
       expect(body.data.tenantId).toBeTruthy();
       expect(typeof body.data.userId).toBe("string");
       expect(typeof body.data.tenantId).toBe("string");
+
+      // The tenant id is generated application-side and set as `app.tenant_id` before the
+      // INSERT, because `tenant_self_insert` checks the id being written against the context.
+      // Reading the row back through the owner connection proves the echoed id is the id the
+      // database actually stored, not one the response invented.
+      const storedTenant = await getAdmin().tenant.findUnique({
+        where: { id: body.data.tenantId },
+        select: { id: true }
+      });
+      const storedUser = await getAdmin().user.findUnique({
+        where: { id: body.data.userId },
+        select: { tenantId: true }
+      });
+
+      expect(storedTenant?.id).toBe(body.data.tenantId);
+      expect(storedUser?.tenantId).toBe(body.data.tenantId);
     });
 
     it("sets first registrant as OWNER role", async () => {
-      const email = `owner-role-${randomUUID()}@example.com`;
+      const email = `owner-role-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
 
       const registerResponse: InjectResponse = await getApp().inject({
         method: "POST",
@@ -513,11 +606,11 @@ describe.sequential("auth-service integration", () => {
           };
         };
       }>(loginResponse);
-      expect(loginBody.data.user.role).toBe("OWNER");
+      expect(loginBody.data.user.role).toBe(AUTH_ROLES.OWNER);
     });
 
     it("rejects duplicate email with 409 and EMAIL_ALREADY_EXISTS code", async () => {
-      const email = `duplicate-${randomUUID()}@example.com`;
+      const email = `duplicate-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
 
       const firstRegister: InjectResponse = await getApp().inject({
         method: "POST",
@@ -551,7 +644,7 @@ describe.sequential("auth-service integration", () => {
     });
 
     it("rejects duplicate email case-insensitively with 409", async () => {
-      const email = `caseinsensitive-${randomUUID()}@example.com`;
+      const email = `caseinsensitive-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
 
       const firstRegister: InjectResponse = await getApp().inject({
         method: "POST",
@@ -595,11 +688,11 @@ describe.sequential("auth-service integration", () => {
         }
       });
 
-      expect(response.statusCode).toBe(400);
+      expect(response.statusCode).toBe(AUTH_HTTP_STATUS.BAD_REQUEST);
     });
 
     it("rejects password shorter than 8 characters with 400", async () => {
-      const email = `shortpass-${randomUUID()}@example.com`;
+      const email = `shortpass-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
 
       const response: InjectResponse = await getApp().inject({
         method: "POST",
@@ -613,11 +706,11 @@ describe.sequential("auth-service integration", () => {
         }
       });
 
-      expect(response.statusCode).toBe(400);
+      expect(response.statusCode).toBe(AUTH_HTTP_STATUS.BAD_REQUEST);
     });
 
     it("rejects empty firstName with 400", async () => {
-      const email = `emptyname-${randomUUID()}@example.com`;
+      const email = `emptyname-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
 
       const response: InjectResponse = await getApp().inject({
         method: "POST",
@@ -631,11 +724,11 @@ describe.sequential("auth-service integration", () => {
         }
       });
 
-      expect(response.statusCode).toBe(400);
+      expect(response.statusCode).toBe(AUTH_HTTP_STATUS.BAD_REQUEST);
     });
 
     it("rejects empty lastName with 400", async () => {
-      const email = `emptylast-${randomUUID()}@example.com`;
+      const email = `emptylast-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
 
       const response: InjectResponse = await getApp().inject({
         method: "POST",
@@ -649,11 +742,11 @@ describe.sequential("auth-service integration", () => {
         }
       });
 
-      expect(response.statusCode).toBe(400);
+      expect(response.statusCode).toBe(AUTH_HTTP_STATUS.BAD_REQUEST);
     });
 
     it("rejects missing required field with 400", async () => {
-      const email = `missing-${randomUUID()}@example.com`;
+      const email = `missing-${randomUUID()}${SUITE_EMAIL_DOMAIN}`;
 
       const response: InjectResponse = await getApp().inject({
         method: "POST",
@@ -667,7 +760,7 @@ describe.sequential("auth-service integration", () => {
         }
       });
 
-      expect(response.statusCode).toBe(400);
+      expect(response.statusCode).toBe(AUTH_HTTP_STATUS.BAD_REQUEST);
     });
   });
 });

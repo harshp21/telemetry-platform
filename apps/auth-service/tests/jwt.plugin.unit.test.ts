@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { SignJWT } from "jose";
+import type { AuthRole } from "../src/constants";
+import { AUTH_ROLES } from "../src/constants";
 import {
   ExpiredTokenError,
   InvalidTokenError,
@@ -30,7 +32,9 @@ const createAccessToken = async (
   secret: string,
   payload: {
     tenantId?: string;
-    role?: "OWNER" | "ADMIN" | "MEMBER";
+    // Deliberately wider than `AuthRole`: the point of two tests below is a signed token
+    // carrying a role the service does not recognise, which `AuthRole` cannot express.
+    role?: AuthRole | string;
     jti?: string;
   },
   expiration: string
@@ -76,7 +80,7 @@ describe("jwt.plugin unit", () => {
   it("throws ExpiredTokenError for expired token", async () => {
     const token = await createAccessToken(
       process.env.JWT_SECRET as string,
-      { tenantId: "tenant_1", role: "OWNER", jti: "jti_1" },
+      { tenantId: "tenant_1", role: AUTH_ROLES.OWNER, jti: "jti_1" },
       "-1s"
     );
     const request = createRequest(`Bearer ${token}`);
@@ -86,10 +90,41 @@ describe("jwt.plugin unit", () => {
     );
   });
 
+  it("throws InvalidTokenError for a signed token carrying an unknown role", async () => {
+    // The signature is valid — `jwtVerify<AccessJwtPayload>` is a shape assertion, not
+    // validation, so without the AUTH_ROLES check this reaches
+    // `AuthenticatedRequestContext.role` typed as `AuthRole` while holding "SUPERADMIN".
+    const token = await createAccessToken(
+      process.env.JWT_SECRET as string,
+      { tenantId: "tenant_1", role: "SUPERADMIN", jti: "jti_1" },
+      "15m"
+    );
+    const request = createRequest(`Bearer ${token}`);
+
+    await expect(requireJwtAuth(request, {} as FastifyReply)).rejects.toBeInstanceOf(
+      InvalidTokenError
+    );
+  });
+
+  it("throws InvalidTokenError when the role claim is absent", async () => {
+    // The "required claims are missing" test below omits `tenantId` and keeps a valid role, so
+    // it never reaches the role branch.
+    const token = await createAccessToken(
+      process.env.JWT_SECRET as string,
+      { tenantId: "tenant_1", jti: "jti_1" },
+      "15m"
+    );
+    const request = createRequest(`Bearer ${token}`);
+
+    await expect(requireJwtAuth(request, {} as FastifyReply)).rejects.toBeInstanceOf(
+      InvalidTokenError
+    );
+  });
+
   it("throws InvalidTokenError when required claims are missing", async () => {
     const token = await createAccessToken(
       process.env.JWT_SECRET as string,
-      { role: "OWNER", jti: "jti_1" },
+      { role: AUTH_ROLES.OWNER, jti: "jti_1" },
       "15m"
     );
     const request = createRequest(`Bearer ${token}`);
@@ -102,14 +137,14 @@ describe("jwt.plugin unit", () => {
   it("sets request.auth for valid token and non-denylisted jti", async () => {
     const token = await createAccessToken(
       process.env.JWT_SECRET as string,
-      { tenantId: "tenant_1", role: "OWNER", jti: "jti_valid" },
+      { tenantId: "tenant_1", role: AUTH_ROLES.OWNER, jti: "jti_valid" },
       "15m"
     );
     const request = createRequest(`Bearer ${token}`) as FastifyRequest & {
       auth?: {
         userId: string;
         tenantId: string;
-        role: "OWNER" | "ADMIN" | "MEMBER";
+        role: AuthRole;
         jti: string;
         expiresAt: number;
       };
@@ -131,7 +166,7 @@ describe("jwt.plugin unit", () => {
 
     const token = await createAccessToken(
       process.env.JWT_SECRET as string,
-      { tenantId: "tenant_1", role: "OWNER", jti: "jti_revoked" },
+      { tenantId: "tenant_1", role: AUTH_ROLES.OWNER, jti: "jti_revoked" },
       "15m"
     );
     const request = createRequest(`Bearer ${token}`);

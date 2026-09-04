@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { jwtVerify } from "jose";
+import { AUTH_ROLES } from "../src/constants";
+import { TEST_DATABASE_URLS } from "./database-urls";
 
 const applyEnv = (): void => {
   process.env.NODE_ENV = "test";
   process.env.PORT = "3001";
-  process.env.DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/telemetry";
+  process.env.DATABASE_URL = TEST_DATABASE_URLS.AUTH_APP;
   process.env.REDIS_URL = "redis://localhost:6379";
   process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "http://localhost:4318";
   process.env.LOG_LEVEL = "silent";
@@ -43,7 +45,7 @@ describe("token.service unit", () => {
     const result = await service.createAccessToken({
       userId: "user_1",
       tenantId: "tenant_1",
-      role: "OWNER"
+      role: AUTH_ROLES.OWNER
     });
 
     expect(result.expiresInSeconds).toBe(900);
@@ -53,7 +55,7 @@ describe("token.service unit", () => {
 
     expect(verified.payload.sub).toBe("user_1");
     expect(verified.payload.tenantId).toBe("tenant_1");
-    expect(verified.payload.role).toBe("OWNER");
+    expect(verified.payload.role).toBe(AUTH_ROLES.OWNER);
     expect(typeof verified.payload.jti).toBe("string");
     expect((verified.payload.jti as string).length).toBeGreaterThan(0);
     expect((verified.payload.exp ?? 0) - (verified.payload.iat ?? 0)).toBe(900);
