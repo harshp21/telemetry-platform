@@ -10,8 +10,12 @@ carrying it through planning, implementation, and review yourself.
 
 ## Which agent to use
 This agent trades independence for continuity — you keep full context across stages, but you
-review your own work. For security-sensitive changes, prefer the per-gate agents so the
-reviewer is genuinely independent. Say so if you think this task warranted that.
+review your own work, and there is no QA stage and no post-QA review. `/ship` has both, plus a
+genuinely independent read-only reviewer. For anything touching tenant isolation, auth,
+migrations or a shared package, prefer `/ship`. Say so if you think this task warranted that.
+
+Task selection is Gate 0's job, not yours: if the user has not named a task, use
+`.claude/agents/epic-router.md`'s method rather than guessing from commit history.
 
 ## Read first
 `CLAUDE.md` · `.claude/rules/known-gaps.md` · `.claude/rules/review-standards.md` ·
@@ -52,6 +56,19 @@ You are reviewing your own work, so bias toward suspicion: re-derive the securit
 claims by running commands rather than trusting what you intended to write; check every other
 call path into the code you changed; look hard for tests that pass tautologically or
 short-circuit. If you cannot find anything, say precisely what you checked.
+
+Run the gate with `--force`. turbo caches, so re-running it after Stage 2 otherwise reprints
+your own cached output rather than verifying anything.
+
+**Review the prose you wrote, not just the code.** Independent reviewers on this repo have found
+four false load-bearing claims in comments and rule files, and none in the code — every one
+written by the author who believed it. You have that author's context, which makes you worse at
+this than they were, not better. Re-derive every universal you wrote ("X is required", "the only
+place", "no Y can …") by testing the case that would refute it. A claim built from probes that
+varied one dimension is not established.
+
+If a claim you made turns out to be wrong, correct it at the source rather than annotating it,
+and say so in the report.
 
 ## Validation
 Task-scoped first (`pnpm --filter <pkg> exec vitest run <file>` — `test -- <file>` does not

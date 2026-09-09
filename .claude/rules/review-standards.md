@@ -8,6 +8,10 @@ agent at Gates 4 and 6.
 ### Compile-Time Validation (REQUIRED GATE)
 - Run task-scoped lint, typecheck, build — **no errors allowed**.
 - Run full workspace lint, typecheck, build — **no blockers allowed**.
+- **Pass `--force`.** turbo caches task results, so a plain re-run after the implementer's own
+  run replays their cached output: `pnpm typecheck` reports `13 cached · FULL TURBO` in under a
+  second and establishes nothing about the revision under review. `--force` is the difference
+  between re-running the gate and reprinting it.
 - Report status for **all 13 packages** on every review.
 - Classify pre-existing warnings as pre-existing and **prove it** with
   `git diff --name-only` / `git log -1 <file>`. Never let a pre-existing warning be counted
@@ -20,6 +24,20 @@ agent at Gates 4 and 6.
 - All error codes and messages in `constants.ts` or a service-local constants module.
 - Report findings-first: each violation as **BLOCKER / HIGH / MEDIUM / LOW / NIT** with an
   explicit disposition.
+
+### Claims the Change Makes (REQUIRED GATE)
+- Treat every assertion the diff **adds** as a finding candidate, not as context: code comments,
+  `CLAUDE.md` and `.claude/rules/` edits, plan dispositions, release notes, commit message.
+- Re-derive the load-bearing ones **by execution**. A false claim in `CLAUDE.md` or
+  `.claude/rules/` is **HIGH** — those files are designated authoritative and other agents are
+  instructed to trust them without re-verification. A false claim beside security-relevant code
+  is at least MEDIUM; the next person to edit it will believe it.
+- Be most suspicious of **universals**: "X is required", "the only place", "no Y can …",
+  "catches both directions", "verified". For each, ask what would have to be true for it to be
+  false and test *that*. A claim established by probes that varied only one dimension is not
+  established.
+- Check the change's account of itself: if a plan or commit message says a test was "confirmed
+  red", or that a claim was removed from N places, verify the redness and the count.
 
 ### Code Correctness
 - Bug detection and regression-risk assessment.
@@ -42,7 +60,9 @@ agent at Gates 4 and 6.
   required fixes. List remaining risks and their dispositions.
 
 ## Review priority order
-Security and correctness blockers before style nits:
+Security and correctness blockers before style nits. The *Claims the Change Makes* gate is not
+in this list because it cuts across all of it — a false claim can be about tenant isolation,
+precision, or a test's redness, and takes the severity of whatever it is about:
 
 1. Tenant isolation and RLS
 2. Injection risk in raw SQL

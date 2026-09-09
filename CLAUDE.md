@@ -66,7 +66,10 @@ the whole package suite. Use `pnpm --filter <pkg> exec vitest run <file>` to act
     Epic Router → Task Planner → Task Implementer → Senior Reviewer (pre-QA)
       → QA Tester → Senior Reviewer (final) → CI Validation Gate → Commit Approval
 
-Each stage is owned by an agent in `.claude/agents/`. Run it with **`/ship <task-id>`**.
+Each stage is owned by an agent in `.claude/agents/` — `epic-router`, `task-planner`,
+`task-implementer`, `senior-reviewer` (both review gates) and `qa-tester`. Run it with
+**`/ship <task-id>`**, or **`/ship`** with no argument to have `epic-router` derive and propose
+the next task and stop for confirmation.
 
 Two hard rules:
 
@@ -75,7 +78,9 @@ Two hard rules:
 2. **No commits until all gates pass.** Stage during implementation; one atomic commit per
    task, and only when the user says so.
 
-Artifacts: `docs/plans/` · `docs/reviews/` · `docs/qa/`
+Artifacts: `docs/plans/` · `docs/reviews/` · `docs/qa/` · `docs/releases/` (ordered deploys,
+rollback levers). A plan marks a task **started**, not finished — Gate 1 writes it before any
+code exists, so nothing may read `docs/plans/` as evidence of completion.
 
 ---
 

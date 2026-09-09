@@ -18,8 +18,10 @@ the approved plan.
 ## Priority order
 1. **Tenant isolation** (highest) — every tenant query scoped; predicate derived from the
    repository's bound context, never caller input; `withTenant` wrapping; middleware not
-   bypassable. Check the DB layer too — and remember a superuser connection makes RLS inert
-   regardless of `FORCE ROW LEVEL SECURITY` (`known-gaps.md` S-2).
+   bypassable. Check the DB layer too: a superuser or `BYPASSRLS` connection makes RLS inert
+   regardless of `FORCE ROW LEVEL SECURITY`, which only removes the *table owner's* exemption.
+   Confirm the connecting role with `pg_roles` rather than assuming — that failure was real
+   here, and a passing RLS test proved nothing while it lasted.
 2. **Injection** — raw SQL must bind every user value; enum variation must be a key lookup
    into constant `Prisma.sql` fragments.
 3. **Correctness** — bugs, regression risk, boundary and precision handling, pagination
@@ -40,6 +42,25 @@ and read the bound values; query `pg_roles`; grep for the constant's actual uses
 State explicitly **what you could not verify and why** (e.g. needs a live database). An honest
 "not verified" outranks an assumed green.
 
+## Claims the change itself makes (REQUIRED)
+
+Treat every assertion the diff *adds* — code comments, `.claude/rules/` and `CLAUDE.md` edits,
+plan dispositions, release notes, the commit message — as a finding candidate, not as context.
+Re-derive the load-bearing ones by execution.
+
+A false claim in `CLAUDE.md` or `.claude/rules/` is **HIGH**: those files are designated
+authoritative and other agents are instructed to trust them without re-verification. A false
+claim in a comment next to security-relevant code is at least MEDIUM — the next person to edit
+that code will believe it.
+
+Be most suspicious of **universals**: "X is required", "this is the only …", "no Y can …",
+"catches both directions", "verified". For each, ask what would have to be true for it to be
+false, and test *that*. A claim established by probes that varied only one dimension is not
+established — check whether the author tried the one variation that would have refuted it.
+
+Also check the change's own account of itself: if a plan or commit message says a test was
+"confirmed red", or that a claim was removed from N places, verify the count and the redness.
+
 ## Test honesty — look for these specifically
 - Tests that assert a mock's own return value rather than behaviour.
 - Helpers that pass vacuously when the thing they look for is absent (they must throw).
@@ -53,7 +74,12 @@ State explicitly **what you could not verify and why** (e.g. needs a live databa
 
 ## Compile-time gate (run it, report actual output)
 Task-scoped then full workspace: `lint`, `typecheck`, `build`, `test`. Report status for all
-13 packages. Classify pre-existing warnings as pre-existing and **prove it** with
+13 packages.
+
+**Use `--force`.** turbo caches task results, so a plain `pnpm test` run after the implementer
+has just run it replays their cached output and verifies nothing about the revision you are
+reviewing. `pnpm test --force` (and the same for the other three) is the difference between
+re-running the gate and reprinting it. Classify pre-existing warnings as pre-existing and **prove it** with
 `git diff --name-only` / `git log -1 <file>`. Never count a pre-existing warning against the
 change, and never wave a new one through as pre-existing.
 

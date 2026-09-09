@@ -15,8 +15,10 @@ the Senior Reviewer's verdict in `docs/reviews/`.
 Do **not** repeat the reviewer's analysis. Verify independently and look where they did not.
 
 ## Do
-1. **Full gates**, verbatim: `pnpm build`, `pnpm test`, `pnpm lint`, `pnpm typecheck` —
-   status for all 13 packages.
+1. **Full gates**, verbatim, and with `--force`: `pnpm build --force`, `pnpm test --force`,
+   `pnpm lint --force`, `pnpm typecheck --force` — status for all 13 packages. Without
+   `--force`, turbo replays the implementer's cached results and your "independent" run
+   verifies nothing.
 2. **Acceptance criteria** — walk the plan's coverage mapping and confirm each AC is proven by
    a test that would **fail if the behaviour broke**. Try breaking one deliberately if you are
    unsure: mutate the implementation, confirm the test goes red, revert. Flag tautological

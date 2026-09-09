@@ -186,3 +186,65 @@ currently red because of it.
 **Fix direction:** change the upsert to `where: { email }`, matching the unique that actually
 exists. Check the rest of the file against the current schema at the same time; it has not been
 run since `v1_1`.
+
+---
+
+## S-14 · `.claude/agents/` and `.github/agents/` are two divergent copies of one pipeline — **LOW, open**
+
+The same five agents are defined twice: `.claude/agents/*.md` for Claude Code and
+`.github/agents/*.agent.md` for Copilot, plus `.github/instructions/` carries an 88-line
+`copilot-instructions.md`, a 263-line `enterprise-delivery-flow.instructions.md` and
+`agent-stage-tracking.instructions.md` with no Claude counterpart.
+
+They have already drifted, structurally rather than just in wording. `epic-router` existed
+**only** on the Copilot side until this change ported it — which is why `CLAUDE.md` described an
+eight-stage pipeline whose first stage had no agent. The dangling `known-gaps.md` S-2 citation in
+`senior-reviewer.md` survived for the same reason: a fix applied to one copy does not reach the
+other. `enterprise-delivery` differs substantially in length and content between the two, and the
+`.github/instructions/` files have no Claude counterpart at all.
+
+Left open rather than fixed: unifying two agent sets consumed by two different tools is its own
+task, and the Copilot side cannot be exercised from here to confirm a rewrite is faithful.
+
+**Fix direction:** make `.claude/agents/` authoritative and generate or thin the `.github/` set
+from it, or drop the Copilot set if nobody drives this repo through Copilot. Until then, a change
+to any agent definition should be applied to both copies in the same commit, and the reviewer
+should check that it was.
+
+---
+
+## S-15 · The epic files are not a reliable task manifest — **LOW, open**
+
+Found by the first real run of `.claude/agents/epic-router.md`, which has to derive task state
+because no status field exists. Five distinct hygiene defects, each verified:
+
+- **An id is declared twice for two different tasks.** `T-070` is
+  "Service coverage thresholds and CI gate" in `docs/epics/epic-12-testing.md` and
+  "Tenant isolation type-level enforcement" in `docs/epics/epic-13-security.md`. The epic-12
+  sense is committed (`f8a3246`); the epic-13 sense is unimplemented — its deliverable
+  `scripts/check-tenant-isolation.sh` does not exist and no CI step runs it. `/ship T-070` is
+  therefore ambiguous.
+- **An id is committed but never declared.** `T-074` (`dba4899`, startup env-file resilience)
+  runs past the declared maximum; no epic knows it exists.
+- **Sub-task ids invented during delivery and never folded back.** `T-024C`, `T-024D`, `T-067A`,
+  `T-067B`, `T-067C` have plans and commits but no epic declaration.
+- **An id reused by an unrelated artifact.** `docs/plans/t-068-auth-access-ttl-guardrail.md` is
+  about the auth access-token TTL guardrail, not epic-12's T-068 (compose smoke tests) — so
+  filename-prefix matching reports T-068 planned on the strength of a different task's plan.
+- **A decision gate reads unresolved but was settled in practice.** `docs/epics/README.md` lists
+  Q5 (refresh token delivery) with no "decided" marker, while `640e53d` and `bdb6bcf` shipped a
+  hybrid cookie + CSRF model. Read literally, the router must refuse all of Epic 4 over a gate
+  the repo answered long ago.
+
+Suffixed ids are a related trap for tooling rather than a doc defect: `T-024B` and `T-025A`
+exist, so any id matcher must be `T-[0-9]+[A-Z]?`. The bare pattern truncates `T-025A` to
+`T-025` and reports `T-025` — which is **not** committed — as done.
+
+Left open rather than fixed: reconciling the backlog is a docs task with its own review, and
+guessing which `T-070` was meant, or marking Q5 decided on the router's inference, would be
+exactly the kind of silent resolution the router is built to refuse.
+
+**Fix direction:** renumber the epic-13 `T-070`, declare `T-074` and the sub-task ids, rename the
+`t-068-*` plan, and mark Q5 decided with its resolution — then keep `docs/epics/README.md` the
+single authority it claims to be. Until then, treat router output as evidence-with-ambiguities,
+not as a manifest.

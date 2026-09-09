@@ -80,8 +80,9 @@ the migration itself and by `apps/auth-service/tests/rls.integration.test.ts`:
 
 1. **Owner:** `telemetry_auth_definer` — `NOLOGIN NOSUPERUSER NOBYPASSRLS`, holding `SELECT` on
    exactly two tables. `FORCE ROW LEVEL SECURITY` on `"User"` removes the *owner's* exemption,
-   so a definer with no way past the policies returns `NULL` **silently** — which is the S-7
-   bug reproduced from inside its own fix. The way past is two targeted policies,
+   so a definer with no way past the policies returns `NULL` **silently** — which is the failure
+   S-7 described, reproduced from inside its own fix. (S-7 is fixed and its id retired; the record
+   is `docs/plans/s-007-auth-service-restricted-role.md`.) The way past is two targeted policies,
    `user_auth_definer_read` and `refreshtoken_auth_definer_read`, both `FOR SELECT` and both
    scoped `TO telemetry_auth_definer`.
 2. **Not `BYPASSRLS`.** That is a *role attribute*: it applies to every table the role can ever

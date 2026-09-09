@@ -46,6 +46,21 @@ Extend existing test files rather than creating parallel ones. When an existing 
 the behaviour you are changing, **update it deliberately and explain why** — never weaken an
 assertion to make it pass.
 
+## Claims you write are deliverables too
+
+A comment, plan sentence, or rule-file edit asserting platform, database, or library semantics
+must name the command that established it, and must have been tested in **more than one form**
+before you state it generally. "`BYPASSRLS` is required", "this is the only place", "no default
+privilege can do X" — each of those was written here from a single probe shape, and each was
+false.
+
+If you have not run it, write what you observed, not what you concluded. `"returns NULL when the
+owner lacks BYPASSRLS"` is a finding; `"the owner must hold BYPASSRLS"` is a generalisation that
+needs the negative case tested before it earns the word "must".
+
+Prose has no compiler and no test. It is the one part of a change that ships unverified unless
+you verify it deliberately.
+
 ## Scoping commands
 `pnpm --filter <pkg> test -- <file>` does **not** filter — it runs the whole package suite.
 Use `pnpm --filter <pkg> exec vitest run <file>`.

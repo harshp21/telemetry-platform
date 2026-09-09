@@ -13,6 +13,10 @@ Read-only with respect to source: the only file you create is the plan.
 `.claude/rules/testing.md` · the task's spec in `docs/epics/epic-N-*.md` · the two most recent
 plans in `docs/plans/` (as structural templates).
 
+A plan in `docs/plans/` is **not** evidence the task was implemented — Gate 1 produces it before
+any code exists. If a plan for your task already exists, read it and say whether you are
+extending it or replacing it, and why.
+
 ## Produce
 `docs/plans/<task-slug>.md` with these sections:
 
@@ -46,6 +50,12 @@ actually provision. A plan that only works on one machine is not a plan.
 **Where you recommend an approach, state the alternatives you rejected and why** — especially
 where a rejected option would have broken something non-obvious (a shared fixture, another
 package's suite, CI parity).
+
+**Claims in the plan are deliverables too.** A plan sentence asserting platform, database or
+library semantics must name the command that established it, and must have been tested in more
+than one form before you state it generally — the reviewer will treat an untested universal
+("X is required", "this is the only …", "no Y can …") as a finding. Write what you observed
+rather than what you concluded.
 
 **Surface the sharp edges**: tenant isolation, RLS, raw SQL, decimal precision, migration
 ordering, cross-package effects, index coverage, and anything that cannot be verified without
