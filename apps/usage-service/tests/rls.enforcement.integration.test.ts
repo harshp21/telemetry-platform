@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
+import { DATABASE_SESSION_SETTINGS } from "../src/constants";
 
 /**
  * Proves that PostgreSQL Row-Level Security is *actually enforcing* — the acceptance
@@ -21,7 +22,6 @@ import { PrismaClient } from "@prisma/client";
  *                          because seeding is itself subject to RLS as the app role
  */
 
-const APP_TENANT_ID_SETTING = "app.tenant_id";
 const SEEDED_QUANTITY_A = "11.500000";
 const SEEDED_QUANTITY_B = "22.500000";
 const ADMIN_URL_FALLBACK = "postgresql://postgres:postgres@localhost:5432/telemetry";
@@ -181,7 +181,7 @@ describe("PostgreSQL RLS enforcement on UsageLine (integration)", () => {
 
   it("returns only tenant A's rows when app.tenant_id is tenant A", async () => {
     const rows = await app.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT set_config(${APP_TENANT_ID_SETTING}, ${tenantAId}, true)`;
+      await tx.$queryRaw`SELECT set_config(${DATABASE_SESSION_SETTINGS.TENANT_ID}, ${tenantAId}, true)`;
       return tx.$queryRaw<UsageLineRow[]>`SELECT * FROM "UsageLine"`;
     });
 
@@ -192,7 +192,7 @@ describe("PostgreSQL RLS enforcement on UsageLine (integration)", () => {
 
   it("returns only tenant B's rows when app.tenant_id is tenant B", async () => {
     const rows = await app.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT set_config(${APP_TENANT_ID_SETTING}, ${tenantBId}, true)`;
+      await tx.$queryRaw`SELECT set_config(${DATABASE_SESSION_SETTINGS.TENANT_ID}, ${tenantBId}, true)`;
       return tx.$queryRaw<UsageLineRow[]>`SELECT * FROM "UsageLine"`;
     });
 
@@ -204,7 +204,7 @@ describe("PostgreSQL RLS enforcement on UsageLine (integration)", () => {
   it("cannot write a row belonging to another tenant", async () => {
     await expect(
       app.$transaction(async (tx) => {
-        await tx.$queryRaw`SELECT set_config(${APP_TENANT_ID_SETTING}, ${tenantAId}, true)`;
+        await tx.$queryRaw`SELECT set_config(${DATABASE_SESSION_SETTINGS.TENANT_ID}, ${tenantAId}, true)`;
         return tx.$executeRaw`
 					INSERT INTO "UsageLine"
 						("id", "tenantId", "eventId", "metricKey", "quantity", "periodStart", "periodEnd")
@@ -217,7 +217,7 @@ describe("PostgreSQL RLS enforcement on UsageLine (integration)", () => {
 
   it("cannot update another tenant's row even with an explicit id predicate", async () => {
     const affected = await app.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT set_config(${APP_TENANT_ID_SETTING}, ${tenantAId}, true)`;
+      await tx.$queryRaw`SELECT set_config(${DATABASE_SESSION_SETTINGS.TENANT_ID}, ${tenantAId}, true)`;
       return tx.$executeRaw`UPDATE "UsageLine" SET "billed" = true WHERE "id" = ${usageLineBId}`;
     });
 

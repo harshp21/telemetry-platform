@@ -61,6 +61,42 @@ export const USAGE_SUMMARY_CONSTANTS = {
   MESSAGE_INVALID_RANGE: "from must be earlier than to"
 } as const;
 
+/**
+ * PostgreSQL session settings written, transaction-locally, at the start of every
+ * tenant-scoped transaction (`TenantScopedRepository.withTenant`).
+ *
+ * `TIME_ZONE` is pinned because `"UsageLine"."periodStart"` -- and all 20 application
+ * timestamp columns -- are `timestamp(3) without time zone`. A `timestamptz` bound compared
+ * against a naive column resolves through the SESSION zone, so an unpinned session makes the
+ * same query return different rows on different servers (S-18).
+ */
+export const DATABASE_SESSION_SETTINGS = {
+  TENANT_ID: "app.tenant_id",
+  TIME_ZONE: "TimeZone",
+  TIME_ZONE_UTC: "UTC"
+} as const;
+
+/**
+ * Fixed SQL text this service splices into raw queries. Plain strings, never
+ * `Prisma.Sql` — `constants.ts` is imported by `app.ts`, both controllers, both route
+ * modules, all three middleware and the validator, and `@prisma/client` does not belong in
+ * that graph. The consuming repository wraps each entry in `Prisma.raw` once, at module
+ * scope, and keeps the resulting fragment module-private.
+ *
+ * The same treatment `apps/auth-service/src/constants.ts` gives its resolver function names
+ * (`AUTH_DATABASE.RESOLVE_TENANT_BY_EMAIL_FN`, wrapped at
+ * `apps/auth-service/src/repositories/user.repository.ts`).
+ *
+ * `UTC_NAIVE_TIMESTAMP_CAST` is the cast every timestamp bound in raw SQL must carry.
+ * `"UsageLine"."periodStart"` is `timestamp(3) without time zone`; the precision must match
+ * the column, because a narrower cast rounds (measured: `'2026-01-31T23:59:59.999Z'` under
+ * `::timestamp(0)` becomes `2026-02-01 00:00:00`, which moves a row across an exclusive
+ * upper bound), and `::timestamptz` reintroduces S-18 outright.
+ */
+export const DATABASE_SQL = {
+  UTC_NAIVE_TIMESTAMP_CAST: "::timestamp(3)"
+} as const;
+
 export const USAGE_SERVICE_RUNTIME = {
   DEFAULT_PORT: 3002,
   HOST: "0.0.0.0"

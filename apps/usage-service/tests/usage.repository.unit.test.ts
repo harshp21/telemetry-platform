@@ -4,13 +4,72 @@ import type { PrismaClient } from "@prisma/client";
 import type { TenantId } from "@telemetry/shared-types";
 import { UsageRepository } from "../src/repositories/usage.repository";
 import type { UsageSummaryQueryInput } from "../src/repositories/usage.repository";
-import { USAGE_SUMMARY_CONSTANTS, USAGE_SUMMARY_GRANULARITY } from "../src/constants";
+import {
+  DATABASE_SESSION_SETTINGS,
+  USAGE_SUMMARY_CONSTANTS,
+  USAGE_SUMMARY_GRANULARITY
+} from "../src/constants";
 
 const TENANT_ID = "11111111-1111-4111-8111-111111111111" as TenantId;
 const OTHER_TENANT_ID = "22222222-2222-4222-8222-222222222222";
 
 const FROM = "2026-01-01T00:00:00.000Z";
 const TO = "2026-01-08T00:00:00.000Z";
+// The same two instants written with a non-Z offset. `iso8601Schema` is
+// `z.string().datetime({ offset: true })`, so these are legal request values.
+const FROM_WITH_OFFSET = "2026-01-01T05:30:00.000+05:30";
+const TO_WITH_OFFSET = "2026-01-08T05:30:00.000+05:30";
+
+/** Position of each bound parameter in the range predicate's `values` array. */
+const BOUND_INDEX = {
+  TENANT_ID: 0,
+  FROM: 1,
+  TO: 2
+} as const;
+
+/** Order of the `set_config` statements `withTenant` issues before any aggregate query. */
+const SET_CONFIG_INDEX = {
+  TENANT_ID: 0,
+  TIME_ZONE: 1
+} as const;
+
+/** Order of the aggregate queries `aggregateSummary` issues inside the transaction. */
+const AGGREGATE_INDEX = {
+  COUNT: 0,
+  PAGE: 1
+} as const;
+
+/**
+ * Argument positions inside a tagged-template `$queryRaw` call: the template strings, then
+ * `set_config`'s bound setting name and setting value.
+ */
+const TEMPLATE_ARG = {
+  STRINGS: 0,
+  SETTING_NAME: 1,
+  SETTING_VALUE: 2
+} as const;
+
+const SET_CONFIG_FUNCTION = "set_config";
+/** `is_local = true` — the setting must not outlive the transaction on a pooled connection. */
+const TRANSACTION_LOCAL_ARGUMENT = ", true)";
+
+/**
+ * Hard literals, deliberately NOT imported from `src/constants`, and the one place in this
+ * file where `.claude/rules/constants.md` is answered rather than followed.
+ *
+ * That rule exists to stop one magic value being restated in several places and drifting
+ * apart. Here the subject of the assertion IS the exact wire format, so the literal is the
+ * specification: deriving it from the code under test makes the expectation move with the
+ * production constant and the test blind to the very mutations it names. Measured — both of
+ * these pass the derived form and fail this one: `::timestamptz` reintroduces S-18 (a
+ * `timestamptz` bound resolves through the session zone; `'2026-01-01T00:00:00.000Z'`
+ * renders `2026-01-01 05:30:00` naive under `Asia/Kolkata`) and `::timestamp(0)` rounds
+ * `2026-01-31T23:59:59.999Z` up to `2026-02-01 00:00:00`, moving a row across an exclusive
+ * upper bound.
+ */
+const EXPECTED_TIMESTAMP_CAST = "::timestamp(3)";
+/** The S-18 defect itself: a cast that puts the session zone back into the comparison. */
+const FORBIDDEN_TIMESTAMPTZ_CAST = "::timestamptz";
 
 const baseInput: UsageSummaryQueryInput = {
   from: FROM,
@@ -41,18 +100,31 @@ const rawRow = (
   totalQuantity: new Prisma.Decimal(totalQuantity)
 });
 
+const isSetConfigCall = (call: unknown[]): boolean =>
+  String(call[TEMPLATE_ARG.STRINGS]).includes(SET_CONFIG_FUNCTION);
+
 /**
  * Builds a Prisma double whose `$transaction` immediately runs the callback with a
- * transaction client. `$queryRaw` resolves the supplied results in order:
- * [0] the `set_config` call issued by TenantScopedRepository.withTenant,
- * [1] the grouped-row count query,
- * [2] the paginated aggregate query.
+ * transaction client.
+ *
+ * `$queryRaw` answers the session `set_config` statements that
+ * TenantScopedRepository.withTenant issues with an empty result, and serves
+ * `aggregateResults` to the aggregate queries in `AGGREGATE_INDEX` order. Dispatching on
+ * the statement rather than on a call index keeps every assertion in this file independent
+ * of how many session settings `withTenant` writes -- otherwise adding one `set_config`
+ * silently re-points every result and each test fails for a reason it is not about.
  */
-const createPrismaMock = (results: unknown[]) => {
-  const queryRaw = vi.fn();
-  for (const result of results) {
-    queryRaw.mockResolvedValueOnce(result);
-  }
+const createPrismaMock = (aggregateResults: unknown[]) => {
+  const pending = [...aggregateResults];
+  const queryRaw = vi.fn(async (...args: unknown[]) => {
+    if (isSetConfigCall(args)) {
+      return [];
+    }
+    if (pending.length === 0) {
+      throw new Error("Aggregate query issued with no mocked result remaining");
+    }
+    return pending.shift();
+  });
   const tx = { $queryRaw: queryRaw };
   const prisma = {
     $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx))
@@ -61,22 +133,38 @@ const createPrismaMock = (results: unknown[]) => {
   return { prisma, queryRaw };
 };
 
-const sqlAt = (queryRaw: ReturnType<typeof vi.fn>, index: number): Prisma.Sql => {
-  const call = queryRaw.mock.calls[index];
+const setConfigAt = (queryRaw: ReturnType<typeof vi.fn>, index: number): unknown[] => {
+  const call = queryRaw.mock.calls.filter(isSetConfigCall)[index];
   if (!call) {
-    throw new Error(`Expected $queryRaw call at index ${index}`);
+    throw new Error(`Expected a set_config statement at index ${index}`);
+  }
+  return call;
+};
+
+const aggregateSqlAt = (queryRaw: ReturnType<typeof vi.fn>, index: number): Prisma.Sql => {
+  const call = queryRaw.mock.calls.filter((entry) => !isSetConfigCall(entry))[index];
+  if (!call) {
+    throw new Error(`Expected an aggregate $queryRaw call at index ${index}`);
   }
   return call[0] as Prisma.Sql;
 };
 
+const aggregateResults = (total: number, rows: unknown[]): unknown[] => [[{ total }], rows];
+
 const runAggregate = async (
   input: UsageSummaryQueryInput,
-  results: unknown[] = [[], [{ total: 0 }], []]
+  results: unknown[] = aggregateResults(0, [])
 ) => {
   const { prisma, queryRaw } = createPrismaMock(results);
   const repository = new UsageRepository(prisma, TENANT_ID, testLogger());
   const result = await repository.aggregateSummary(input);
-  return { prisma, queryRaw, result, countSql: sqlAt(queryRaw, 1), rowsSql: sqlAt(queryRaw, 2) };
+  return {
+    prisma,
+    queryRaw,
+    result,
+    countSql: aggregateSqlAt(queryRaw, AGGREGATE_INDEX.COUNT),
+    rowsSql: aggregateSqlAt(queryRaw, AGGREGATE_INDEX.PAGE)
+  };
 };
 
 describe("UsageRepository.aggregateSummary", () => {
@@ -89,19 +177,35 @@ describe("UsageRepository.aggregateSummary", () => {
   it("sets app.tenant_id before issuing any aggregate query", async () => {
     const { queryRaw } = await runAggregate(baseInput);
 
-    const setConfigCall = queryRaw.mock.calls[0];
-    expect(setConfigCall).toBeDefined();
-    expect(String(setConfigCall?.[0])).toContain("set_config");
-    expect(setConfigCall?.[1]).toBe(TENANT_ID);
+    const setConfigCall = setConfigAt(queryRaw, SET_CONFIG_INDEX.TENANT_ID);
+    expect(setConfigCall[TEMPLATE_ARG.SETTING_NAME]).toBe(DATABASE_SESSION_SETTINGS.TENANT_ID);
+    expect(setConfigCall[TEMPLATE_ARG.SETTING_VALUE]).toBe(TENANT_ID);
+    expect(String(setConfigCall[TEMPLATE_ARG.STRINGS])).toContain(TRANSACTION_LOCAL_ARGUMENT);
+    // The tenant statement is the FIRST statement of the transaction: nothing may run
+    // before RLS context exists, and the S-18 zone pin must not displace it.
+    expect(queryRaw.mock.calls.findIndex(isSetConfigCall)).toBe(SET_CONFIG_INDEX.TENANT_ID);
+  });
+
+  it("pins the session time zone to UTC after setting the tenant id, before any aggregate query", async () => {
+    const { queryRaw } = await runAggregate(baseInput);
+
+    const zoneCall = setConfigAt(queryRaw, SET_CONFIG_INDEX.TIME_ZONE);
+    expect(zoneCall[TEMPLATE_ARG.SETTING_NAME]).toBe(DATABASE_SESSION_SETTINGS.TIME_ZONE);
+    expect(zoneCall[TEMPLATE_ARG.SETTING_VALUE]).toBe(DATABASE_SESSION_SETTINGS.TIME_ZONE_UTC);
+    expect(String(zoneCall[TEMPLATE_ARG.STRINGS])).toContain(TRANSACTION_LOCAL_ARGUMENT);
+    // Both session statements precede every aggregate query.
+    const firstAggregateCall = queryRaw.mock.calls.findIndex((call) => !isSetConfigCall(call));
+    const zoneCallPosition = queryRaw.mock.calls.indexOf(zoneCall as never);
+    expect(zoneCallPosition).toBeLessThan(firstAggregateCall);
   });
 
   it("applies an explicit tenantId filter to the count query and the page query", async () => {
     const { countSql, rowsSql } = await runAggregate(baseInput);
 
     expect(countSql.text).toContain('"tenantId" = $1');
-    expect(countSql.values[0]).toBe(TENANT_ID);
+    expect(countSql.values[BOUND_INDEX.TENANT_ID]).toBe(TENANT_ID);
     expect(rowsSql.text).toContain('"tenantId" = $1');
-    expect(rowsSql.values[0]).toBe(TENANT_ID);
+    expect(rowsSql.values[BOUND_INDEX.TENANT_ID]).toBe(TENANT_ID);
     expect(countSql.values).not.toContain(OTHER_TENANT_ID);
     expect(rowsSql.values).not.toContain(OTHER_TENANT_ID);
   });
@@ -111,8 +215,50 @@ describe("UsageRepository.aggregateSummary", () => {
 
     expect(rowsSql.text).toContain('"periodStart" >= $2');
     expect(rowsSql.text).toContain('"periodStart" < $3');
-    expect(rowsSql.values[1]).toEqual(new Date(FROM));
-    expect(rowsSql.values[2]).toEqual(new Date(TO));
+  });
+
+  it("binds both range bounds as UTC-naive timestamps, not as timestamptz Dates", async () => {
+    const { countSql, rowsSql } = await runAggregate(baseInput);
+
+    // A bound JS Date arrives as `timestamp with time zone`, and comparing that to
+    // `"periodStart"` (`timestamp(3) without time zone`) resolves through the database
+    // SESSION time zone -- so the same request returns different rows on different
+    // servers (S-18). The bound value must therefore be a UTC-normalized ISO string
+    // cast to a naive timestamp, and never a Date.
+    //
+    // The cast text is a hard literal (see EXPECTED_TIMESTAMP_CAST) so that changing the
+    // production constant fails here instead of following it.
+    for (const sql of [countSql, rowsSql]) {
+      expect(sql.text).toContain(`"periodStart" >= $2${EXPECTED_TIMESTAMP_CAST}`);
+      expect(sql.text).toContain(`"periodStart" < $3${EXPECTED_TIMESTAMP_CAST}`);
+      // A naive-timestamp cast is not enough on its own: `::timestamptz` would also satisfy
+      // "is cast", while putting the session zone straight back into the comparison.
+      expect(sql.text).not.toContain(FORBIDDEN_TIMESTAMPTZ_CAST);
+      expect(sql.values[BOUND_INDEX.FROM]).toBe(FROM);
+      expect(sql.values[BOUND_INDEX.TO]).toBe(TO);
+      expect(sql.values[BOUND_INDEX.FROM]).not.toBeInstanceOf(Date);
+      expect(sql.values[BOUND_INDEX.TO]).not.toBeInstanceOf(Date);
+    }
+  });
+
+  it("normalizes an offset-bearing bound to the identical value as its Z equivalent", async () => {
+    const zulu = await runAggregate(baseInput);
+    const offset = await runAggregate({
+      ...baseInput,
+      from: FROM_WITH_OFFSET,
+      to: TO_WITH_OFFSET
+    });
+
+    // PostgreSQL's text -> timestamp cast DISCARDS an offset instead of converting it
+    // ('2026-01-01T00:00:00+05:30'::timestamp(3) is 2026-01-01 00:00:00), so casting the
+    // raw request string would trade a session-dependent bug for an offset-dependent one.
+    // The normalization has to happen in JS, before the value reaches SQL.
+    expect(offset.rowsSql.values[BOUND_INDEX.FROM]).toBe(zulu.rowsSql.values[BOUND_INDEX.FROM]);
+    expect(offset.rowsSql.values[BOUND_INDEX.TO]).toBe(zulu.rowsSql.values[BOUND_INDEX.TO]);
+    expect(offset.rowsSql.values[BOUND_INDEX.FROM]).toBe(FROM);
+    expect(offset.rowsSql.values[BOUND_INDEX.TO]).toBe(TO);
+    expect(offset.rowsSql.values).not.toContain(FROM_WITH_OFFSET);
+    expect(offset.rowsSql.values).not.toContain(TO_WITH_OFFSET);
   });
 
   it("omits the metricKey filter when metricKey is not provided", async () => {
@@ -178,8 +324,15 @@ describe("UsageRepository.aggregateSummary", () => {
     const { rowsSql } = await runAggregate(baseInput);
 
     // periodStart is TIMESTAMP(3) without time zone and is persisted in UTC, so
-    // DATE_TRUNC alone yields UTC bucket boundaries. Any AT TIME ZONE conversion
-    // would silently shift day/week boundaries per server locale.
+    // DATE_TRUNC alone yields UTC bucket boundaries. Measured across four session zones:
+    // DATE_TRUNC('day', "periodStart") returns the same instant under each.
+    //
+    // The direction matters. `AT TIME ZONE 'UTC'` applied to the COLUMN would turn a naive
+    // timestamp into a timestamptz and shift every day/week boundary by the server offset
+    // -- verified: DATE_TRUNC('day','2026-01-01 03:00:00'::timestamp(3) AT TIME ZONE 'UTC')
+    // renders as 2026-01-01 00:00:00+05:30 on an Asia/Kolkata session. Applied to a bound
+    // PARAMETER it is correct and equivalent to the `::timestamp(3)` cast this repository
+    // uses. So this assertion forbids converting the column, not normalizing the bound.
     expect(rowsSql.text).not.toContain("AT TIME ZONE");
   });
 
@@ -200,11 +353,12 @@ describe("UsageRepository.aggregateSummary", () => {
   });
 
   it("returns total as the count of grouped rows, not raw event rows", async () => {
-    const { countSql, result } = await runAggregate(baseInput, [
-      [],
-      [{ total: 3 }],
-      [rawRow("api.request", "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "10")]
-    ]);
+    const { countSql, result } = await runAggregate(
+      baseInput,
+      aggregateResults(3, [
+        rawRow("api.request", "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "10")
+      ])
+    );
 
     expect(countSql.text).toContain("COUNT(*)");
     expect(countSql.text).toContain("GROUP BY");
@@ -230,11 +384,12 @@ describe("UsageRepository.aggregateSummary", () => {
   });
 
   it("normalizes Decimal totalQuantity into a plain string", async () => {
-    const { result } = await runAggregate(baseInput, [
-      [],
-      [{ total: 1 }],
-      [rawRow("api.request", "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "12.500000")]
-    ]);
+    const { result } = await runAggregate(
+      baseInput,
+      aggregateResults(1, [
+        rawRow("api.request", "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "12.500000")
+      ])
+    );
 
     const [row] = result.rows;
     expect(row).toBeDefined();
@@ -244,11 +399,12 @@ describe("UsageRepository.aggregateSummary", () => {
   });
 
   it("normalizes bucket boundaries into UTC ISO-8601 strings", async () => {
-    const { result } = await runAggregate(baseInput, [
-      [],
-      [{ total: 1 }],
-      [rawRow("api.request", "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "1")]
-    ]);
+    const { result } = await runAggregate(
+      baseInput,
+      aggregateResults(1, [
+        rawRow("api.request", "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "1")
+      ])
+    );
 
     const [row] = result.rows;
     expect(row).toEqual({
@@ -260,13 +416,14 @@ describe("UsageRepository.aggregateSummary", () => {
   });
 
   it("returns zero rows and zero total for a range with no data", async () => {
-    const { result } = await runAggregate(baseInput, [[], [{ total: 0 }], []]);
+    const { result } = await runAggregate(baseInput, aggregateResults(0, []));
 
     expect(result).toEqual({ rows: [], total: 0 });
   });
 
   it("propagates database errors to the caller", async () => {
     const queryRaw = vi.fn().mockRejectedValue(new Error("aggregate failed"));
+    // Rejects on the very first statement, so this covers set_config failures too.
     const tx = { $queryRaw: queryRaw };
     const prisma = {
       $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx))

@@ -184,6 +184,64 @@ parameter. Enum-like SQL variation (e.g. `DATE_TRUNC` granularity) must be a key
 a frozen map of constant `Prisma.sql` fragments — never string interpolation, never
 `Prisma.raw` on user input.
 
+#### Raw SQL and timestamps (S-18)
+
+**Never bind a JS `Date` into `$queryRaw` to compare against a timestamp column.** Normalize
+to UTC in JS and cast: `${new Date(iso).toISOString()}::timestamp(3)`. Or use the ORM.
+
+Each claim below with the command that established it, each tested in more than one form.
+
+- **A bound JS `Date` is `timestamptz`.** `SELECT pg_typeof(${new Date(...)})::text` →
+  `timestamp with time zone`; a bound ISO string → `text`; the same string cast →
+  `timestamp without time zone`. Compared against a naive column the comparison then resolves
+  through the **session** `TimeZone`, not UTC. Six `UsageLine` rows, one window
+  (`2026-01-01Z` → `2026-02-01Z`), one predicate, four session zones via
+  `options=-c timezone=…`: `UTC` → `{r2,r3,r4,r5}`, `Asia/Kolkata` → `{r4,r5,r6}`,
+  `America/New_York` → `{r1,r2,r3,r4}`, `Asia/Kathmandu` (+05:45) → `{r4,r5,r6}`.
+- **Prisma's ORM path is safe** — `where: { periodStart: { gte, lt } }` returned
+  `{r2,r3,r4,r5}` under all four zones, both inside and outside `$transaction`, and the query
+  log shows the bound already UTC-normalized (`"2026-01-01 00:00:00 UTC"`). That behaviour is
+  what was measured, and it is what the guidance rests on. *Why* it differs from `$queryRaw`
+  is **inference, not measurement**: the logged parameter form suggests the engine resolves
+  the bound against the column type it has from the schema. Do not restate the mechanism as
+  fact. Prefer the ORM for date ranges; where raw SQL is required, coerce the bound explicitly.
+- **A text → `timestamp` cast discards an offset, it does not convert it.** Under
+  `TimeZone='Asia/Kolkata'`: `'…T00:00:00.000Z'::timestamp(3)`, `'…+05:30'::timestamp(3)` and
+  `'…-08:00'::timestamp(3)` all render `2026-01-01 00:00:00` — three different instants, one
+  value. Offsets are legal input (`iso8601Schema` is `z.string().datetime({ offset: true })`),
+  so casting the raw request string trades a session-dependent bug for an offset-dependent
+  one that no `Z`-only fixture catches. `new Date(x).toISOString()` **first**, then cast.
+- **Omitting the cast fails loudly, so it is the safe mistake**: Prisma binds an ISO string as
+  `text` (`SELECT pg_typeof(${iso})::text` → `text`), and an uncast bound string raises
+  `42883`, surfaced by Prisma as `P2010` with `meta.code = "42883"`. The message names the
+  operands **in the order they appear in the SQL**, so for a `"periodStart" >= $1` predicate it
+  reads `operator does not exist: timestamp without time zone >= text`; write the bound on the
+  left and the same error reads `text <= timestamp without time zone`. Measured in four forms:
+  `$queryRaw` in both operand orders, and `psql` with `'…'::text` and with `PREPARE p(text)`.
+  Caveat: an *unquoted* SQL literal does **not** error — it is `unknown`-typed and coerces — so
+  the loudness comes from the bind being `text`, not from the cast being absent.
+- **All 20 application timestamp columns are naive** — `timestamp(3) without time zone`, no
+  `@db.Timestamptz` anywhere in `prisma/schema.prisma` (`information_schema.columns` over
+  `table_schema='public'`; the only `timestamptz` columns belong to `_prisma_migrations`). So
+  this applies to every one of them. **Equality fails worse than a range**: same rows,
+  `WHERE "periodStart" = $1` with a bound `Date` matched the right row under `UTC`, **no row**
+  under `Asia/Kolkata`, and **the wrong row** under `America/New_York` — which matters for
+  `Invoice @@unique([tenantId, periodStart, periodEnd])` and `Meter`'s `activeFrom` key.
+- **The output side is fine, and must be left alone.** `DATE_TRUNC` over a naive column
+  returned the same instant under every zone tested. `AT TIME ZONE 'UTC'` on a bound
+  *parameter* is correct and equivalent to the cast; on the *column* it produces a
+  `timestamptz` and shifts every bucket boundary by the server offset. Fix the bound.
+- **CI cannot catch any of this.** `postgres:16-alpine` defaults `TimeZone` to `UTC`
+  (`docker exec … psql -Atc "show timezone"` → `UTC`, source `configuration file`), where the
+  broken and correct predicates are identical. A regression test must pin its own non-UTC
+  session or it asserts nothing. Use `options=-c timezone=…`; a bare `?timezone=…` is accepted
+  and silently ignored.
+
+usage-service additionally pins `set_config('TimeZone','UTC',true)` inside `withTenant`
+(`apps/usage-service/src/repositories/base.repository.ts`) as a second layer. It covers
+queries **inside** `withTenant` only, and only in that service — the other four copies of
+`TenantScopedRepository` do not have it.
+
 ### Constants
 No magic strings or numbers in controllers, routes, middleware, or entrypoints — route
 paths, header names, HTTP status codes, error codes and messages, service names all live in

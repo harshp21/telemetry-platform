@@ -1,5 +1,6 @@
 import type { PrismaClient } from "@prisma/client";
 import type { TenantId } from "@telemetry/shared-types";
+import { DATABASE_SESSION_SETTINGS } from "../constants";
 
 type TransactionClient = Omit<
 	PrismaClient,
@@ -54,6 +55,13 @@ interface Logger {
  *   `prisma/migrations/v1_4_app_role_non_superuser/migration.sql`.
  * - ✅ Transaction errors logged with tenant context for observability
  * - ✅ Two-layer defense: app + DB isolation
+ * - ✅ `withTenant()` also pins the session `TimeZone` to UTC, transaction-locally. All 20
+ *   application timestamp columns are `timestamp(3) without time zone`, and a `timestamptz`
+ *   bound compared against a naive column resolves through the SESSION zone — so an
+ *   unpinned session makes the same raw date predicate return different rows on different
+ *   servers (S-18). Measured: `postgres:16-alpine` (CI) defaults to `UTC`, so CI cannot see
+ *   that class of defect; this pin is what makes the *next* raw date predicate in this
+ *   service safe by default. Scope note: it covers queries inside `withTenant` only.
  *
  * ## Non-Goals
  *
@@ -88,14 +96,19 @@ export abstract class TenantScopedRepository {
 		return { ...conditions, tenantId: this.tenantId };
 	}
 
-	// Sets app.tenant_id for the duration of the transaction so Postgres RLS policies fire.
+	// Sets app.tenant_id for the duration of the transaction so Postgres RLS policies fire,
+	// then pins the session TimeZone to UTC so a raw timestamp comparison cannot resolve
+	// through the server's own zone. Both are is_local = true, so neither outlives the
+	// transaction on a pooled connection.
 	protected async withTenant<T>(
 		fn: (tx: TransactionClient) => Promise<T>
 	): Promise<T> {
 		try {
 			this.logger.debug({ operation: "transaction_start" }, "Starting tenant-scoped transaction");
 			const result = await this.prisma.$transaction(async (tx) => {
-				await tx.$queryRaw`SELECT set_config('app.tenant_id', ${this.tenantId}, true)`;
+				// The tenant statement stays FIRST: nothing may run before RLS context exists.
+				await tx.$queryRaw`SELECT set_config(${DATABASE_SESSION_SETTINGS.TENANT_ID}, ${this.tenantId}, true)`;
+				await tx.$queryRaw`SELECT set_config(${DATABASE_SESSION_SETTINGS.TIME_ZONE}, ${DATABASE_SESSION_SETTINGS.TIME_ZONE_UTC}, true)`;
 				return fn(tx);
 			});
 			this.logger.debug({ operation: "transaction_commit" }, "Tenant-scoped transaction committed");

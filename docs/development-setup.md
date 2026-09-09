@@ -28,6 +28,30 @@ Two connection strings, by design (see `.claude/rules/tenant-isolation.md`):
   `prisma migrate deploy` and `prisma migrate status` run as the owner. Nothing at runtime
   should use it.
 
+### The database session time zone matters
+
+All 20 application timestamp columns are `timestamp(3) without time zone`, so a raw SQL
+comparison against a `timestamptz` bound resolves through the **server session's** `TimeZone`
+(S-18, `CLAUDE.md` § *Raw SQL and timestamps*). Check yours:
+
+    psql "$DIRECT_DATABASE_URL" -Atc "show timezone"
+
+`postgres:16-alpine` — the image CI and `docker/docker-compose.yml` use — defaults to `UTC`,
+so this is invisible in CI. A host-native PostgreSQL takes its `postgresql.conf` value from
+`initdb`, which takes it from the host zone; on this project's dev machines that has been
+`Asia/Kolkata`. Nothing is broken by a non-UTC session today — usage-service normalizes its
+bounds in code and pins the zone inside `withTenant` — but a non-UTC session is what makes
+that class of defect reproducible locally, which is worth keeping.
+
+Recommended for an operator, as belt and braces:
+
+    ALTER DATABASE telemetry SET TimeZone='UTC';    -- applies to new sessions
+
+Two caveats, both measured: `ALTER ROLE … SET TimeZone` **overrides** the database-level
+setting, and neither is visible from this repository. And on a connection string,
+`options=-c timezone=UTC` works while a bare `?timezone=UTC` is accepted and silently
+ignored — so an operator can believe they pinned the session and be wrong.
+
 `telemetry_app` is created by `prisma/migrations/v1_4_app_role_non_superuser`, so on a fresh
 clone the ordering is: start Postgres, then
 

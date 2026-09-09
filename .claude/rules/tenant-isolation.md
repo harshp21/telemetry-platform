@@ -14,7 +14,12 @@ Multi-tenant data separation is the platform's core security invariant. Four lay
    `String @default(uuid())`, and a tenant id containing `:` would make
    `DeduplicationService`'s `dedup:<tenantId>:<rawKey>` ambiguous.
 4. **`TenantScopedRepository`** — `withTenant` opens a transaction and issues
-   `set_config('app.tenant_id', …, true)`; PostgreSQL RLS policies read it.
+   `set_config('app.tenant_id', …, true)` as its **first** statement; PostgreSQL RLS policies
+   read it. In usage-service only, a second statement then pins
+   `set_config('TimeZone','UTC',true)` (S-18). The tenant statement stays first because no
+   statement against a tenant-scoped table may precede the RLS context, and a later addition
+   inside `withTenant` must not displace it. That pin is a correctness layer, not an isolation
+   one — see `CLAUDE.md` § *Raw SQL and timestamps*.
 
 ## Required
 - Every tenant-scoped query carries an explicit `tenantId` predicate **and** runs inside
