@@ -93,6 +93,28 @@ export const INTERNAL_AUTH_CONSTANTS = {
 	SECRET_MIN_LENGTH: 32
 } as const;
 
+/**
+ * The Redis Stream that carries usage events between services.
+ *
+ * One definition, three consumers of it: usage-service's producer default
+ * (`apps/usage-service/src/config/env.ts`), its `STREAM_CONSTANTS.DEFAULT_STREAM_NAME`
+ * (`apps/usage-service/src/constants.ts`), and worker-service's consumer default
+ * (`apps/worker-service/src/constants.ts`). It lives here for the same reason
+ * `INTERNAL_AUTH_CONSTANTS` does -- more than one service's env schema resolves it, and
+ * `.claude/rules/constants.md` asks for promotion before the third copy.
+ *
+ * Producer and consumer disagreeing on this value is silent: `XADD` succeeds, `XREADGROUP`
+ * blocks forever on an empty key, and both services report healthy. Deriving all three sites
+ * from one constant means a rename here fails shared-types', usage-service's and
+ * worker-service's suites together. It does **not** make divergence impossible: re-pinning any
+ * one site to a literal still diverges silently, caught by the constants gate and an
+ * unused-import lint error rather than by a test. An operator can also diverge them at runtime
+ * by setting `REDIS_STREAM_NAME` on one service only.
+ */
+export const EVENT_STREAM_CONSTANTS = {
+	USAGE_EVENTS_STREAM: "telemetry:events"
+} as const;
+
 export const ERROR_RESPONSES = {
 	CODE_VALIDATION_ERROR: "VALIDATION_ERROR",
 	CODE_CONFLICT: "CONFLICT",

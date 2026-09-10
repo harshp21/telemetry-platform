@@ -1,4 +1,5 @@
 import {
+  EVENT_STREAM_CONSTANTS,
   INTERNAL_AUTH_HEADERS,
   INTERNAL_AUTH_RESPONSES
 } from "@telemetry/shared-types";
@@ -108,6 +109,10 @@ export const DEDUP_CONSTANTS = {
 } as const;
 
 export const STREAM_CONSTANTS = {
-  DEFAULT_STREAM_NAME: "telemetry:events",
+  // Single-sourced from `@telemetry/shared-types`: a rename there reddens this service's,
+  // worker-service's and shared-types' suites together. Re-pinning this line to a literal
+  // still diverges silently -- see `EVENT_STREAM_CONSTANTS` there, and worker-service's
+  // `WORKER_STREAM_CONSTANTS`.
+  DEFAULT_STREAM_NAME: EVENT_STREAM_CONSTANTS.USAGE_EVENTS_STREAM,
   DEFAULT_MAX_LEN: 100_000
 } as const;

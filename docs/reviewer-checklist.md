@@ -28,7 +28,7 @@ Current compliance (keep this table honest; the open items are in `.claude/rules
 | gateway | n/a — it is the caller; injects the header on every proxied request | yes (env schema) | n/a |
 | usage-service | yes, `onRequest`, `/health` exempt | yes (env schema) | yes |
 | billing-service | yes, but `preHandler` on the internal route group only | partly — `process.env` + `.trim()`, no minimum length (S-8) | no (S-8) |
-| worker-service | as billing-service (S-8) | partly (S-8) | no (S-8) |
+| worker-service | as billing-service (S-8) | yes (env schema, T-037) | no (S-8) |
 | analytics-service | no — `/health` only today (S-9) | no (S-9) | n/a |
 | auth-service | n/a — deliberately public (`/v1/auth/register\|login\|refresh`) | n/a | n/a |
 

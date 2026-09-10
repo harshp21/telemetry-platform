@@ -9,6 +9,7 @@ import {
   type TelemetryEventEnvelope,
   AppError,
   ERROR_RESPONSES,
+  EVENT_STREAM_CONSTANTS,
   INTERNAL_AUTH_CONSTANTS,
   INTERNAL_AUTH_HEADERS,
   INTERNAL_AUTH_RESPONSES,
@@ -23,6 +24,14 @@ describe("shared-types", () => {
       "A valid X-Internal-Secret header is required"
     );
     expect(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH).toBe(32);
+  });
+
+  // The Redis Stream key usage-service's producer XADDs to and worker-service's env schema
+  // defaults to (worker's XREADGROUP itself lands in T-039).
+  // Asserted against the literal on purpose: this is the wire value, and a test written against
+  // the constant would still pass after the constant was edited to a key nothing writes.
+  it("exposes the usage-events stream key both services resolve to", () => {
+    expect(EVENT_STREAM_CONSTANTS.USAGE_EVENTS_STREAM).toBe("telemetry:events");
   });
 
   it("models application errors with stable code and status", () => {

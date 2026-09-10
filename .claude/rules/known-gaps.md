@@ -43,23 +43,37 @@ startup contracts inside a usage-service security fix breaks the one-task-per-co
 
 `apps/billing-service/src/middleware/internal-auth.middleware.ts:9` and
 `apps/worker-service/src/middleware/internal-auth.middleware.ts:9` are the same file, and both
-differ from `apps/usage-service/src/middleware/internal-auth.middleware.ts` in three ways:
+differ from `apps/usage-service/src/middleware/internal-auth.middleware.ts` in three ways
+(item 2 now applies to **billing-service only** — worker's env schema enforces the minimum at
+module load, so worker differs in two):
 
 1. **`!==`, not a timing-safe comparison.** String comparison short-circuits at the first
    differing byte, so response latency leaks how many leading bytes a guess got right. See the
    `secretsMatch` helper in usage-service for the SHA-256 + `timingSafeEqual` form.
-2. **The secret bypasses the env schema.** `apps/billing-service/src/app.ts:23` and
-   `apps/worker-service/src/app.ts:23` read `process.env.INTERNAL_API_SECRET ?? ""` directly, so
+2. **The secret bypasses the env schema — billing-service only.**
+   `apps/billing-service/src/app.ts:23` reads `process.env.INTERNAL_API_SECRET ?? ""` directly, so
    `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH` is not enforced and a 1-character secret starts
-   cleanly. The `.trim()` check they do run happens *after* the DI container is built.
-3. **`preHandler`, not `onRequest`, and `reply.send(...)` is not returned.** An unauthenticated
+   cleanly. The `.trim()` check it does run happens *after* the DI container is built.
+   worker-service no longer has this: T-037 declared `INTERNAL_API_SECRET` in its `EnvSchema`
+   with `.trim().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)`, parsed at module load, and
+   `apps/worker-service/src/app.ts:27` reads the parsed value.
+3. **`preHandler`, not `onRequest`, and `reply.send(...)` is not returned.** (worker's
+   registration is now at `apps/worker-service/src/app.ts:59`.) An unauthenticated
    caller still gets its body parsed and validated before rejection, and the un-`return`ed
    `reply.status(401).send(...)` inside an async hook relies on Fastify's `reply.sent` check
    rather than stating the short-circuit.
 
-**Fix direction:** move `INTERNAL_API_SECRET` into both services' `EnvSchema` with
-`.min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)`, promote the guard to `onRequest`, and share
-one timing-safe comparison helper rather than keeping three copies of the middleware.
+**Fix direction:** move `INTERNAL_API_SECRET` into billing-service's `EnvSchema` with
+`.trim().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)` — the `.trim()` matters and is not
+decoration: `.min()` alone accepts an all-whitespace secret of the right length, which is the
+hole T-037 closed in worker-service. Note usage-service still carries the untrimmed
+`.min()` form and should be aligned in the same change, so all three end up identical.
+
+Then promote the guard to `onRequest` in both, share one timing-safe comparison helper rather
+than keeping three copies of the middleware, and adopt each service's
+`HTTP_STATUS_UNAUTHORIZED` constant instead of the literal `401` at
+`internal-auth.middleware.ts:10` — worker-service defines the constant but its middleware still
+writes the literal.
 
 ---
 

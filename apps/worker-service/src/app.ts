@@ -20,7 +20,11 @@ export const buildWorkerServiceApp = (
   const app = Fastify({ logger: true });
   const container = createContainer(WORKER_SERVICE_NAME, env as ServiceEnv);
   app.decorate("container", container);
-  const internalApiSecret = options.internalApiSecret ?? process.env.INTERNAL_API_SECRET ?? "";
+  // Read the validated value, not `process.env`: `EnvSchema` is what enforces
+  // `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH`, and a declaration `app.ts` bypasses would be
+  // config nothing reads. The explicit option still wins -- `tests/smoke.test.ts` builds the app
+  // with its own short secret, and that override is deliberately not length-checked.
+  const internalApiSecret = options.internalApiSecret ?? env.INTERNAL_API_SECRET;
 
   registerGlobalErrorHandler(app);
 
@@ -31,6 +35,12 @@ export const buildWorkerServiceApp = (
     }
   });
 
+  // The `env.INTERNAL_API_SECRET` path cannot produce a blank value: `EnvSchema` trims before
+  // measuring, so a whitespace-only secret is a parse failure at module load
+  // (`tests/env.schema.unit.test.ts`, "rejects an all-whitespace INTERNAL_API_SECRET"). What
+  // reaches here blank is an explicitly-passed option -- `??` does not fall back for `""` --
+  // which is what "rejects a blank internalApiSecret option" in that same file covers. Before
+  // the trim was added, a 32-space `INTERNAL_API_SECRET` parsed cleanly and arrived here empty.
   if (!internalApiSecret.trim()) {
     throw new InternalApiSecretMissingError();
   }
