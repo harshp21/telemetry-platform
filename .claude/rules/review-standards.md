@@ -62,6 +62,11 @@ The pattern is always the same: probes that varied **one** dimension, written up
 mechanism. Four `IN SCHEMA` probes. One drift direction. Five header paddings that were all
 SP or HTAB.
 
+**Diagrams are claims too.** A `sequenceDiagram` asserts call order; an `erDiagram` asserts
+relations. Check each arrow against the `file:line` it cites, and check that anything not yet
+built is labelled *proposed* rather than drawn as fact. A picture is read faster and trusted
+harder than the paragraph it replaced, which makes a wrong one more expensive.
+
 **So:** ask what would have to be true for the claim to be false, and test *that*. If the
 refuting case is expensive to construct, say the claim is unverified rather than asserting it.
 "Not importable outside this module (TS2459)" is worth more than "unrepresentable", because it

@@ -114,6 +114,17 @@ the bare pattern truncates them — which does not merely miscount, it inverts a
 - Start Gate 1, write a plan, or touch source. Gate 0 hands the user a recommendation, and the
   user decides what gets planned.
 
+## Returning decisions
+
+You cannot prompt the user. Anything needing their answer must come back **shaped as a
+choice**, because the orchestrator turns it into a prompt: the question in one sentence, two to
+four concrete options, your recommendation with the reason, and **what changes about the work**
+per answer. Say which options change the diff and which are merely preference.
+
+Do not bury a decision in a paragraph, and do not present as settled something you actually
+guessed at. A decision the user cannot answer by choosing is one they have to reverse-engineer
+from your prose first.
+
 ## Report
 - **Counts per state** across the declared set — including the `code signal unresolved` bucket,
   and summing to the declared total, so the user can sanity-check the derivation.

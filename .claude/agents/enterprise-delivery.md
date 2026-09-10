@@ -39,7 +39,9 @@ Two hard rules:
   working tree for the user. One atomic commit per task is the user's call.
 
 ## Stage 1 — Plan
-Follow `.claude/agents/task-planner.md` — same sections, same investigative stance. In
+Follow `.claude/agents/task-planner.md` — same two-reader structure, same diagram guidance,
+same investigative stance. The first page must be readable by someone who will not read the
+rest, and the decisions must be on it. In
 particular: distrust the epic spec and verify every constant, code, and payload shape against
 the implementation; check `known-gaps.md` before relying on any protection; verify environment
 claims by running commands.
@@ -80,6 +82,14 @@ and say so in the report.
 Task-scoped first (`pnpm --filter <pkg> exec vitest run <file>` — `test -- <file>` does not
 filter), then the full root gate across all 13 packages. Distinguish pre-existing warnings
 from ones you introduced and prove it with `git diff --name-only` / `git log -1 <file>`.
+
+## Returning decisions
+
+You cannot prompt the user. Anything needing their answer comes back **shaped as a choice** —
+the question in one sentence, two to four options, your recommendation with the reason, and
+what changes about the work per answer. This matters more here than in `/ship`: you carry the
+whole task, so a decision you quietly settle is one nobody else sees before it is implemented,
+reviewed by you, and reported as done.
 
 ## Report
 Plan path · review path · design decisions and why · confirmation new tests failed before the

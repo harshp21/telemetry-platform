@@ -45,6 +45,23 @@ without being told to continue. Gate 2 and Gate 8 are the two where the user is 
 something substantive; the rest are checkpoints where they may redirect, reorder, skip a gate,
 or stop — and cannot if the next agent is already running.
 
+**Ask the transition as a prompt, not as a paragraph.** Use a structured question with
+options. The user should be able to answer by choosing, not by composing a reply.
+
+- One prompt per boundary. Lead with the recommended option and say why it is recommended.
+- Options are the paths that genuinely exist — proceed to the named next gate, rework, skip a
+  gate (with the reason), or stop. Never offer a choice you would refuse to honour.
+- **Fold that gate's decisions and clarifications into the same prompt.** A gate that surfaces
+  three open questions and a transition asks all four together, not a wall of prose followed by
+  "shall I continue?". If a decision changes what the next gate does, it belongs *before* the
+  transition question, because the answer changes which option is right.
+- Each option states what happens next **and what it costs** — another agent run, a wider
+  diff, a deferred gap. The user is choosing how to spend time and risk, not rubber-stamping.
+- Put the substance in the prose above the prompt: findings, what you verified, what you could
+  not. The prompt carries the decision, not the evidence.
+- If there is genuinely one path, still ask — proceed or stop — and say plainly that the
+  alternatives are not real.
+
 Skipping a gate is the user's call to make explicitly. If you think one is not worth running
 — Gate 5 on a change with no production code, say — propose it and give the reason. Never
 skip silently.
@@ -91,3 +108,8 @@ deploy, a migration applied before a config flip, or a documented rollback lever
 
 A plan in `docs/plans/` marks a task **started**, not finished — Gate 1 writes it before any code
 exists. Nothing downstream may read it as evidence of completion.
+
+Plans serve two readers: a business analyst who reads the first page and decides, and a senior
+developer who implements from the rest. Decisions and the plain-language summary go on page one;
+probe transcripts go in an appendix. Diagrams (mermaid) where movement or ordering is the point —
+and a diagram is a claim, subject to the same verification as prose.

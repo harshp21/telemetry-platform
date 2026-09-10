@@ -18,18 +18,41 @@ any code exists. If a plan for your task already exists, read it and say whether
 extending it or replacing it, and why.
 
 ## Produce
-`docs/plans/<task-slug>.md` with these sections:
 
-1. Business context (objective, user impact)
-2. Scope and non-goals
-3. Files to change (existing / new)
-4. Step-by-step implementation slices, smallest safe first — including the **controlling
-   code path** and a **falsifiable local hypothesis** ("this is falsified if …")
-5. Test plan with an **explicit acceptance-coverage mapping** (each AC → the tests proving it)
-6. Validation commands: task-scoped first, then the full gate
-7. Risks and mitigations
-8. Pending task checklist
-9. Approval gate statement
+`docs/plans/<task-slug>.md`, written for **two readers who need different things**:
+
+- a **business analyst** deciding whether this is the right work, at the right time, at the
+  right cost — who will not read past the first page and should not have to;
+- a **senior developer** who has to implement it without repeating your investigation.
+
+Serve the first on page one. Serve the second in everything after. Recent plans ran to 1,545
+lines with the decisions at section 22 — by which point the plan has already made them.
+
+### Part 1 — the first page, for the analyst
+
+1. **In plain terms.** What changes, who notices, and what it costs if this is wrong. No file
+   paths, no line numbers, no library names. If a diagram makes the change legible faster than
+   a paragraph does, it belongs here.
+2. **Decisions needed from the user.** Up front. Each with the options, your recommendation,
+   and *what changes about the work* depending on the answer. If an answer would reshape the
+   plan rather than adjust it, you should have halted and asked instead — see below.
+3. **Scope and non-goals**, including anything you are deliberately leaving broken and why.
+
+### Part 2 — for the implementer
+
+4. Files to change (existing / new)
+5. Implementation slices, smallest safe first — each with its **controlling code path** and a
+   **falsifiable local hypothesis** ("this is falsified if …")
+6. Test plan with an explicit **acceptance-coverage mapping** (each AC → the tests proving it)
+7. Validation commands: task-scoped first, then the full gate
+8. Risks and mitigations
+9. Pending task checklist
+10. Approval gate statement
+
+### Appendix — the evidence
+
+Raw probe transcripts, catalog dumps, `EXPLAIN` output, long greps. Keep them: they are why
+the plan is trustworthy. Keep them **out of part 2**, where they bury the instructions.
 
 ## Investigative stance — this is where plans earn their value
 
@@ -67,6 +90,50 @@ you cannot, weaken the claim to what you measured. Six findings across S-7, S-18
 T-037 were universals established by probes that varied a single dimension — and in every case
 the code was right and only the sentence was wrong.
 
+## Diagrams — when they earn their place
+
+Use mermaid in a fenced ```mermaid block. It renders in GitHub, VS Code and most viewers, and
+degrades to readable text where it does not.
+
+Reach for one when the change is about **movement, ordering or shape**, and prose would need a
+paragraph to say it:
+
+- `sequenceDiagram` — a request or message crossing services: who calls whom, in what order,
+  and where tenant context is established. Ordering is the most expensive defect class in this
+  repo; a picture of it is worth the space.
+- `flowchart` — branching, guard ordering, retry and dead-letter paths.
+- `erDiagram` — schema changes, new columns, relations.
+- `stateDiagram-v2` — lifecycles, e.g. a stream message pending → claimed → acked → dead-lettered.
+
+Do **not** draw:
+
+- a picture of a bullet list;
+- a box-per-file architecture diagram that restates the directory tree;
+- anything you have not verified. **A sequence diagram is a claim about call order** and falls
+  under the universals gate in `.claude/rules/review-standards.md` — name the `file:line` each
+  arrow comes from, and if you are describing a path that does not exist yet, label it
+  *proposed* rather than drawing it as fact.
+
+Keep them small — roughly five to ten nodes. A diagram that needs scrolling has stopped
+explaining and started decorating. One good diagram beats four.
+
+The shape to aim for — every arrow traceable, the proposed part labelled:
+
+```mermaid
+sequenceDiagram
+    participant P as usage-service (producer)
+    participant R as Redis stream telemetry.events
+    participant W as worker-service (proposed)
+    P->>R: XADD (stream.publisher.ts:70)
+    Note over R: 2 entries, no consumer group today
+    W-->>R: XGROUP CREATE (proposed, T-038)
+    W-->>R: XREADGROUP (proposed, T-039)
+```
+
+`P->>R` is drawn solid because it exists and the line number says where; the worker arrows are
+dashed and labelled *proposed* because they do not. A reader can tell at a glance which half of
+the picture is a fact and which is a plan.
+
 ## Ask before you plan around it
 
 If you hit an ambiguity where **different readings produce materially different plans**, stop
@@ -86,6 +153,17 @@ user never agreed to is worse than both.
 is needed, which service owns the change, or whether the task is a fix or a documentation
 change. **Do not ask when:** a sensible default exists and the cost of being wrong is a small
 edit — decide it, record it as a decision with your reasoning, and carry on.
+
+## Returning decisions
+
+You cannot prompt the user. Anything needing their answer must come back **shaped as a
+choice**, because the orchestrator turns it into a prompt: the question in one sentence, two to
+four concrete options, your recommendation with the reason, and **what changes about the work**
+per answer. Say which options change the diff and which are merely preference.
+
+Do not bury a decision in a paragraph, and do not present as settled something you actually
+guessed at. A decision the user cannot answer by choosing is one they have to reverse-engineer
+from your prose first.
 
 ## Stop
 End at the approval gate. **Do not write production code or tests.** State plainly that you

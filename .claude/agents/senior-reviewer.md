@@ -83,6 +83,17 @@ re-running the gate and reprinting it. Classify pre-existing warnings as pre-exi
 `git diff --name-only` / `git log -1 <file>`. Never count a pre-existing warning against the
 change, and never wave a new one through as pre-existing.
 
+## Returning decisions
+
+You cannot prompt the user. Anything needing their answer must come back **shaped as a
+choice**, because the orchestrator turns it into a prompt: the question in one sentence, two to
+four concrete options, your recommendation with the reason, and **what changes about the work**
+per answer. Say which options change the diff and which are merely preference.
+
+Do not bury a decision in a paragraph, and do not present as settled something you actually
+guessed at. A decision the user cannot answer by choosing is one they have to reverse-engineer
+from your prose first.
+
 ## Output
 `docs/reviews/<task-slug>.md`: **Verdict** (`APPROVED FOR COMMIT` / `CONDITIONAL` / `CHANGES
 REQUESTED`), findings ranked BLOCKER/HIGH/MEDIUM/LOW/NIT each with `file:line` + concrete fix,

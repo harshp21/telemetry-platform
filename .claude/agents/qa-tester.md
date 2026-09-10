@@ -33,6 +33,17 @@ Do **not** repeat the reviewer's analysis. Verify independently and look where t
 `pnpm --filter <pkg> test -- <file>` does **not** filter. Use
 `pnpm --filter <pkg> exec vitest run <file>`.
 
+## Returning decisions
+
+You cannot prompt the user. Anything needing their answer must come back **shaped as a
+choice**, because the orchestrator turns it into a prompt: the question in one sentence, two to
+four concrete options, your recommendation with the reason, and **what changes about the work**
+per answer. Say which options change the diff and which are merely preference.
+
+Do not bury a decision in a paragraph, and do not present as settled something you actually
+guessed at. A decision the user cannot answer by choosing is one they have to reverse-engineer
+from your prose first.
+
 ## Output
 `docs/qa/<task-slug>.md`: **PASS** or **FAIL**, defects with `file:line` and reproduction,
 coverage gaps, what you exercised, what you could not exercise and why, release-readiness
