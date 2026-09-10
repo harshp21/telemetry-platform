@@ -56,7 +56,7 @@ role per service, and the owner connection used only by Prisma Migrate:
 
 | Env var | Role | Used by |
 |---|---|---|
-| `DATABASE_URL` | `telemetry_app` (least privilege) | gateway, usage, worker, billing, analytics at runtime |
+| `DATABASE_URL` | `telemetry_app` (least privilege) | usage, worker, billing, analytics at runtime (gateway holds no database client) |
 | `DATABASE_URL` | `telemetry_auth_app` (least privilege, DML on three tables only) | auth-service at runtime — see below |
 | `DIRECT_DATABASE_URL` | admin/owner | Prisma `directUrl` — `migrate deploy`/`status`, and integration fixtures that RLS would otherwise block |
 

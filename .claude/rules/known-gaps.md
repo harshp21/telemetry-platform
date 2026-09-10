@@ -30,7 +30,7 @@ in the service is the dedup TTL.
 
 ## S-6 · `INGEST_BATCH_MAX` is dead config — **LOW, open**
 
-`apps/usage-service/src/config/env.ts:14` defines and validates `INGEST_BATCH_MAX`; no
+`apps/usage-service/src/config/env.ts:19` defines and validates `INGEST_BATCH_MAX`; no
 production code reads it. The enforced cap is a hard-coded `BATCH_SIZE_MAX: 100` in
 `events.validator.ts:6`. Operators setting the env var get no effect and no warning.
 
@@ -248,3 +248,222 @@ exactly the kind of silent resolution the router is built to refuse.
 `t-068-*` plan, and mark Q5 decided with its resolution — then keep `docs/epics/README.md` the
 single authority it claims to be. Until then, treat router output as evidence-with-ambiguities,
 not as a manifest.
+
+---
+
+## S-16 · The specified 10 KB per-event payload cap is enforced nowhere — **MEDIUM, open**
+
+`docs/epics/epic-6-usage-service.md:62` requires that "serialized `metadata` + envelope for each
+event must stay within 10 KB — `400` if exceeded". usage-service implements no such check.
+
+Observed:
+
+- `grep -rn "bodyLimit\|10240\|10 \* 1024" apps/usage-service/src` → no match.
+- The cap exists, in a package usage-service does not import: `MAX_EVENT_SIZE_BYTES = 10 * 1024`
+  at `packages/shared-validation/src/index.ts:7`, applied by `UsageEventsBatchSchema` (`:115`)
+  in a `superRefine` (`:120`) whose per-event size check is at `:125`.
+  `grep -rn "UsageEventsBatchSchema\|MAX_EVENT_SIZE" apps/usage-service/src` → no match; the
+  service validates with its own `ingestRequestSchema`
+  (`src/validators/events.validator.ts:43`), which has no size rule.
+- `apps/usage-service/src/app.ts:19` is `Fastify({ logger: true })` — no options — so the only
+  ceiling is Fastify's default `bodyLimit`. At the installed fastify@5.10.0 that default is
+  **1 048 576 bytes**, stated three times in
+  `node_modules/.pnpm/fastify@5.10.0/node_modules/fastify/lib/config-validator.js`
+  (`{"bodyLimit":{"type":"integer","default":1048576}}` at :6, `data.bodyLimit = 1048576` at :31,
+  and `defaultInitOptions` at :1265).
+
+So the endpoint is **not** unbounded — it is bounded at 1 MiB *per request*, against an intended
+10 KB *per event*, and a 100-event batch may carry ~10 KB each within that 1 MiB. The gap is the
+missing per-event rule and the absent `400`, not an absent limit. State it that way; the
+overclaim ("unbounded") is itself a finding.
+
+Unlike S-5 and S-6 this is a *missing* guard rather than a mislabelled one, so a test written
+from the epic's wording **fails** rather than passing vacuously. T-036 therefore does not cover
+it: adding the check would be new production behaviour inside a test task.
+
+**Fix direction:** enforce per-event size in `ingestRequestSchema`, return the documented `400`,
+and set an explicit `bodyLimit` on the Fastify instance so the request-level ceiling is a
+decision rather than a default. Reuse the existing number rather than adding a copy — but note
+it is **not** importable today: `MAX_EVENT_SIZE_BYTES` is a module-private `const` at
+`packages/shared-validation/src/index.ts:7` with no `export` keyword (`grep -n "export.*MAX_EVENT_SIZE_BYTES"`
+→ no match), so the first step is exporting it from `@telemetry/shared-validation`.
+
+---
+
+## S-17 · Three more epic-vs-code divergences in the ingestion contract — **LOW, open**
+
+Found while writing T-036's integration suite. Each is a documentation/contract mismatch rather
+than a live hole, and the suite asserts the shipped behaviour in every case.
+
+**`quantity` is far narrower than both the epic and the column.**
+`docs/epics/epic-6-usage-service.md:51` promises "positive, up to 6 decimal places".
+`apps/usage-service/src/validators/events.validator.ts:29` is
+`z.number().int().min(INGESTION_CONSTANTS.QUANTITY_MIN).max(INGESTION_CONSTANTS.QUANTITY_MAX)`
+with `QUANTITY_MIN: 1, QUANTITY_MAX: 100` (`:7-8`) — integers only, and capped at 100 — while
+`Event.quantity` and `UsageLine.quantity` are `Decimal(18,6)` (`prisma/schema.prisma:71` and
+`:89`).
+`quantity: 0.5` and `quantity: 101` are both rejected today. This is why T-036 seeds fractional
+quantities through the owner connection: the HTTP path cannot express the values the
+`Decimal(18,6)` precision cases need.
+
+**Ingest error bodies omit the fields the epic documents.**
+`docs/epics/epic-6-usage-service.md:73` specifies
+`400 { code: 'VALIDATION_ERROR', issues: [...] }` and `:74`
+`400 { code: 'BATCH_TOO_LARGE', max: number }`.
+`apps/usage-service/src/controllers/events.controller.ts:54-57` and `:76-79` send
+`{ code, message }` with `message` a joined string — no `max`, no `issues`.
+`registerGlobalErrorHandler` *does* emit `issues`
+(`packages/shared-utils/src/index.ts:120-128`), but the controller `safeParse`s and never throws
+the `ZodError`, so that path is unreachable from here.
+
+**`generateIdempotencyKey` is specified and dead.**
+`docs/epics/epic-6-usage-service.md:67` names
+`generateIdempotencyKey(tenantId, eventType, occurredAt)`. It exists — a SHA-256 helper at
+`packages/shared-utils/src/index.ts:13-21` — and `grep -rn "generateIdempotencyKey" apps packages
+--include=*.ts` returns eight lines: the declaration, two stale `packages/shared-utils/dist/**/*.d.ts`
+declarations, one import and four call sites, the import and all four call sites inside
+`packages/shared-utils/tests/unit.test.ts`.
+No production caller anywhere. (Aside, not part of this gap: the two `dist` declarations
+disagree with each other and with the source — `dist/src/index.d.ts:3` declares a fourth
+`source: string` parameter that `src/index.ts` does not have.)
+`apps/usage-service/src/services/ingestion.service.ts:114-116` derives a plaintext
+`<eventType>:<sourceId ?? "unknown">:<occurredAt>` instead. Note the derived key omits the tenant
+**deliberately** — `DeduplicationService` owns that segment since S-1 — so a fix must not
+reintroduce the tenant here.
+
+**Fix direction:** decide contract-first in each case (widen the validator to match the column,
+or narrow the epic; add `max`/`issues` to the ingest error bodies, or correct the epic; adopt the
+helper, or delete it). Do not "fix" any of them by editing a test — T-036 pins current behaviour
+on purpose, with inline comments naming this gap.
+
+---
+
+## S-19 · `TenantScopedRepository` is five copies, and S-18's fix reached only one — **MEDIUM, open**
+
+`apps/{analytics,auth,billing,usage,worker}-service/src/repositories/base.repository.ts` are five
+separate files implementing the same class. Recommended independently by the S-18 reviewer, and
+filed here rather than folded into S-18 because changing four other services' transaction
+behaviour inside a usage-service correctness fix breaks the one-task-per-commit rule.
+
+Observed with `md5sum` and `diff`:
+
+- `analytics`, `billing` and `worker` are **byte-identical** (`13a533a2e2c2dcc1ff9db28fb5c7a1fd`,
+  111 lines each).
+- `auth` differs from those three in comments only — `diff` filtered to non-comment lines is
+  empty. It is 118 lines because of a doc paragraph about `UserRepository` not extending the
+  class.
+- `usage` is the outlier at 124 lines: S-18 added
+  `set_config('TimeZone', 'UTC', true)` to its `withTenant`, and moved its two setting names
+  onto `DATABASE_SESSION_SETTINGS` constants. `grep -c TIME_ZONE` → `1` for usage-service, `0`
+  for the other four, which still inline `'app.tenant_id'` as a literal.
+
+Consequence: the other four services' `withTenant` opens a transaction whose session zone is
+whatever the server defaults to. Their columns are the same `timestamp(3) without time zone`, so
+the first raw timestamp predicate written in any of them inherits S-18 exactly.
+
+**How bad it is today, stated no stronger than measured:** latent, not live.
+`grep -rn "extends TenantScopedRepository" apps/*/src` finds exactly one real subclass in the
+whole repository — `UsageRepository` (`apps/usage-service/src/repositories/usage.repository.ts:150`).
+The other four base classes have no subclass at all; the only other matches are the `EventRepository`
+example inside each file's own docstring. So no query is wrong right now. What is wrong is that
+the fix is in the copy that happened to have the bug, and four copies will silently disagree
+with it.
+
+One thing the obvious fix would still not reach, recommended by the S-18 reviewer and recorded
+here so it is not lost: auth-service's two pre-authentication resolver calls
+(`apps/auth-service/src/repositories/user.repository.ts:246-251` and `:258-266`) issue
+`this.db.$queryRaw` **outside** `withTenantContext` and outside any transaction — verified by
+reading both method bodies; the only `set_config` in that file is at `:235`, inside
+`withTenantContext`. A transaction-local `set_config('TimeZone', 'UTC', true)` rolled into all
+five `withTenant` implementations would therefore not cover them. They take no timestamp
+argument today, so nothing is wrong now; the point is that "roll the pin to all five" is not by
+itself a complete answer for auth-service.
+
+**The setting name itself is duplicated the same way.** `grep -rn "app\.tenant_id" apps --include=*.ts`
+(excluding `dist/`, comments and test titles) shows `"app.tenant_id"` written as an executable
+string in **six** places: two named constants —
+`apps/usage-service/src/constants.ts:74` (`DATABASE_SESSION_SETTINGS.TENANT_ID`) and
+`apps/auth-service/src/constants.ts:69` (`AUTH_DATABASE.TENANT_CONTEXT_SETTING`) — and four
+hard-coded literals inside `set_config`, at `analytics`/`billing`/`worker`
+`base.repository.ts:98` and `auth` `base.repository.ts:105`. No test passes the bare literal to
+`set_config`/`current_setting` — every test that names the setting to the database imports one
+of the two constants (checked: the remaining test-file occurrences are comments, `it(...)`
+titles, and one assertion-failure message at
+`apps/auth-service/tests/user.repository.unit.test.ts:116`).
+`.claude/rules/constants.md` asks for promotion before the third copy,
+and this is the sixth; the shared-package fix below should carry the constant with it.
+
+Same drift class as S-14 (`.claude/agents/` vs `.github/agents/`): duplication that was harmless
+while the copies matched, and became a correctness question the moment one changed.
+
+**Fix direction:** promote one implementation to a shared package — a `@telemetry/shared-db`
+alongside the existing seven shared packages — and delete the five copies. `TenantId` already
+comes from `@telemetry/shared-types`, so the dependency direction is established. Do it as its
+own task across all five services, not opportunistically inside the next repository change,
+because it touches every service's data path at once.
+
+---
+
+## S-20 · auth-service's integration fixtures leak permanently, and the reset cannot see it — **MEDIUM, open**
+
+`apps/auth-service/tests/auth.integration.test.ts` cleans up in `beforeEach` only:
+
+- `beforeEach` → `resetAuthState()` (`:188-190`).
+- `afterAll` (`:192-208`) closes the app and disconnects Prisma, the admin client and the global
+  Redis handle. **No data cleanup.** So whatever the final test created stays.
+- `resetAuthState` (`:123-134`) finds its rows by `email: { endsWith: SUITE_EMAIL_DOMAIN }`, and
+  `SUITE_EMAIL_DOMAIN` is `@auth-integration-${randomUUID()}.test` (`:27-28`) — regenerated
+  every run. A run's filter therefore **cannot** match a previous run's rows, by construction.
+
+Both halves are needed for the leak: `beforeEach`-only cleanup leaves the last test's rows, and a
+run-unique filter means no later run ever collects them. Residue is permanent and monotonic.
+
+**Observed, not inferred.** The development database currently holds exactly two `Tenant` and two
+`User` rows and no `RefreshToken`. Both users' emails carry `@auth-integration-<uuid>.test`
+domains, and the two uuids **differ** — `…-2b860f1d-…` and `…-a90cd587-…`. That is two prior runs
+each leaving one orphan behind, which is the mechanism above, measured rather than reasoned about.
+
+A fully-passing run happens to leak nothing only by accident of ordering: the file's last test is
+`"rejects missing required field with 400"` (`:748`), a negative case that registers no user.
+Append one positive test after it, shard the file, or run a subset with `-t`, and every run leaks.
+
+**Fix direction:** call `resetAuthState()` from `afterAll` as well as `beforeEach`, and widen the
+filter to a **stable** prefix so an earlier run's residue is collectable.
+
+That second half is a trade-off, not a straight win, and needs deciding rather than reverting:
+the run-unique domain exists so that parallel vitest workers cannot delete each other's rows —
+`apps/auth-service/tests/rls.integration.test.ts` seeds its own users and tenants and deletes them
+by explicit id (`:179-183`), and a broad `endsWith` filter in the other file could race it. A
+stable prefix plus a per-run *infix* (e.g. `@auth-integration.test` matched for collection,
+`<runId>.auth-integration.test` written per run) keeps both properties. Decide it explicitly.
+
+---
+
+## S-21 · The S-18 regression suite does not isolate the fix it was written for — **LOW, open**
+
+`apps/usage-service/tests/usage.timezone.integration.test.ts` was added by S-18 to prove the
+usage-summary range filter resolves in UTC on any server. Its docstring at `:31-32` says it
+"fails on the unfixed code on **any** server". It does not.
+
+S-18 shipped **two independent guards** — the `utcTimestampBound` normalization-plus-cast in
+`usage.repository.ts`, and the transaction-local `set_config('TimeZone','UTC',true)` in
+usage-service's `withTenant` — and either alone is sufficient. Verified independently three
+times (T-036 Gate 3, and both T-036 review rounds): reverting `utcTimestampBound` to a bound
+JS `Date`, which is the exact S-18 defect, leaves that suite **17/17 green**. Only removing
+both guards fails, and then the failure is `B8 … Asia/Kolkata` in T-036's suite.
+
+Consequence: a future change that removes the bound normalization while leaving the session pin
+in place ships green, and the platform is then one connection-pooler or one raw query outside
+`withTenant` away from the original defect returning silently.
+
+Related, same file: the comment at `:429-431` claims its bucket assertions guard against
+"fixing" the column with `AT TIME ZONE` instead of the bound parameter. Measured: with the pin
+present that mutation passes 47/47, and with the pin also removed the failure lands at `:466`
+(the cross-zone equality loop), not the block the comment annotates. On the committed tree the
+column mistake is caught by neither suite. The projection-side danger the comment describes is
+real — `DATE_TRUNC('day', "periodStart" AT TIME ZONE 'UTC')` yields `2025-12-31` under
+`America/New_York` — but that is not what those assertions test.
+
+**Fix direction:** give each guard a case that fails when *it alone* is reverted — the bound
+one needs a session pinned non-UTC *and* the `withTenant` pin bypassed, which is why it was
+missed. Then correct the docstring and reattach or requalify the `:429-431` comment.
