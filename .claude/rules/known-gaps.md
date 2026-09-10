@@ -481,3 +481,144 @@ real — `DATE_TRUNC('day', "periodStart" AT TIME ZONE 'UTC')` yields `2025-12-3
 **Fix direction:** give each guard a case that fails when *it alone* is reverted — the bound
 one needs a session pinned non-UTC *and* the `withTenant` pin bypassed, which is why it was
 missed. Then correct the docstring and reattach or requalify the `:429-431` comment.
+
+---
+
+## S-22 · auth-service's integration tests write to Redis db 0, alongside the real event stream — **LOW, open**
+
+`apps/auth-service/tests/auth.integration.test.ts:34` hard-codes
+`REDIS_URL: "redis://localhost:6379"`. No logical database is selected anywhere in
+auth-service's config or test setup, so that resolves to **db 0** — the same database holding
+`telemetry:events`, the production ingest stream. `TokenDenylistService`
+(`src/services/token-denylist.service.ts:40`) then writes `denylist:<jti>` keys there on every
+logout test.
+
+Reproduced in isolation: running that one suite took db 0's `DBSIZE` from 2 to 3.
+
+**Nothing is destroyed today.** The keys carry a TTL and self-expire, and no auth-service suite
+issues `FLUSHDB`. The hazard is latent: the moment someone adds a `FLUSHDB` to an auth-service
+suite — the obvious way to make its fixtures deterministic, and exactly what S-20's fix
+direction invites — it wipes the developer's event stream, and on CI it would wipe whatever
+else shares that instance.
+
+Other suites already avoid this by convention rather than by mechanism: usage-service reserves
+db 15 and `FLUSHDB`s only that (`tests/integration.constants.ts:64`, flushed at
+`tests/integration.fixtures.ts:204`), and worker-service reserved db 14 for the same reason in
+T-038, re-asserting that `CLIENT INFO` contains `db=14` immediately before **every** `FLUSHDB`
+it issues.
+
+An earlier revision of this entry said worker asserted the index once, before its *first*
+flush, and that this meant a failed URL override "cannot silently flush the wrong database".
+That was false and is corrected here. Vitest runs `afterAll` even when `beforeAll` throws, so
+a single pre-flush guard leaves the teardown flushes unguarded. Measured on this repo's vitest
+2.1.9: with the guard mutated to an assertion `CLIENT INFO` cannot satisfy, and a sentinel key
+seeded into db 14, the suite reported `Test Files 1 failed (1) / Tests 6 skipped (6)` and
+`redis-cli -n 14 DBSIZE` still went 1 -> 0. With the same mutation against the
+every-flush shape, DBSIZE stayed at 1. Scope of the corrected claim: it holds for flushes
+routed through that one helper. Nothing in the type system stops a future bare
+`redis.flushdb()` in the same file, so this is a chokepoint, not an impossibility.
+
+Found while verifying T-038's own Redis hygiene. Not fixed there: it edits an unrelated
+service's test harness, which is the same reason S-8 was not folded into S-4.
+
+**Fix direction:** give auth-service a reserved logical database as usage-service and
+worker-service have — `redis://localhost:6379/13`, say — and route every `FLUSHDB` through a
+single helper that re-asserts `CLIENT INFO` contains the reserved index *on each call*, as
+`apps/worker-service/tests/stream.consumer.integration.test.ts`'s `flushReservedDb` does. Do
+not copy the one-guard-in-`beforeAll` shape: it does not cover `afterEach`/`afterAll`, which
+run even when `beforeAll` throws. Pairs naturally with S-20, which has to touch that suite's
+fixture lifecycle anyway. Note that a shared Redis instance
+with per-suite logical databases is a convention no mechanism enforces; if suites ever run
+against a managed Redis without multiple databases, this needs key prefixes instead.
+
+---
+
+## S-23 · usage-service's `REDIS_STREAM_NAME` accepts the empty string; worker-service's does not — **LOW, open**
+
+The producer and the consumer resolve the *same* operator-supplied value through schemas of
+different strictness, so `REDIS_STREAM_NAME=""` makes them disagree about which stream the
+platform uses.
+
+| Site | Declaration | `safeParse("")` |
+|---|---|---|
+| `apps/usage-service/src/config/env.ts:21` | `z.string().default(EVENT_STREAM_CONSTANTS.USAGE_EVENTS_STREAM)` | **OK**, parses to `""` |
+| `apps/worker-service/src/config/env.ts:41` | `z.string().min(1).default(WORKER_STREAM_CONSTANTS.DEFAULT_STREAM_NAME)` | throws `String must contain at least 1 character(s)` |
+| `apps/worker-service/src/config/env.ts:42` (`REDIS_CONSUMER_GROUP`) | `z.string().min(1).default(...)` | throws, same message |
+
+Measured against the real schemas, not a reconstruction: `EnvSchema.shape.<field>.safeParse("")`
+on usage-service's compiled `dist/src/config/env.js` and on worker-service's `src/config/env.ts`
+under vitest, zod 3.25.76. The two `REDIS_STREAM_NAME` fields — usage's and worker's, the pair
+the divergence is about — were also probed with `undefined`, and both yield the shared default
+`telemetry:events`, so the divergence is specific to the *empty* value and not to the absent one.
+Worker's `REDIS_CONSUMER_GROUP` is not part of that pair: `undefined` yields its own default,
+`worker-group`, and usage-service declares no consumer-group field at all. (An earlier revision
+said "both fields", which read against the three-row table above as worker's two — false for the
+consumer group. Gate-4 re-review LOW-3.)
+
+Consequence with `REDIS_STREAM_NAME=""` set on both services: usage-service parses `""`, and
+`apps/usage-service/src/events/stream.publisher.ts:36`'s
+`env.REDIS_STREAM_NAME || STREAM_CONSTANTS.DEFAULT_STREAM_NAME` takes the right-hand arm, so
+the producer publishes to `telemetry:events`. worker-service refuses to start. Both fail
+safely — nothing is written to a wrong stream and nothing is silently dropped — but they fail
+*differently* on one value, which is the producer/consumer divergence
+`apps/worker-service/.env.example`'s `REDIS_STREAM_NAME` note exists to prevent.
+
+Second, smaller consequence: `WORKER_STREAM_CONSTANTS`' docblock
+(`apps/worker-service/src/constants.ts:41-44`) states that the producer's `||` fallback "never
+reaches". That is true for an *absent* variable and false for an empty one. T-038 corrected the
+copy of this claim it had introduced in `src/events/stream.consumer.ts`; the T-037 docblock
+still carries it, and was left alone deliberately — editing a T-037 comment inside a T-038
+commit is the same one-task-per-commit objection that kept S-8 out of S-4.
+
+Found at T-038's Gate-4 review. Not fixed there: adding `.min(1)` changes another service's
+startup contract inside a worker-service task, and would need its own schema tests.
+
+**Fix direction:** add `.min(1)` to `apps/usage-service/src/config/env.ts:21` so both sides
+reject the same values, extend usage-service's env-schema unit test with the empty-string case,
+and then delete the now-dead `|| STREAM_CONSTANTS.DEFAULT_STREAM_NAME` arm at
+`stream.publisher.ts:36` rather than leaving an unreachable fallback. Correct
+`apps/worker-service/src/constants.ts:41-44` in the same change. Consider promoting the field
+to one shared schema fragment in `@telemetry/shared-types` so a third service cannot introduce
+a third strictness.
+
+---
+
+## S-24 · Agent sessions have twice been given a **stale snapshot** of `.claude/rules/` — **LOW, open**
+
+`CLAUDE.md` designates this directory authoritative and instructs agents to trust it *without
+re-verification*. That instruction is only safe if the copy an agent sees is the copy on disk.
+Twice now it has not been.
+
+**Observed, both times by a review agent that then went and read the files with `cat`:**
+
+- At T-038's Gate-4 review: the injected `.claude/rules/*` were pre-`1b872b3` — a `testing.md`
+  still carrying the integration-exclusion wording that `1b872b3` had already fixed, a
+  `known-gaps.md` ending at **S-10**, and a `review-standards.md` with no *Universals Must Cite
+  Their Mutation* section. On-disk at the same commit, all three were current.
+- At T-038's Gate-6 review, in a different session: the injected `known-gaps.md` ended at
+  **S-21**, so it could not see the S-22 correction and the S-23 entry that the very diff under
+  review had added.
+
+**What is *not* established:** the mechanism. Neither review investigated whether this is
+snapshot timing, caching, or something else, and nothing here reproduces it on demand — both
+sightings are after-the-fact observations by agents who noticed a mismatch, not a controlled
+probe. Do not restate the cause as known. The *consequence* is what is measured: an agent can
+cite `.claude/rules/` accurately and still be citing a superseded revision.
+
+**Why it is LOW and not higher:** it has caused no wrong verdict so far, because in both cases
+the reviewer noticed the mismatch and re-read from disk. It is filed because that recovery
+depended on the reviewer being suspicious, which is not a mechanism either.
+
+**How this bites, concretely:** the reviewer that cannot see S-23 also cannot see that the gap
+it is about to file already exists, so the same finding gets a second id; and an agent working
+from a `known-gaps.md` that stops at S-10 will not know that S-11 through S-21 forbid what it is
+about to write.
+
+**Working practice until it is fixed:** an agent that is going to *cite* or *edit* a
+`.claude/rules/` file should `cat` it first and treat the injected copy as a hint, not as the
+text. Reviews that quote these files should say which revision they read, as T-038's Gate-4
+review did. Cheap, and it is what caught both sightings.
+
+**Fix direction:** establish the mechanism before attempting a fix — the two sightings are the
+whole evidence base, and a fix aimed at the wrong layer would be unfalsifiable. If it turns out
+to be unfixable from inside the repository, say so here and keep the working practice above.
