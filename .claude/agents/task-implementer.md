@@ -61,6 +61,12 @@ needs the negative case tested before it earns the word "must".
 Prose has no compiler and no test. It is the one part of a change that ships unverified unless
 you verify it deliberately.
 
+**A universal must cite its mutation.** Before writing "cannot", "only", "never", "unreachable"
+or "unrepresentable", make the edit that would falsify it and name the test that goes red. If
+you cannot, weaken the claim to what you measured. Six findings across S-7, S-18, T-036 and
+T-037 were universals established by probes that varied a single dimension — and in every case
+the code was right and only the sentence was wrong.
+
 ## Scoping commands
 `pnpm --filter <pkg> test -- <file>` does **not** filter — it runs the whole package suite.
 Use `pnpm --filter <pkg> exec vitest run <file>`.

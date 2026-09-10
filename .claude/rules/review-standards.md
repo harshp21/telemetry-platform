@@ -39,6 +39,34 @@ agent at Gates 4 and 6.
 - Check the change's account of itself: if a plan or commit message says a test was "confirmed
   red", or that a claim was removed from N places, verify the redness and the count.
 
+### Universals Must Cite Their Mutation (REQUIRED GATE)
+
+A claim of the form **"cannot"**, **"only"**, **"never"**, **"unreachable"**, **"impossible"**
+or **"unrepresentable"** is a testable assertion. It must name the mutation that establishes
+it — the edit you made, and the named test that went red — or it must be weakened to what was
+actually measured.
+
+This is not style. Every one of these shipped, was believed by its author, and was refuted by
+running the thing it forbade:
+
+| Claim | Refutation |
+|---|---|
+| the definer role *must* hold `BYPASSRLS` | a `NOBYPASSRLS` role with one targeted policy resolves the same tenant |
+| `logout-auth.plugin.ts` is *the* JWT trust boundary | nothing imports it; `/logout` uses `requireJwtAuth` |
+| *no* `ALTER DEFAULT PRIVILEGES` can remove `PUBLIC`'s `EXECUTE` | true only of the `IN SCHEMA` form; the database-scoped form works |
+| the parity assertion catches drift in *either* direction | it caught one; the other compiled clean |
+| the half-fixed cast shape *cannot* be composed outside the module | the cast is SQL text and needs no import |
+| producer and consumer *cannot* drift in code | two edits diverged them with the whole gate green |
+
+The pattern is always the same: probes that varied **one** dimension, written up as a general
+mechanism. Four `IN SCHEMA` probes. One drift direction. Five header paddings that were all
+SP or HTAB.
+
+**So:** ask what would have to be true for the claim to be false, and test *that*. If the
+refuting case is expensive to construct, say the claim is unverified rather than asserting it.
+"Not importable outside this module (TS2459)" is worth more than "unrepresentable", because it
+is true.
+
 ### Code Correctness
 - Bug detection and regression-risk assessment.
 - Type safety and boundary violations.
