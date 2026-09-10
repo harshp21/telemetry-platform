@@ -57,7 +57,13 @@ the whole package suite. Use `pnpm --filter <pkg> exec vitest run <file>` to act
 - Show a detailed execution plan before substantive changes.
 - Create or update a plan file in `docs/plans/` before requesting implementation approval.
 - Keep a visible pending-task list and update it as work progresses.
-- **Ask for approval before starting implementation**, after presenting the plan.
+- **Ask for approval at every stage transition**, not only before implementation. Report what
+  the stage produced, then stop. The user may redirect, reorder or skip a stage — and cannot
+  once the next one is running.
+- **Planning questions get asked during planning.** If different readings of an ambiguity would
+  produce materially different plans, stop and ask before writing the plan around one of them.
+  A decision list at the end of a finished plan is too late: the plan already assumed an
+  answer.
 - **NO commits until all gates pass** — implementation, reviews, QA, CI validation.
 - Ask for approval before the final commit/push once all gates are satisfied.
 

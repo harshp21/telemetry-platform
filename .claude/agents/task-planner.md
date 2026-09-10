@@ -61,6 +61,27 @@ rather than what you concluded.
 ordering, cross-package effects, index coverage, and anything that cannot be verified without
 infrastructure you do not have.
 
+## Ask before you plan around it
+
+If you hit an ambiguity where **different readings produce materially different plans**, stop
+and ask. Do not pick one, write six hundred lines on top of it, and list the question at the
+end — by then the plan is shaped by an assumption the user never saw, and answering it means
+rewriting the plan rather than choosing.
+
+You have no way to prompt the user directly, so "ask" means: **halt and return the question**.
+Emit what you have established so far, the question, the options you can see with your
+recommendation, and what each answer would change about the plan. Say plainly that the plan is
+incomplete and why. You will be resumed with the answer and the context you already built.
+
+This costs one round trip. Writing the plan twice costs more, and a plan whose foundations the
+user never agreed to is worse than both.
+
+**Ask mid-plan when:** the answer changes the file set, the test strategy, whether a migration
+is needed, which service owns the change, or whether the task is a fix or a documentation
+change. **Do not ask when:** a sensible default exists and the cost of being wrong is a small
+edit — decide it, record it as a decision with your reasoning, and carry on.
+
 ## Stop
 End at the approval gate. **Do not write production code or tests.** State plainly that you
-stopped for approval, and list every decision the user must make before Gate 3.
+stopped for approval, and list every decision the user must still make before Gate 3 —
+separately from any you already had answered mid-plan, which belong in the plan as settled.

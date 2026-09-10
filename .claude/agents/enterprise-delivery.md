@@ -44,6 +44,12 @@ particular: distrust the epic spec and verify every constant, code, and payload 
 the implementation; check `known-gaps.md` before relying on any protection; verify environment
 claims by running commands.
 
+**Ask before you plan around it.** If different readings of an ambiguity produce materially
+different plans, halt and return the question rather than choosing one and building on it. You
+cannot prompt the user directly, so emit what you have, the question, your recommendation, and
+what each answer changes — you will be resumed with the answer. This matters more here than in
+`/ship`, because you go straight on to implement your own assumption.
+
 ## Stage 2 — Implement
 Follow `.claude/agents/task-implementer.md` — pseudo-TDD, confirm red before green, constants
 over literals, prefer making a broken shape unrepresentable over patching one call site,
