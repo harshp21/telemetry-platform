@@ -34,6 +34,19 @@ export const INTEGRATION_REDIS = {
    * `FLUSHALL`.
    */
   LOGICAL_DB_INDEX: 14,
+  /**
+   * `connectionName` for every client this suite opens, so a `CLIENT LIST` row can be
+   * attributed to this suite rather than to whatever else is connected to the server.
+   *
+   * Needed because `CLIENT LIST` is **server-wide** and crosses logical databases: the
+   * blocked-read detector `I12` waits on was satisfied by a connection parked on database 13
+   * with nothing parked on 14 (Round 1, M-3). Measured, and the reason this works at all:
+   * `duplicate()` inherits `connectionName`, so the read connection the subject opens for
+   * itself carries this name without the subject knowing about it — one client built with
+   * `{ connectionName }` and its duplicate both reported `name=t039-probe db=14` from
+   * `CLIENT INFO`, and both rows appeared in `CLIENT LIST`.
+   */
+  CLIENT_NAME: "worker-integration-suite",
   /** Per-run key prefixes, so no two cases and no two runs share a stream or a group. */
   STREAM_NAME_PREFIX: "telemetry:events:t038:",
   CONSUMER_GROUP_PREFIX: "worker-group-t038-",
@@ -107,3 +120,139 @@ export const INTEGRATION_CONCURRENCY = {
  * share a value, and reusing the count constant reads as "two of something".
  */
 export const INTEGRATION_FIELD_PAIR_STRIDE = 2;
+
+/**
+ * Fixture vocabulary for T-039's loop cases (`I7`-`I12`).
+ *
+ * Separate prefixes from the `t038` ones above, deliberately: the two sets of cases share a
+ * logical database and a `FLUSHDB`, and a name that says which task created it is the
+ * difference between reading a leftover key and guessing at one. The `t038` members are
+ * untouched.
+ */
+export const INTEGRATION_LOOP_REDIS = {
+  STREAM_NAME_PREFIX: "telemetry:events:t039:",
+  CONSUMER_GROUP_PREFIX: "worker-group-t039-",
+  /** The consumer identity the subject reads under. */
+  CONSUMER_NAME: "t039-worker",
+  /**
+   * A second identity, used to seed the pending list `I10` makes the subject reclaim.
+   *
+   * Recovery is only meaningful against work owned by *another* consumer; seeding under the
+   * subject's own name would leave entries it could reach with an ordinary read at `0`.
+   *
+   * Read by `I10` through `readNewEntryIds`' consumer-name parameter. Until Round 1 this
+   * constant was declared and unread (L-2) and `I10` seeded under T-038's `"t038-reader"`,
+   * which was materially valid — that is also a different consumer from the subject — but
+   * attributed t039 fixture data to a t038 identity.
+   */
+  ABANDONED_CONSUMER_NAME: "t039-dead-worker"
+} as const;
+
+/**
+ * Timings and cardinalities for the loop cases.
+ *
+ * Every block value is small except `BLOCK_MS_LONG`, which belongs to the one case whose
+ * subject *is* elapsed time. Everything else asserts on state — `XPENDING`, `XINFO`, the ids
+ * the handler saw — rather than on the clock, because a wall-clock assertion in CI is a
+ * flake waiting to happen.
+ */
+export const INTEGRATION_LOOP = {
+  /** `STREAM_BLOCK_MS` for the cases that must cycle quickly. */
+  BLOCK_MS_SHORT: 20,
+  /**
+   * `STREAM_BLOCK_MS` for `I12`, whose subject is that `stop()` does not wait this out.
+   *
+   * **Must stay under vitest's 5 000 ms per-case budget**, for the same reason as
+   * `RUN_DEADLINE_MS` above: if `stop()` regresses to waiting the block out, `I12` awaits
+   * `run()` for the whole block, and a block *equal to* the budget means the runner kills the
+   * case before `STOP_BUDGET_MS` can report anything. The regression would then surface as
+   * `Test timed out in 5000ms`, naming nothing, instead of as the elapsed-time assertion
+   * written for it.
+   *
+   * This was `5_000` — exactly the budget — and was found at Gate 5 (QA finding F-3), one file
+   * over from the same defect fixed as M-6 at the Gate-4 Round-2 review. At 3 000 a regression
+   * fails by assertion at ~3 s with ~2 s of runner headroom, while the passing path is
+   * unaffected: a `disconnect()` during a long read was measured ending it in **205 ms**, which
+   * is far inside `STOP_BUDGET_MS` either way, so the case's positive claim keeps its margin.
+   */
+  BLOCK_MS_LONG: 3_000,
+  /**
+   * Upper bound on `stop()` -> `run()` resolving, against `BLOCK_MS_LONG`.
+   *
+   * Deliberately loose. A `disconnect()` during a blocking read was measured ending it in
+   * 205 ms (against a 5 000 ms block, before F-3 lowered `BLOCK_MS_LONG` to 3 000 — the
+   * measurement is a property of `disconnect()`, not of the block length); the claim under
+   * test is "does not wait the block out", so the bound is set at a fraction of the block
+   * rather than near the measurement. A tight bound would turn a slow
+   * CI runner into a failure about the wrong thing.
+   */
+  STOP_BUDGET_MS: 2_000,
+  /** `STREAM_BATCH_SIZE` for the recovery case: smaller than the pending list it must walk. */
+  BATCH_SIZE_SMALL: 2,
+  /** Entries seeded under the abandoned consumer, chosen to straddle `BATCH_SIZE_SMALL`. */
+  ABANDONED_ENTRY_COUNT: 5,
+  /**
+   * Pause after seeding, so the abandoned entries are idle for longer than the reclaim
+   * threshold (`BLOCK_MS_SHORT` x `RECOVERY_IDLE_MULTIPLIER` = 40 ms). Three times the
+   * threshold, so a slow tick cannot make the case assert the opposite of its subject.
+   */
+  IDLE_SETTLE_MS: 120,
+  /**
+   * Ceiling on how long a case will let the loop run before its predicate gives up.
+   *
+   * Every loop case stops on a *condition* (the entries it expected arrived), so this only
+   * fires when the condition never will. It converts a hang into a legible assertion
+   * failure, which is the difference between a red suite and a timed-out one.
+   *
+   * **Must stay under vitest's 5 000 ms per-case budget**, which nothing in this package
+   * overrides (`grep -rn "testTimeout|hookTimeout" apps/worker-service` excluding
+   * `node_modules`/`dist` -> no match; `vitest.config.mjs` sets only `include`, `setupFiles`
+   * and `coverage`). A deadline above that budget cannot fire: the runner kills the case
+   * first and reports `Test timed out in 5000ms`, naming nothing.
+   *
+   * This was `10_000` and therefore unreachable. Measured at the Gate-4 Round-2 review with
+   * the recovery pagination mutated to a single page (`while` -> `if` at
+   * `stream.consumer.ts:641`), which is the mutation the plan's S4 nominates for `I10`:
+   * `I10` went red at **5009 ms** as `Test timed out in 5000ms` — the exact failure mode the
+   * paragraph above claims to convert away. Mirrors `STOP_DEADLINE_MS` in
+   * `stream.consumer.unit.test.ts`, which got the inequality right in the same round.
+   *
+   * 3 000 ms is ample: the whole integration file runs in ~450 ms, and the longest legitimate
+   * wait is `I12`'s read parking, which is milliseconds. `I12` does not use
+   * `buildLoopHarness`, so this being *equal to* `BLOCK_MS_LONG` is safe: `I12` uses
+   * `RUN_DEADLINE_MS` only for the `vi.waitFor` that observes the read parking (~26 ms
+   * measured), never as a loop deadline. (Said "below" until F-3 lowered `BLOCK_MS_LONG` to
+   * the same 3 000; corrected at the Gate-6 review, L-12.)
+   */
+  RUN_DEADLINE_MS: 3_000,
+  /** Poll interval while waiting for an out-of-band condition (a re-created group, a parked read). */
+  POLL_INTERVAL_MS: 10
+} as const;
+
+/** Harness-side Redis tokens for the loop cases. Not production vocabulary. */
+export const INTEGRATION_LOOP_COMMANDS = {
+  CLIENT: "CLIENT",
+  CLIENT_LIST: "LIST",
+  CLIENT_INFO: "INFO",
+  /** Substring `CLIENT LIST` shows for a connection parked on a blocking read. */
+  CLIENT_LIST_BLOCKED_READ: "cmd=xreadgroup",
+  /** `CLIENT LIST` prints one connection per line, with fields separated by spaces. */
+  CLIENT_LIST_ROW_SEPARATOR: "\n",
+  /** Field prefixes on a `CLIENT LIST` / `CLIENT INFO` row. */
+  CLIENT_NAME_FIELD_PREFIX: "name=",
+  CLIENT_DB_FIELD_PREFIX: "db=",
+  /** `XPENDING <key> <group> - + <count>` — the extended form, which returns entry ids. */
+  XPENDING_MIN_ID: "-",
+  XPENDING_MAX_ID: "+"
+} as const;
+
+/** Fixture payload values for the loop cases. */
+export const INTEGRATION_LOOP_FIXTURE = {
+  VALUE_DELIVERED: "t039-delivered",
+  VALUE_SECOND_DELIVERED: "t039-delivered-2",
+  VALUE_BACKLOG: "t039-backlog",
+  VALUE_AFTER_GROUP: "t039-after-group",
+  VALUE_ABANDONED: "t039-abandoned",
+  VALUE_AFTER_RECREATE: "t039-after-recreate",
+  VALUE_AFTER_TIMEOUT: "t039-after-timeout"
+} as const;

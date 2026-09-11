@@ -230,7 +230,7 @@ should check that it was.
 ## S-15 · The epic files are not a reliable task manifest — **LOW, open**
 
 Found by the first real run of `.claude/agents/epic-router.md`, which has to derive task state
-because no status field exists. Five distinct hygiene defects, each verified:
+because no status field exists. Six distinct hygiene defects, each verified:
 
 - **An id is declared twice for two different tasks.** `T-070` is
   "Service coverage thresholds and CI gate" in `docs/epics/epic-12-testing.md` and
@@ -241,7 +241,17 @@ because no status field exists. Five distinct hygiene defects, each verified:
 - **An id is committed but never declared.** `T-074` (`dba4899`, startup env-file resilience)
   runs past the declared maximum; no epic knows it exists.
 - **Sub-task ids invented during delivery and never folded back.** `T-024C`, `T-024D`, `T-067A`,
-  `T-067B`, `T-067C` have plans and commits but no epic declaration.
+  `T-067B`, `T-067C` have plan files but no epic declaration — and, corrected here after
+  re-measurement during T-039, no *commit* either. The clause used to read "have plans and
+  commits"; `git log --all --format="%h %s%n%b" | grep -icE "T[- ]?024[CD]|T[- ]?067[ABC]"`
+  returns `0` with grep exiting 1, so none of the five ids appears in any commit subject or
+  body in the spellings tried (hyphenated, spaced, run together). What shipped is the *plan
+  file*, as payload of a differently-titled commit, and there are **five** carriers:
+  `d68e719` (t-024c), `e3d7556` (t-024d), `21c9a9e` (t-067a), `f47b7d8` (t-067b), and
+  `eb3ef10` + `4925e4a` (t-067c — added by the first, modified by the second;
+  `git show --name-status` reports `A` then `M`). Naming all five matters, because the point of
+  the clause is that id-based archaeology fails: `git log --grep` finds these tasks nowhere, and
+  only a `docs/plans/` filename does.
 - **An id reused by an unrelated artifact.** `docs/plans/t-068-auth-access-ttl-guardrail.md` is
   about the auth access-token TTL guardrail, not epic-12's T-068 (compose smoke tests) — so
   filename-prefix matching reports T-068 planned on the strength of a different task's plan.
@@ -249,6 +259,16 @@ because no status field exists. Five distinct hygiene defects, each verified:
   Q5 (refresh token delivery) with no "decided" marker, while `640e53d` and `bdb6bcf` shipped a
   hybrid cookie + CSRF model. Read literally, the router must refuse all of Epic 4 over a gate
   the repo answered long ago.
+- **The declared task total does not match the declared tasks.** `docs/epics/README.md:138` reads
+  `| **Total** | **73** | |`, and the per-epic column above it sums to 73 — internally
+  consistent, so the table cannot be caught out by checking its own arithmetic. The epic files
+  declare **76** task headings (`grep -cE '^#+ +T-[0-9]+[A-Z]?' docs/epics/epic-*.md`, summed),
+  resolving to **75 distinct ids** because `T-070` is declared twice. The three headings above
+  73 are `T-024B` and `T-025A` — epic-4's column says 8 against 10 headings — and the second
+  `T-070`: epic-12's column says 4 against 5 headings, while epic-13's 4 matches its headings.
+  State it as 76 headings / 75 distinct / 73 declared rather than "73 against 75", which invites
+  a reader to hunt for two missing ids when one of the three extra headings is a re-declaration
+  of an id already counted.
 
 Suffixed ids are a related trap for tooling rather than a doc defect: `T-024B` and `T-025A`
 exist, so any id matcher must be `T-[0-9]+[A-Z]?`. The bare pattern truncates `T-025A` to
@@ -622,3 +642,169 @@ review did. Cheap, and it is what caught both sightings.
 **Fix direction:** establish the mechanism before attempting a fix — the two sightings are the
 whole evidence base, and a fix aimed at the wrong layer would be unfalsifiable. If it turns out
 to be unfixable from inside the repository, say so here and keep the working practice above.
+
+---
+
+## S-25 · worker-service's largest file is outside its own coverage thresholds, and the per-suite Redis database convention does not scope *reads* — **LOW, open**
+
+Two findings from T-039's Round-1 review, filed under one id because they share a cause: a
+guard that exists is assumed to cover a case it was never scoped to.
+
+### 1 · `src/events/**` is excluded from coverage collection
+
+`apps/worker-service/vitest.config.mjs:18` lists `"src/events/**"` in `coverage.exclude`,
+alongside `src/**/index.ts`, `src/config/container.ts`, `src/jobs/**`, `src/middleware/**`,
+`src/models/**`, `src/telemetry/**` and `src/types/**`. The thresholds it guards are
+`lines/functions/statements: 80` and `branches: 75` (`:25-30`).
+
+`src/events/stream.consumer.ts` is **777 lines** after T-039 — measured with
+`find apps/worker-service/src -name '*.ts' | xargs wc -l`, against 1 541 lines of `src/` in
+total. It is larger than every other source file added together (764: `constants.ts` 281,
+`index.ts` 145, `base.repository.ts` 111, `app.ts` 70, `config/env.ts` 59, `container.ts` 44,
+and 54 across the fourteen one-line barrel `index.ts`s and four small files). It holds the read
+loop, the
+recovery pagination, the reply parsers and the failure classification, and none of it is
+measured by the service's own gate.
+
+Three of T-039's Round-1 findings were branches in that path with no test at all — the
+`malformed` warn, the `RECOVERY_MAX_PAGES` bound, and the default message handler that a
+deployed worker actually runs. All three now have cases (`U37`, `U38`, `U34`), which is
+evidence for the *consequence* of the exclusion rather than a fix for it: they were found by a
+reviewer reading the diff, not by a threshold.
+
+**Not fixed in T-039** because removing the exclusion changes what the thresholds mean for the
+whole service, needs the other excluded globs decided at the same time, and would put a
+coverage-policy change inside a feature commit. Filed rather than left to the plan: `CLAUDE.md`
+says a plan marks a task *started* and nothing may read `docs/plans/` as evidence, so §10's
+"handed forward to epic-12" is not a durable record.
+
+**Fix direction:** own it in epic-12 alongside `T-070` (the service-coverage-thresholds task —
+note `T-070` is declared twice, see S-15). Measure the file first with the exclusion lifted;
+decide the thresholds from the number rather than assuming the existing 80/75 transfers.
+
+### 2 · The per-suite logical-database convention scopes writes, not reads
+
+`flushReservedDb()` in `apps/worker-service/tests/stream.consumer.integration.test.ts`
+re-asserts `CLIENT INFO` contains `db=14` before **every** `FLUSHDB` (the shape S-22 records).
+That guard is real, and it is about writes. Nothing scoped *reads*, and a `CLIENT LIST`-based
+predicate in the same file was therefore satisfied by a connection in a different logical
+database.
+
+Measured on Redis 7.0.15, with a blocking `XREADGROUP` parked on database **13** and nothing
+parked on 14:
+
+```
+CLIENT LIST | grep -c 'cmd=xreadgroup'                 -> 1
+CLIENT LIST | grep 'cmd=xreadgroup' | grep -o 'db=[0-9]*' -> db=13
+CLIENT LIST | grep 'cmd=xreadgroup' | grep -c 'db=14'  -> 0
+INFO clients (issued on db 14)                          -> blocked_clients:1
+```
+
+So `CLIENT LIST` rows and `INFO clients`' `blocked_clients` counter both cross database
+boundaries. `CLIENT LIST` does at least *attribute* each row (`db=<n>` and `cmd=<x>` share a
+row, which is what makes a row-scoped predicate possible); `INFO clients` reports a bare
+server-wide count with no attribution at all.
+
+**One correction to the review that raised this**, because the entry would otherwise carry it
+forward: `CLIENT INFO` is **not** in the same category. It describes the *calling* connection
+— `redis-cli -n 7 CLIENT INFO` reports `db=7` and `-n 3` reports `db=3` — which is exactly why
+`flushReservedDb()` can use it as a guard. Do not "fix" that helper on the strength of this
+entry.
+
+T-039 fixed its own instance by matching on a `connectionName` the suite sets on its client
+(`INTEGRATION_REDIS.CLIENT_NAME`), which `duplicate()` inherits — measured: a client built with
+`{ connectionName: "t039-probe" }` and its duplicate both reported `name=t039-probe db=14` from
+`CLIENT INFO`. The general gap is open: nothing stops the next suite from writing a
+server-wide predicate, and the one that existed was introduced by someone who had read S-22
+and believed the database reservation covered it.
+
+**Relation to S-22**, verified rather than asserted: S-22 documents the per-suite logical
+database convention and the `FLUSHDB` chokepoint, and its own wording is about flushes —
+"route every `FLUSHDB` through a single helper that re-asserts `CLIENT INFO`". So S-22 does not
+overclaim; the reading that the reservation bounds *everything* a suite observes is the gap.
+S-22 also already notes that "a shared Redis instance with per-suite logical databases is a
+convention no mechanism enforces". This entry is the read-side half of that sentence.
+
+Same family as S-14 (`.claude/agents/` vs `.github/agents/`) and S-19 (five copies of
+`TenantScopedRepository`) only in the loose sense that all three are one-guard-assumed-general;
+it is **not** the same duplication-and-drift mechanism — there is one copy of this helper, not
+five — and it is recorded here as a weaker relation than those two share with each other.
+
+**Fix direction:** when the next suite needs to observe connection state, give it a named
+connection and match on the name; a `db=` match is better than nothing but does not survive two
+suites sharing an index. `grep -rln 'CLIENT LIST\|INFO clients' apps/*/tests` returns
+only `apps/worker-service/tests/stream.consumer.integration.test.ts` and its
+`integration.constants.ts`, so the surface is one suite.
+
+
+---
+
+## S-26 · worker-service's shutdown teardown log lines usually do not reach a deployed worker — **LOW, open**
+
+`apps/worker-service/src/index.ts` calls `process.exit(0)` at the end of its shutdown handler.
+The stream consumer loop is started with `void streamConsumer.run()` — deliberately discarded, so
+`/health` is not delayed behind it — and `stop()` interrupts the blocking read rather than
+awaiting the loop's own teardown. The two teardown lines,
+`"Stream read interrupted by shutdown"` and `"Stream consumer loop stopped"`, are therefore in a
+race with the exit, and usually lose it.
+
+**Whether they lose depends on `STREAM_BLOCK_MS`, and this is measured, not reasoned.** Nine real
+`SIGTERM` runs of `node --import tsx src/index.ts` against Redis db 14, at three block values:
+
+| `STREAM_BLOCK_MS` | `"Stream consumer loop stopped"` emitted |
+|---|---|
+| `20` | **4 of 5 runs** |
+| `500` | 0 of 3 |
+| `5000` (the default) | 0 of 1 |
+
+The mechanism, from the log timestamps: the whole shutdown handler completes in **3–6 ms**, while
+`disconnect()` takes **~205 ms** to reject the parked read. The lines appear only when the read
+expires inside that window — at block 20 the line lands at **+4 ms**, ahead of
+`"Shutdown complete"` at +6 ms. `STREAM_BLOCK_MS` is
+`z.coerce.number().int().positive()` (`apps/worker-service/src/config/env.ts:44-48`), so a small
+block is a legal configuration, not a contrived one.
+
+**An earlier revision of this entry said the lines are "never emitted in production".** That was a
+false universal: it generalised from three runs that all used the default 5 000 ms block, and the
+table above refutes it. The corrected claim is conditional, and the condition is a value an
+operator sets.
+
+**Nothing is lost, and this is the approved design.** T-039's D2-A handler acknowledges nothing,
+so every delivered entry stays in the pending list and is reclaimable by `XAUTOCLAIM` on the next
+start; draining in-flight work and `XGROUP DELCONSUMER` on clean shutdown are explicitly T-043's.
+Severity is LOW because the consequence is observability, not data — and observability that is
+*intermittent by block length* is arguably worse to debug than one that is reliably absent, which
+is the reason to write the condition down rather than the conclusion.
+
+**Which tests are involved, stated correctly.** An earlier revision of this entry named `U26`,
+`U35` and `I12`, and scope comments were added to all three. That was wrong in both directions:
+
+- `"Stream read interrupted by shutdown"` is asserted by **`U26`** — but only since the Gate-6
+  review (M-8) added the assertion. Before that it was asserted by no test at all, and `U26`
+  pinned only the *negative* (`logger.error` not called), so deleting the whole `info` call left
+  the suite green.
+- `"Stream consumer loop stopped"` is asserted by **`U14`** and **`U24`**.
+- `U35` asserts a different message entirely (`RECOVERY_INTERRUPTED`), and `I12` makes no logger
+  assertion at all.
+
+The scope comments now sit on `U14`, `U24` and `U26` — the cases that actually assert these
+lines. Those tests are correctly scoped: they construct `StreamConsumer` and assert what the
+class does, which is true. The hazard this entry exists for is a reader taking a passing `U26` or
+`U14` as evidence that a shut-down worker *says so in its logs*, which depends on the block
+length.
+
+**Fix direction (T-043, not a standalone task):** await the loop with a bounded timeout before
+`process.exit(0)`, so teardown either completes or is reported as having been cut short. Do **not**
+simply drop the `void`: `await streamConsumer.run()` never returns while the loop is running, so
+`listen` is never reached — mutating `index.ts` that way was measured at the Gate-6 review as
+`Tests 10 failed | 2 passed (12)`. (An earlier revision of this entry said that mutation would
+"break `U25`, which asserts the loop starts *after* the listener binds". `U25` asserts the
+opposite — `claimOrder < listenOrder`, the loop starting *before* the listener binds — and the
+failure is far wider than that one case.) When it is fixed, narrow or remove the three scope
+comments in the same change.
+
+**One process note, because it is the reason this is filed rather than left in a plan.** The race
+was **disclosed by the implementer at Gate 3**, passed through two review rounds without being
+raised, and was found independently by QA at Gate 5. Then this entry — written to capture it —
+was itself wrong three times over and was corrected at Gate 6. A volunteered caveat in a hand-off
+report is not a finding, and a finding written from one configuration is not a general claim.
