@@ -63,23 +63,97 @@ export const WORKER_STREAM_CONSTANTS = {
   DEFAULT_BLOCK_MS: 5_000,
   DEFAULT_BATCH_SIZE: 10,
   BATCH_SIZE_MIN: 1,
-  BATCH_SIZE_MAX: 100
+  BATCH_SIZE_MAX: 100,
+  /**
+   * How many times one entry may fail before it is dead-lettered (T-041, Q10).
+   *
+   * `3`, the Q10 answer. The attempts are **not** immediate: each redelivery costs at least
+   * `DEFAULT_BLOCK_MS x WORKER_STREAM_READ.RECOVERY_IDLE_MULTIPLIER`, because that is the
+   * minimum idle time `XAUTOCLAIM` requires before it will take an entry back. So three
+   * attempts span tens of seconds at the defaults, not three round trips -- which is why Q10
+   * needed no separate retry-delay knob.
+   */
+  DEFAULT_MAX_RETRY_COUNT: 3,
+  /**
+   * Bounds on `MAX_RETRY_COUNT`, in the same role `BATCH_SIZE_MIN`/`BATCH_SIZE_MAX` play:
+   * validation bounds, not defaults, and no operator can override them.
+   *
+   * The floor is `1` rather than `0`: a budget of 0 would dead-letter every entry on its first
+   * failure, including a transient database blip, which is the failure mode plan R1 exists
+   * about. The ceiling is a policy choice, not a protocol limit -- at the default block
+   * interval a budget of 10 keeps an entry retrying for roughly two minutes.
+   *
+   * **Do not lower the floor without reading `DeadLetterService.readRetryCount`.** A second
+   * invariant leans on it: that method's coercion of a non-numeric counter to `0` is inert at
+   * every budget >= 1 and becomes load-bearing at exactly `0`, because `0 >= 0` is true while
+   * `NaN >= 0` is false. `U72` (`tests/env.schema.unit.test.ts`) pins the floor against a
+   * **literal** `MAX_RETRY_COUNT=0` and goes red on this line changing; it exists because
+   * nothing did -- the Gate-6 reviewer set this to `0` and the package stayed 156/156 green.
+   */
+  MAX_RETRY_COUNT_MIN: 1,
+  MAX_RETRY_COUNT_MAX: 10,
+  /**
+   * Where an exhausted entry is copied before it is acknowledged (T-041, Q10).
+   *
+   * A Redis stream, and deliberately **not** derived from `DEFAULT_STREAM_NAME`: a dead letter
+   * written back onto the source stream would be redelivered, fail again, and dead-letter
+   * itself forever. Written as its own literal rather than as a suffix expression so that
+   * renaming the source stream cannot silently move the dead-letter destination with it.
+   *
+   * Nothing trims this stream. The source stream is published with `MAXLEN ~ 100000`, but a
+   * trimmed *dead letter* is data loss with no record left of it, so unbounded growth is
+   * accepted and the operational lever is `XLEN telemetry:dead-letter` until T-057 adds a
+   * metric (plan R5).
+   */
+  DEFAULT_DEAD_LETTER_STREAM: "telemetry:dead-letter",
+  /**
+   * Parse failure when `DEAD_LETTER_STREAM` equals `REDIS_STREAM_NAME`.
+   *
+   * A **mechanism** for the "must not" the `DEFAULT_DEAD_LETTER_STREAM` docblock above and
+   * `.env.example` both state. Added at the T-041 Gate-4 review, which found the invariant
+   * asserted in three places and enforced in none -- an operator setting both to the same value
+   * parsed cleanly and started. That is the shape S-6 (`INGEST_BATCH_MAX`, declared and read by
+   * nothing) and S-23 (a strictness that one side lacks) were filed for: a rule that exists only
+   * in prose.
+   *
+   * Enforced by a `.superRefine` on the whole object, because zod's per-field refinements cannot
+   * see a sibling. Pinned by the env-schema case "rejects a DEAD_LETTER_STREAM equal to
+   * REDIS_STREAM_NAME", which was confirmed red before the refinement existed and goes red again
+   * when it is deleted.
+   */
+  DEAD_LETTER_STREAM_COLLISION:
+    "DEAD_LETTER_STREAM must differ from REDIS_STREAM_NAME: a dead letter written back onto the stream the worker reads is redelivered, fails to parse, and dead-letters itself"
 } as const;
 
 /**
  * `XGROUP CREATE` bootstrap tokens (T-038).
  *
  * A sibling of `WORKER_STREAM_CONSTANTS` rather than a member of it. The distinction is which
- * file consumes them: every one of that object's **seven** members feeds
- * `src/config/env.ts`'s schema -- five as a `.default(...)` (`DEFAULT_STREAM_NAME`,
- * `DEFAULT_CONSUMER_GROUP`, `DEFAULT_CONSUMER_NAME`, `DEFAULT_BLOCK_MS`,
- * `DEFAULT_BATCH_SIZE`) and two as the `.min()`/`.max()` bounds on `STREAM_BATCH_SIZE`
- * (`BATCH_SIZE_MIN`, `BATCH_SIZE_MAX`, `env.ts:52-53`). Counted:
- * `grep -c 'WORKER_STREAM_CONSTANTS\.' src/config/env.ts` -> 7, one per member. These four
- * feed no env field at all and are referenced only by `src/events/stream.consumer.ts` -- the
- * Redis subcommand spelling, and the start position T-038 chose. Keeping the two kinds in
- * one object would invite a future `REDIS_START_POSITION` env var, which is exactly the knob
- * D1 decided against.
+ * file consumes them: every one of that object's members feeds `src/config/env.ts`'s schema --
+ * seven as a `.default(...)` (`DEFAULT_STREAM_NAME`, `DEFAULT_CONSUMER_GROUP`,
+ * `DEFAULT_CONSUMER_NAME`, `DEFAULT_BLOCK_MS`, `DEFAULT_BATCH_SIZE`, and T-041's
+ * `DEFAULT_MAX_RETRY_COUNT` and `DEFAULT_DEAD_LETTER_STREAM`), four as the `.min()`/`.max()`
+ * bounds on `STREAM_BATCH_SIZE` and `MAX_RETRY_COUNT` (`BATCH_SIZE_MIN`, `BATCH_SIZE_MAX`,
+ * `MAX_RETRY_COUNT_MIN`, `MAX_RETRY_COUNT_MAX`), and one as the message of the cross-field
+ * `.superRefine` (`DEAD_LETTER_STREAM_COLLISION`, `env.ts:96`) -- **7 + 4 + 1 = 12**, which is
+ * the taxonomy the count below has to add up to. It summed to 11 for one review round because
+ * the `.superRefine` member was added without being classified here (Gate-6 R2-1 residual).
+ * Counted at T-041:
+ * `grep -c 'WORKER_STREAM_CONSTANTS\.' src/config/env.ts` -> 12, one per member.
+ *
+ * That figure read **11** for the length of one review round: M-6 added the 12th reference
+ * (`src/config/env.ts`'s `.superRefine`) in the same change that left this number alone, so the
+ * paragraph below documented the failure this paragraph then committed. Caught at the Gate-4
+ * Round-2 review (R2-1) and re-counted with the command above, not adjusted by eye.
+ *
+ * The count in this paragraph said **seven** until T-041, which was right for the seven members
+ * the object had then and is the kind of figure that goes stale silently -- it is re-counted
+ * with the command above whenever a member is added, rather than adjusted by eye.
+ *
+ * These four feed no env field at all and are referenced only by
+ * `src/events/stream.consumer.ts` -- the Redis subcommand spelling, and the start position
+ * T-038 chose. Keeping the two kinds in one object would invite a future `REDIS_START_POSITION`
+ * env var, which is exactly the knob D1 decided against.
  *
  * An earlier revision of this paragraph said "those five values are *env defaults* (each is a
  * `.default(...)`) ... these four are protocol and policy tokens that no operator may
@@ -223,6 +297,21 @@ export const WORKER_STREAM_READ = {
    * The filter was observed to work in both directions on a freshly-delivered entry:
    * `XAUTOCLAIM … 60000 0-0` returned `["0-0",[],[]]`, and `XAUTOCLAIM … 0 0-0` on the same
    * entry returned it.
+   *
+   * **Since T-041 this threshold does double duty, and nothing flags that.** `runLoop` reuses
+   * the same `blockMs x RECOVERY_IDLE_MULTIPLIER` product as the interval between reclaim
+   * passes, so it is now both the peer-safety margin *and* the spacing between an entry's retry
+   * attempts. Q10 settled on no retry delay — there is no sleep, no scheduled re-add and no
+   * backoff ladder anywhere in T-041 — and this is what spaces the attempts instead. A change
+   * to `STREAM_BLOCK_MS` or to this multiplier therefore moves how long a failing entry takes
+   * to reach the dead-letter stream: at the shipped defaults a budget of 3 spans roughly
+   * 20–30 seconds, and halving either value roughly halves that.
+   *
+   * **No test asserts the coupling**, and that is a stated gap rather than an oversight: it
+   * cannot be asserted without pinning a wall-clock relationship, and this package has three
+   * prior incidents from wall-clock deadlines (see `CASE_BUDGET_MS` and `U50`). What `U70` does
+   * assert is that the cadence equals the same product the `min-idle` argument uses, so the two
+   * cannot drift apart from each other — only together, away from what an operator expected.
    */
   RECOVERY_IDLE_MULTIPLIER: 2,
   /**
@@ -231,9 +320,23 @@ export const WORKER_STREAM_READ = {
    * `XAUTOCLAIM` is paginated and the loop's exit condition is a cursor value the server
    * chooses; a server that never returned `PENDING_START_ID` would spin forever and the
    * worker would never start reading. This caps that at a finite number of round trips. At
-   * the default `STREAM_BATCH_SIZE` of 10 it admits 10 000 entries per startup, and a
-   * truncated scan is logged at warn level and retried on the next restart — the same
+   * the default `STREAM_BATCH_SIZE` of 10 it admits 10 000 entries **per recovery pass**, and a
+   * truncated scan is logged at warn level and retried on the **next cadence pass**
+   * (`blockMs x RECOVERY_IDLE_MULTIPLIER`, ~10 s at the shipped defaults) — the same
    * best-effort stance the rest of recovery takes.
+   *
+   * **This said "per startup" and "on the next restart" until T-041**, which was true while
+   * `recoverPendingEntries` had one call site before the read loop. `runLoop` now calls it on a
+   * cadence, so both were falsified by the same change that introduced them elsewhere.
+   *
+   * That has an operational consequence and not only a wording one, so it is stated rather than
+   * quietly corrected: the truncation `warn` ("Stopped reclaiming pending stream entries at the
+   * page limit") and recovery's `error` ("Failed to reclaim pending stream entries") now repeat
+   * roughly **once per cadence window** for as long as the condition holds, instead of once per
+   * process start. A pending list above 10 000 entries, or a Redis fault affecting only
+   * `XAUTOCLAIM`, therefore becomes a steady log stream rather than a line per boot. Reasoned
+   * from the two call sites and the log statements, **not observed under a PEL that large** —
+   * if that volume becomes real, the fix is a rate limit on the warn, not a larger page bound.
    */
   RECOVERY_MAX_PAGES: 1_000,
   /**
@@ -422,11 +525,178 @@ export const WORKER_EVENT_PROCESSING = {
      */
     ODD_FIELD_LIST: "Stream entry field list has an odd length",
     /** Any envelope field that is absent, empty, or not the shape its column needs. */
-    INVALID_MESSAGE: "Stream entry is not a valid usage event"
+    INVALID_MESSAGE: "Stream entry is not a valid usage event",
+    /**
+     * How the two messages above are extended with a diagnosis.
+     *
+     * This is what closed **S-31** ("a malformed stream message is undiagnosable, and retries
+     * forever"), both halves: the diagnosis here, and the dead-letter path in
+     * `DeadLetterService` for the retries. That entry has been removed from
+     * `.claude/rules/known-gaps.md` accordingly -- ids there are retired, never reused, so a
+     * missing S-31 means fixed. The record is `docs/plans/t-041-retry-tracking-dead-letter.md`
+     * and `docs/reviews/t-041-retry-tracking-dead-letter.md`.
+     *
+     * Before T-041 a malformed message produced one of the two constants above and nothing
+     * else, so an operator reading the log knew an entry was invalid and not which field.
+     * The detail rides on `error.message` rather than on a second field, which is what gets it
+     * to both consumers for free: `describeError` in `StreamConsumer.dispatch`, and the
+     * dead-letter record's `failureReason`.
+     *
+     * **What may appear, and what may not.** Each zod issue is projected to its `code` and its
+     * `path` -- never its `message`, never `issue.keys`, never the record. The rule is not
+     * cosmetic: the values in a stream entry are customer data reaching a service with no
+     * redaction layer, and `code`/`path` are vocabulary this repository chose (the seven
+     * envelope field names) rather than anything a customer supplies.
+     *
+     * Measured, with the mutation that establishes it: appending `JSON.stringify(record)` to
+     * the thrown message turns `U60` red, and reverting to the bare constant turns `U59` red.
+     * A third mutation was run to test the conditional claim the T-041 plan's F9 makes (and
+     * which the retired S-31 entry also made) -- making `envelopeSchema` `.strict()`, which produces an
+     * `unrecognized_keys` issue carrying a customer-supplied metadata key. Under this
+     * projection `U60` stayed **green**, because that issue's `path` is empty and its `keys`
+     * and `message` are not read. So the safety comes from the projection, not from the schema
+     * being non-strict -- but the scope of that is this flat seven-field schema, whose paths
+     * are all declared names. A nested or record-valued schema could put a customer key in a
+     * `path`, and this rule would not cover it.
+     *
+     * The odd-length branch has no issues to project and gets the field list's **length**
+     * instead: a count, not a value, and the one number that tells an operator whether a key
+     * or a value went missing.
+     */
+    DETAIL: {
+      /** Between the base message and the diagnosis. */
+      SEPARATOR: ": ",
+      /** Between two issues. */
+      ISSUE_SEPARATOR: ", ",
+      /** Between an issue's code and its path. */
+      CODE_PATH_SEPARATOR: ":",
+      /** Between the segments of one issue's path. */
+      PATH_SEGMENT_SEPARATOR: ".",
+      /** Stand-in for an issue whose `path` is empty, so the code is never left dangling. */
+      ROOT_PATH: "<root>",
+      /** Label on the odd-length branch's count. */
+      FIELD_COUNT_LABEL: "fieldCount="
+    }
   },
   LOG: {
     PROCESSED: "Processed stream entry into an event and usage line",
     ACK_FAILED: "Failed to acknowledge a processed stream entry"
+  }
+} as const;
+
+/**
+ * Retry accounting and the dead-letter record (T-041).
+ *
+ * A **sibling** of `WORKER_EVENT_PROCESSING`, for the reason that object is a sibling of
+ * `WORKER_STREAM_READ`: the two env-facing values Q10 settled live on
+ * `WORKER_STREAM_CONSTANTS`, because every member of *that* object feeds `src/config/env.ts`.
+ * Nothing here does. These are the Redis keyspace this service owns, the dead-letter record's
+ * field names, and the messages it writes.
+ *
+ * **Keyspace, against `.claude/rules/tenant-isolation.md`'s Redis clause.** The retry key is
+ * `RETRY_KEY_PREFIX + <streamName>` -- built by the service that writes it, from its own prefix
+ * plus operator configuration, never from a caller-supplied value. The hash *field* is the Redis
+ * entry id. Neither is tenant-scoped, and that is correct rather than an omission: the counter
+ * is per stream entry, and the stream is cross-tenant by design -- one worker fleet reads every
+ * tenant's events off one stream. No tenant id is read, written or logged on this path.
+ *
+ * Scope of "never caller-supplied", stated as measured rather than as a protocol guarantee: an
+ * explicit-id `XADD` is legal on Redis (`XADD <key> 9999999999999-0 f v` was accepted on
+ * 7.0.15), so what makes entry ids server-assigned here is a property of this workspace's
+ * producers rather than of Redis.
+ *
+ * **Two** production `xadd` call sites exist as of T-041, not one, and both pass `"*"`.
+ * Re-counted with `grep -rn "\.xadd(" apps packages --include=*.ts`, excluding `dist/` and
+ * `tests/`:
+ *
+ *   apps/usage-service/src/events/stream.publisher.ts:70   -- the source stream; `"*"` is the
+ *                                                             fifth element of `streamArgs`
+ *   apps/worker-service/src/services/dead-letter.service.ts:216 -- the dead-letter stream;
+ *                                                             `WORKER_DEAD_LETTER.ENTRY_AUTO_ID`
+ *
+ * This paragraph said "the workspace's **single** production `xadd` call site" until the T-041
+ * Gate-4 review, which is the universal its own commit refuted: the second call site is the one
+ * declared a few lines above. The claim that matters is narrower and survives -- the only
+ * `xadd` onto the **source** stream, whose ids are what this hash is keyed by, is the
+ * publisher's, and it passes `"*"`. The dead-letter write is onto a different stream and its
+ * ids key nothing.
+ */
+export const WORKER_DEAD_LETTER = {
+  /**
+   * Prefix of the per-stream retry hash: `retries:<streamName>`, the epic's shape.
+   *
+   * One hash per stream rather than one key per entry, so the whole counter set expires
+   * together -- see `RETRY_KEY_TTL_SECONDS`.
+   */
+  RETRY_KEY_PREFIX: "retries:",
+  /**
+   * TTL on the retry **key**, refreshed on every `HINCRBY`.
+   *
+   * Key-level and not field-level because there is no field-level option on the Redis this
+   * platform runs: `HEXPIRE t041probe:retries 60 FIELDS 1 x` replied
+   * `ERR unknown command 'HEXPIRE'` on 7.0.15. That is what was observed here; which later
+   * server version does support it was not established, so do not read this as "7.0.15 is the
+   * cutoff" -- re-probe before relying on it on a different server.
+   *
+   * It exists because a counter field can be orphaned with nothing to collect it. Measured: an
+   * entry whose data is trimmed out of the source stream by `MAXLEN` stays in the pending list,
+   * and `XAUTOCLAIM` then returns it in the **third** reply element -- the one `parseClaimReply`
+   * deliberately does not read -- and removes it from the PEL. That entry never reaches the
+   * handler again, so its field is never `HDEL`ed. Reproduced at Gate 3: five pending ids, four
+   * payloads evicted, `XPENDING` 4 -> 0 after one `XAUTOCLAIM` with an empty entry list.
+   *
+   * `86400`, mirroring usage-service's `DEDUP_CONSTANTS.KEY_TTL_SECONDS`, which is the nearest
+   * precedent for "a Redis bookkeeping key whose loss is not a correctness event". Losing a
+   * stale counter is benign: at worst an entry gets its budget again.
+   */
+  RETRY_KEY_TTL_SECONDS: 86_400,
+  /** `HINCRBY` step. One failure, one increment. */
+  RETRY_COUNT_INCREMENT: 1,
+  /** What `HGET` means when it replies `(nil)`: this entry has not failed yet. */
+  RETRY_COUNT_NONE: 0,
+  /** Base for reading `HGET`'s reply, which is a decimal string. */
+  RETRY_COUNT_RADIX: 10,
+  /** `*` -- let Redis assign the dead-letter entry's own id. */
+  ENTRY_AUTO_ID: "*",
+  /**
+   * The dead-letter record's fields.
+   *
+   * The epic's list plus `groupName`. `payload` is the **whole original field list**, JSON
+   * encoded, and that is decision C rather than convenience: a pending entry's payload can be
+   * evicted from the source stream while its id stays pending, so a record holding only
+   * `originalId` is unreplayable. `failedAt` is an ISO string *inside this Redis entry* -- there
+   * is no `failedAt` column and no Postgres write anywhere on this path.
+   *
+   * The record re-serialises the producer's envelope verbatim and classifies nothing, so it
+   * inherits S-27's drift rather than making a new field-classification decision: a field the
+   * producer adds lands here exactly as it lands in `Event.metadata` today.
+   */
+  FIELD: {
+    ORIGINAL_ID: "originalId",
+    STREAM_NAME: "streamName",
+    GROUP_NAME: "groupName",
+    PAYLOAD: "payload",
+    FAILURE_REASON: "failureReason",
+    FAILED_AT: "failedAt",
+    RETRY_COUNT: "retryCount"
+  },
+  /**
+   * `failureReason` when an entry arrives with its budget already spent.
+   *
+   * The pre-check path holds no error: the failures that spent the budget happened on earlier
+   * deliveries, possibly in an earlier process. Saying so is more honest than repeating a
+   * message this process never saw.
+   */
+  REASON_BUDGET_EXHAUSTED: "Retry budget was already exhausted when this entry was delivered",
+  LOG: {
+    /**
+     * The one line that matters operationally: a usage event has left the billing path.
+     *
+     * `error` level, not `warn`. Nothing watches the dead-letter stream -- there is no metric
+     * and no alert until T-057 -- so this log line and `XLEN` are the only signals, and a
+     * `warn` would be filtered out of exactly the dashboards that need it.
+     */
+    DEAD_LETTERED: "Stream entry dead-lettered after exhausting its retry budget"
   }
 } as const;
 

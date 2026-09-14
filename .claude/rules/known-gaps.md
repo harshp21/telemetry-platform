@@ -577,9 +577,16 @@ platform uses.
 | `apps/worker-service/src/config/env.ts:41` | `z.string().min(1).default(WORKER_STREAM_CONSTANTS.DEFAULT_STREAM_NAME)` | throws `String must contain at least 1 character(s)` |
 | `apps/worker-service/src/config/env.ts:42` (`REDIS_CONSUMER_GROUP`) | `z.string().min(1).default(...)` | throws, same message |
 
-Measured against the real schemas, not a reconstruction: `EnvSchema.shape.<field>.safeParse("")`
-on usage-service's compiled `dist/src/config/env.js` and on worker-service's `src/config/env.ts`
-under vitest, zod 3.25.76. The two `REDIS_STREAM_NAME` fields — usage's and worker's, the pair
+Measured against the real schemas, not a reconstruction, under vitest, zod 3.25.76 — on
+usage-service's compiled `dist/src/config/env.js` and on worker-service's `src/config/env.ts`.
+
+**The recipe differs per service since T-041, and this matters if you reproduce it.**
+usage-service's `EnvSchema` is a plain `z.object`, so `EnvSchema.shape.<field>.safeParse("")`
+works. Worker's is now `z.object({...}).superRefine(...)` — a `ZodEffects`, which has **no
+`.shape`** (measured: `"shape" in EnvSchema` -> `false`). For worker use
+`EnvSchema.innerType().shape.<field>.safeParse("")`, measured to return the identical
+`String must contain at least 1 character(s)`. Nothing this entry asserts changed; only the way
+to re-run it did, which is why it is recorded here rather than left for the next reader to hit. The two `REDIS_STREAM_NAME` fields — usage's and worker's, the pair
 the divergence is about — were also probed with `undefined`, and both yield the shared default
 `telemetry:events`, so the divergence is specific to the *empty* value and not to the absent one.
 Worker's `REDIS_CONSUMER_GROUP` is not part of that pair: `undefined` yields its own default,
@@ -985,34 +992,114 @@ intended.
 
 ---
 
-## S-31 · A malformed stream message is undiagnosable, and retries forever — **LOW, open**
+## S-32 · `docs/epics/epic-7-worker-service.md`'s T-041 section diverges from the shipped code in four ways, plus one unstated cost — **LOW, open**
 
-`apps/worker-service/src/validators/stream-message.validator.ts` discards the reason a message
-failed to parse. `envelopeSchema.safeParse(record)` produces a `ZodError` whose `issues[]` names
-the offending field and why; the parser throws
-`new Error(WORKER_EVENT_PROCESSING.ERROR.INVALID_MESSAGE)` instead — one fixed string, the same
-for every malformation. `foldFields` does the same for an odd-length field list
-(`ERROR.ODD_FIELD_LIST`).
+Sibling of S-29, which records the same class of defect in the **T-040** section of the same
+file. Filed separately rather than folded in: S-29's title is literally scoped to that section,
+so extending it would make its own title false, and four of the five items below concern a code
+snippet S-29 never examined.
 
-**Consequence, and it compounds.** T-040's contract is deliberate and correct: if processing
-throws, the entry is **not** acknowledged, so it stays in the pending list and is redelivered.
-For a transient failure that is exactly right. For a *malformed* message it is a poison entry —
-redelivered forever, failing identically each time, with a log line that says a message was
-invalid and not which field or why. The operator's only route to the cause is reading the raw
-entry out of Redis by hand, and only while it is still in the stream.
+Line numbers are against the working tree as of T-041, re-derived with `grep -n` at Gate 3
+Round 2.
 
-**The safe fix is available and narrow.** Zod's `issues[].path` is field **names**, not values —
-so including the paths (and `code`, not `message`, if the wording is a concern) diagnoses the
-failure without logging any tenant data. Verified at the Gate-5 review: the paths carry no
-payload content.
+**The reason this is LOW rather than MEDIUM, and the reason it is still open:** the file now
+**self-corrects**. `:184-202` carries "What T-041 shipped differs from the snippet above in five
+ways", enumerating every item below with its reason. What is *not* fixed is that the wrong text
+remains above it, at `:151` and `:154`, and nothing in between points forward. A reader who
+greps for the file path lands on `:151` and never reaches `:184`. That is the residual.
 
-**Not fixed in T-040 deliberately.** It changes production behaviour, and the change was already
-past its review gate when the gap was found. Note the *retry-forever* half is **T-041's**
-territory — retry accounting and a dead-letter destination are that task's stated scope, and the
-parser docstring already says so. This entry exists so the two halves are connected: T-041 will
-stop the infinite retry, but a dead-lettered message with no diagnosis is still undiagnosable.
+- **`:151` names a file that does not exist, and would sit outside this package's coverage
+  thresholds if it did.** It says `apps/worker-service/src/events/dead-letter.handler.ts`;
+  `ls apps/worker-service/src/events/` returns `index.ts` and `stream.consumer.ts` only. T-041
+  shipped `src/services/dead-letter.service.ts` instead, because
+  `apps/worker-service/vitest.config.mjs:79` lists `"src/events/**"` in `coverage.exclude`
+  against thresholds of `lines/functions/statements: 80`, `branches: 75`.
+- **`:158-172`'s snippet is a free function over module scope.** It closes over `redis`,
+  `streamName`, `groupName`, `originalPayload`, `lastError` and `retryCount`, none of which
+  exist in this repository's shape — every collaborator here is constructor-injected
+  `(redis, logger, env, …)`. `originalPayload` in particular has no referent: the handler seam
+  is `(id: string, fields: string[])`, so "the original payload" is the flat field list. The
+  same objection is already recorded for T-038's snippet in `ensureConsumerGroup`'s docblock.
+- **`:154`'s "Increment a Prometheus counter" has no substrate.**
+  `grep -rn "prom-client" --include=package.json .` outside `node_modules` → no match. Deferred
+  to T-057 by the Q10 decision, which `:14` and `:174-183` now record.
+- **`:154`'s "Clear from PEL so it doesn't block the consumer" is false as stated.** A pending
+  entry blocks nothing. Re-measured on Redis 7.0.15 at Gate 3 Round 2, db 14: one entry read
+  with `XREADGROUP … >` and left unacknowledged; a second `XREADGROUP … > BLOCK 50` on the same
+  group returned an **empty** reply while `XPENDING` still reported 1. So `>` delivers only
+  entries never handed to any consumer, and an unacknowledged entry neither blocks nor is
+  redelivered by it. What a stuck entry actually costs is a permanent PEL row and a recovery
+  page on every pass. The `XACK` in the snippet is right; the reason given for it is not.
+  **Do not reproduce this sentence in a comment.**
+- **`:156`'s pre-check is an unstated cost, not a divergence.** "Fetch count before processing"
+  means one `HGET` per *successful* message, on the happy path, forever. T-041 kept it — it is
+  the only thing that catches a crash between the `HINCRBY` and the `XADD`/`XACK`, and it is
+  what makes `retryCount >= max` on arrival terminal rather than a fourth attempt — and made the
+  matching `HDEL` conditional so the happy path costs exactly one extra command rather than two.
+  Recorded as an accepted trade (plan §9 R4), not as something to change.
 
-**Fix direction:** include `issues[].path` (and optionally `code`) in the thrown error or the log
-fields, in T-041 alongside the dead-letter work, and assert in a test that no *value* from the
-message reaches the log — the negative is the part worth pinning, since the whole reason this is
-LOW rather than MEDIUM is that nothing tenant-bearing is emitted today.
+**Scope of "five ways", stated precisely:** four of these are divergences between the epic and
+the shipped code; the fifth (`:156`) is a cost the epic does not mention and the implementation
+accepted. The epic's `:184-202` block counts all five together — and that is a *different* five
+from this entry's, **in membership and not only in framing**. The epic's block lists five items
+and calls them all differences; this entry lists four divergences plus one accepted cost, and the
+two sets are not the same five items. So neither number can be used to check the other: matching
+totals here are a coincidence of arithmetic, not agreement. (Gate-5 QA finding F-2; the
+membership half added at Gate 6.)
+
+**Fix direction:** rewrite `:151` and `:154` in place so the section is correct where a reader
+first meets it, and reduce `:184-202` to a short changelog note — or, if the epic files are to
+stay a historical record of what was *specified*, add a one-line forward reference immediately
+under `:151`. Do not simply delete the correction block: it is currently the only true account
+in the file. Pairs naturally with S-29 and with S-15's wider point that the epic files are not a
+reliable manifest.
+
+---
+
+## S-33 · Counts in comments go stale inside the commit that changes them — **LOW, open**
+
+A comment states a count about the codebase, and the same change that makes it wrong ships it.
+Every instance below was caught by a human or agent reading carefully; **none was caught by a
+tool**.
+
+**Only rows with a command behind them are listed.** That is deliberate, and it is this entry's
+own thesis applied to itself: two earlier drafts carried rows whose truth could not be
+mechanically re-derived, and **those were the rows that were wrong** — see the record at the
+bottom. A count you cannot re-run is not evidence.
+
+| Claim, and where | Command | Result |
+|---|---|---|
+| `constants.ts`: `WORKER_STREAM_CONSTANTS`' member count "feeds `env.ts`", with a `grep -c` to check it | `git show <rev>:apps/worker-service/src/config/env.ts \| grep -c 'WORKER_STREAM_CONSTANTS\.'` | **7** at `7ad9375`, `b558641`, `7dc7392` and `c88a933` alike — the claim was *true* until T-041. T-041's `.superRefine` took it to **12**; the task first wrote **11**, so the correction was itself wrong and only a second pass fixed it |
+| `constants.ts`: "the workspace's **single** production `xadd` call site" | `grep -rn "\.xadd(" apps packages --include=*.ts` excluding `dist/` and `tests/` | **two** call sites — T-041's own `dead-letter.service.ts` refuted it. The grep returns **three** lines: the third is the comment carrying the pattern, matching itself |
+| `constants.ts` + S-27: the `RESERVED_STREAM_FIELDS` grep "returns **four** lines" | `grep -rn "RESERVED_STREAM_FIELDS" apps packages --include=*.ts` | **five** — same self-match |
+| S-19: "exactly one real subclass … **latent, not live**" | `grep -rn "extends TenantScopedRepository" apps/*/src` | **two** since T-040 added worker's `EventRepository`, making a live data path over a base copy without the `TimeZone` pin |
+
+**The sub-pattern worth naming: a comment carrying its own verification command matches itself.**
+That is two of the four rows, and it is how a count and its grep disagree by exactly one while
+both look right.
+
+**Why LOW.** No instance caused wrong behaviour. The cost is reviewer time and the erosion of
+`.claude/rules/`' authority — `CLAUDE.md` tells agents to trust these files without
+re-verification.
+
+**The record of this entry's own failures, kept because it is the evidence for the shape above.**
+Draft 1 claimed row 1 was "refuted by T-040's own diff — eleven": wrong task, wrong number, and
+it counted one figure's two movements as two instances, inflating the total to seven. Caught at
+Gate 5 of T-041 and graded HIGH. Draft 2 fixed the count and introduced two more errors, both in
+rows that had no command: a claim that a superseded text appeared in "no committed revision"
+(false repo-wide — `git log -S "fourteen distinct log messages" --all` returns `c88a933`, where
+it survives in `docs/reviews/t-040-event-usageline-processor.md`; the true statement is
+file-scoped to `src/constants.ts`), and a header asserting every row had been re-derived by
+command when two rows had no command to run. Caught at Gate 6. **Both failures were in
+prose rows; every command-backed row has survived re-derivation at three gates.** That is why
+draft 3 keeps only the latter.
+
+**Fix direction — mechanical, not cultural.** These state the command that establishes them. A
+check that extracts `grep -c …` / `grep -rn …` from comments, re-runs them, and compares against
+the adjacent numeral would catch all four rows with no judgement — **provided it accounts for the
+self-match**, or it reproduces the off-by-one it exists to catch. Scope it to `apps/*/src/**`
+comments carrying a backticked command plus a numeral; run it in CI alongside lint.
+
+Do **not** address this by deleting the counts. They are load-bearing: the `xadd` and subclass
+counts are evidence for security-relevant claims, and a vaguer comment would be worse than a
+stale precise one. The number should stay and become checkable.

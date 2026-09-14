@@ -395,3 +395,64 @@ export const INTEGRATION_PROCESSOR_SESSION_TIME_ZONE = {
   URL_SUFFIX: "?options=-c%20timezone%3DAmerica%2FNew_York",
   SHOW_TIMEZONE: "SHOW timezone"
 } as const;
+
+/**
+ * Fixture vocabulary for T-041's retry/dead-letter cases (`I23`-`I27`).
+ *
+ * Its own prefixes, for the reason `INTEGRATION_LOOP_REDIS` and `INTEGRATION_PROCESSOR_REDIS`
+ * give: these cases share logical database 14 and one guarded `FLUSHDB` with the `t038`, `t039`
+ * and `t040` sets, and a key that says which task created it is the difference between reading
+ * a leftover and guessing at one.
+ *
+ * **`DEAD_LETTER_STREAM_PREFIX` is not `telemetry:dead-letter`, and that is deliberate.** The
+ * shipped default is what a developer's own worker would use; a suite that wrote to it would
+ * leave records an operator could mistake for real dropped usage. Every case builds a per-run,
+ * per-case name under this prefix, on database 14 only.
+ */
+export const INTEGRATION_DEAD_LETTER = {
+  STREAM_NAME_PREFIX: "telemetry:events:t041:",
+  CONSUMER_GROUP_PREFIX: "worker-group-t041-",
+  DEAD_LETTER_STREAM_PREFIX: "telemetry:dead-letter:t041:",
+  CONSUMER_NAME: "t041-worker",
+  /** Consumer identity the abandoned-entry fixtures are seeded under. */
+  ABANDONED_CONSUMER_NAME: "t041-dead-worker",
+  /**
+   * Retry budget the live cases run with.
+   *
+   * Equal to the shipped default of 3, unlike the unit suite's deliberately non-default 2.
+   * Here that is the right choice rather than a lapse: `U63` already proves the threshold is
+   * taken from the parsed environment, and these cases are about the number of *round trips to
+   * a real server* the default budget costs. Each attempt waits out a cadence window, so a
+   * larger budget would trade the thing under test for wall-clock time against
+   * `RUN_DEADLINE_MS`.
+   */
+  MAX_RETRY_COUNT: 3,
+  /** Fixture payload values, named so a leftover key says which case wrote it. */
+  VALUE_RETRIED: "t041-retried",
+  VALUE_POISON: "t041-poison",
+  /**
+   * A metadata key and value a customer might send, for `I27`'s S-31 negative.
+   *
+   * The **key** matters separately from the value: zod's `unrecognized_keys` issue carries the
+   * offending key, so a diagnosis that read `issue.message` rather than `issue.code`/`path`
+   * would put a customer-chosen key into the dead-letter record and into the log.
+   */
+  SENTINEL_METADATA_KEY: "SENTINEL-META-KEY-t041",
+  SENTINEL_METADATA_VALUE: "SENTINEL-META-VALUE-t041",
+  /** A `quantity` the parser rejects, carrying a sentinel so `I27` can look for it. */
+  SENTINEL_QUANTITY: "SENTINEL-QUANTITY-t041"
+} as const;
+
+/**
+ * Minimum delivery count `I23` requires from `XPENDING`'s fourth column.
+ *
+ * `2` -- one original delivery and one redelivery inside a single `run()`. Redis maintains this
+ * per-entry counter itself, and it is the most direct evidence available that the entry came
+ * back through the pending list rather than through a `>` read: measured on 7.0.15, a second
+ * `XREADGROUP ... >` against the same group returned empty while `XPENDING` still reported the
+ * entry, so `>` cannot be the source of a second delivery.
+ */
+export const INTEGRATION_REDELIVERY_MIN_COUNT = 2;
+
+/** Position of the delivery count in an `XPENDING <key> <group> - + <n>` row. */
+export const INTEGRATION_XPENDING_DELIVERY_COUNT_INDEX = 3;

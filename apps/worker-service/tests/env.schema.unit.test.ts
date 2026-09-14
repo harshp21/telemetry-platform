@@ -281,6 +281,256 @@ describe("worker-service env schema", () => {
     });
   });
 
+  // T-041 (AC1). Q10's two settled values: `MAX_RETRY_COUNT` 3 and `DEAD_LETTER_STREAM`
+  // `telemetry:dead-letter`. Its own describe block rather than an extension of the one above,
+  // matching how `WORKER_DEAD_LETTER` is a sibling of `WORKER_STREAM_READ` in `src/constants.ts`:
+  // these fields configure failure handling, not the read loop.
+  describe("dead-letter configuration", () => {
+    // AC1. Default asserted against the constant and the *literal* alike, for the reason the
+    // REDIS_STREAM_NAME pair above gives: an assertion sourced only from the constant the schema
+    // reads stays green after someone edits the constant.
+    it("defaults MAX_RETRY_COUNT to 3 and coerces an override from string", () => {
+      const parsedDefault = EnvSchema.safeParse(buildBaseEnv());
+
+      expect(parsedDefault.success).toBe(true);
+
+      if (parsedDefault.success) {
+        expect(parsedDefault.data.MAX_RETRY_COUNT).toBe(
+          WORKER_STREAM_CONSTANTS.DEFAULT_MAX_RETRY_COUNT
+        );
+        expect(parsedDefault.data.MAX_RETRY_COUNT).toBe(3);
+      }
+
+      const parsedOverride = EnvSchema.safeParse({ ...buildBaseEnv(), MAX_RETRY_COUNT: "5" });
+
+      expect(parsedOverride.success).toBe(true);
+
+      if (parsedOverride.success) {
+        expect(parsedOverride.data.MAX_RETRY_COUNT).toBe(5);
+        expect(typeof parsedOverride.data.MAX_RETRY_COUNT).toBe("number");
+      }
+    });
+
+    // AC1. Both bounds accepted, both one-past rejected -- the shape the STREAM_BATCH_SIZE pair
+    // above uses. An operator raising the budget to the cap buys roughly two minutes of retrying
+    // at the default block interval (plan R1); a value of 0 would dead-letter on first failure.
+    it("accepts MAX_RETRY_COUNT at both configured bounds", () => {
+      for (const bound of [
+        WORKER_STREAM_CONSTANTS.MAX_RETRY_COUNT_MIN,
+        WORKER_STREAM_CONSTANTS.MAX_RETRY_COUNT_MAX
+      ]) {
+        const parsed = EnvSchema.safeParse({
+          ...buildBaseEnv(),
+          MAX_RETRY_COUNT: String(bound)
+        });
+
+        expect(parsed.success, String(bound)).toBe(true);
+
+        if (parsed.success) {
+          // `typeof` as well as the value: zod strips an undeclared key rather than
+          // rejecting it, so before the field existed `parsed.data.MAX_RETRY_COUNT` was
+          // `undefined` and `toBe(undefined)` passed. This case was confirmed red only after
+          // the type assertion was added.
+          expect(typeof parsed.data.MAX_RETRY_COUNT, String(bound)).toBe("number");
+          expect(parsed.data.MAX_RETRY_COUNT).toBe(bound);
+        }
+      }
+    });
+
+    // AC1
+    it("rejects a MAX_RETRY_COUNT outside the configured bounds", () => {
+      expectIssueOn(
+        EnvSchema.safeParse({
+          ...buildBaseEnv(),
+          MAX_RETRY_COUNT: String(WORKER_STREAM_CONSTANTS.MAX_RETRY_COUNT_MIN - 1)
+        }),
+        "MAX_RETRY_COUNT"
+      );
+      expectIssueOn(
+        EnvSchema.safeParse({
+          ...buildBaseEnv(),
+          MAX_RETRY_COUNT: String(WORKER_STREAM_CONSTANTS.MAX_RETRY_COUNT_MAX + 1)
+        }),
+        "MAX_RETRY_COUNT"
+      );
+    });
+
+    // AC1, and the one case in this block that does **not** compute its input from the
+    // constant it is testing.
+    //
+    // **Carries a `U` id although this file otherwise cites ACs** -- the plan's F11 records that
+    // convention. The departure is deliberate: this case's subject is a `DeadLetterService`
+    // invariant that happens to be enforced by the schema, and it is cited from that service's
+    // `readRetryCount` docstring, which needs a stable name to point at. It lives here rather
+    // than in `tests/dead-letter.service.unit.test.ts` because the assertion is about
+    // `EnvSchema`, and moving it there would mean a second copy of `buildBaseEnv`.
+    //
+    // **Why the bounds case below cannot cover this.** It asserts
+    // `String(MAX_RETRY_COUNT_MIN - 1)` is rejected, so its input moves with the constant.
+    // Measured, both ways: at `MAX_RETRY_COUNT_MIN: 1` the computed input is `"0"` and is
+    // rejected; set the constant to `0` and the computed input becomes `"-1"` -- still rejected,
+    // so that case stays green -- while `MAX_RETRY_COUNT=0` starts **parsing successfully**.
+    // The Gate-6 reviewer made exactly that edit and the package stayed 156/156 green;
+    // reproduced here before this case was written.
+    //
+    // **What the floor protects, which is why the numeral alone is the weaker assertion.**
+    // `DeadLetterService.readRetryCount` coerces a non-numeric stored counter to `0` rather than
+    // leaving it `NaN`. That coercion is inert at every legal budget -- measured at Gate 5:
+    // driving `wrap()` over a corrupt counter with the coercion present and with a bare
+    // `return parsed` produced byte-identical command sequences and outcomes. It stops being
+    // inert at exactly one value. At `maxRetryCount === 0`, `0 >= 0` is true while `NaN >= 0` is
+    // false, so the coercion becomes the difference between dead-lettering on arrival and
+    // processing the entry -- measured: with the coercion `cmds=[hget,xadd,xack,hdel]` and
+    // `inner` never ran; without it `cmds=[hget]` and `inner` ran once. `MAX_RETRY_COUNT_MIN: 1`
+    // is the only thing keeping that configuration unreachable, and until this case nothing
+    // pinned it.
+    it("U72 - pins the retry floor at 1, so MAX_RETRY_COUNT=0 cannot be configured", () => {
+      // **The property first, deliberately.** Both halves redden when the floor drops, but only
+      // one of them can report it: assertions in a case short-circuit, so whichever runs first
+      // names the failure. Measured -- with the numeral assertion above this one, lowering the
+      // constant failed at `expected +0 to be 1`, and the property below never executed. Ordered
+      // this way the same edit fails at `expected true to be false` on a `safeParse` of
+      // `MAX_RETRY_COUNT=0`, which says what actually broke rather than that a numeral moved.
+      //
+      // A **literal** `0`, never `String(MAX_RETRY_COUNT_MIN - 1)`: an input derived from the
+      // constant under test cannot detect the constant changing.
+      expectIssueOn(
+        EnvSchema.safeParse({ ...buildBaseEnv(), MAX_RETRY_COUNT: "0" }),
+        "MAX_RETRY_COUNT"
+      );
+
+      // The numeral, against the literal rather than against itself. Second because it is the
+      // weaker claim -- it pins what the floor *is*, where the line above pins what the floor
+      // *does*.
+      expect(WORKER_STREAM_CONSTANTS.MAX_RETRY_COUNT_MIN).toBe(1);
+
+      // Anti-vacuity: the floor itself still parses, so this rejects the value below the floor
+      // rather than the field. The both-bounds case above covers this too; asserted here so
+      // that lowering the floor cannot be made to look correct by this case alone.
+      const atFloor = EnvSchema.safeParse({
+        ...buildBaseEnv(),
+        MAX_RETRY_COUNT: String(WORKER_STREAM_CONSTANTS.MAX_RETRY_COUNT_MIN)
+      });
+      expect(atFloor.success).toBe(true);
+    });
+
+    // AC1. `z.coerce.number()` accepts `"2.5"` happily; `.int()` is what refuses it. Without
+    // this, a fractional budget would make the `>=` threshold comparison meaningless.
+    it("rejects a fractional MAX_RETRY_COUNT", () => {
+      expectIssueOn(
+        EnvSchema.safeParse({ ...buildBaseEnv(), MAX_RETRY_COUNT: "2.5" }),
+        "MAX_RETRY_COUNT"
+      );
+    });
+
+    // AC1
+    it("defaults DEAD_LETTER_STREAM to 'telemetry:dead-letter'", () => {
+      const parsed = EnvSchema.safeParse(buildBaseEnv());
+
+      expect(parsed.success).toBe(true);
+
+      if (parsed.success) {
+        expect(parsed.data.DEAD_LETTER_STREAM).toBe(
+          WORKER_STREAM_CONSTANTS.DEFAULT_DEAD_LETTER_STREAM
+        );
+        expect(parsed.data.DEAD_LETTER_STREAM).toBe("telemetry:dead-letter");
+        // Never the stream the worker *reads*: a dead letter written back onto the source
+        // stream would be re-delivered, re-fail, and dead-letter itself forever.
+        expect(parsed.data.DEAD_LETTER_STREAM).not.toBe(parsed.data.REDIS_STREAM_NAME);
+      }
+    });
+
+    // AC1
+    it("honours a DEAD_LETTER_STREAM override", () => {
+      const parsed = EnvSchema.safeParse({
+        ...buildBaseEnv(),
+        DEAD_LETTER_STREAM: "telemetry:dead-letter:replay"
+      });
+
+      expect(parsed.success).toBe(true);
+
+      if (parsed.success) {
+        expect(parsed.data.DEAD_LETTER_STREAM).toBe("telemetry:dead-letter:replay");
+      }
+    });
+
+    // AC1, and S-23's lesson applied in the service that has the guard: usage-service's
+    // `REDIS_STREAM_NAME` lacks `.min(1)` and parses `""`, which is the divergence that entry
+    // records. `XADD ""` would write to a stream key nobody can find. Deliberately **not**
+    // `.trim()`ed -- `src/config/env.ts` records why the stream-name fields are untrimmed, and
+    // this is a stream name.
+    it("rejects a blank DEAD_LETTER_STREAM", () => {
+      expectIssueOn(
+        EnvSchema.safeParse({ ...buildBaseEnv(), DEAD_LETTER_STREAM: "" }),
+        "DEAD_LETTER_STREAM"
+      );
+    });
+
+    // AC1, cross-field. The two defaults differ, which the case above pins -- but that says
+    // nothing about an *operator* who sets both. Before this guard existed the schema accepted
+    // it and the worker started.
+    //
+    // The failure is self-amplifying rather than merely wrong: each dead-lettered entry is
+    // `XADD`ed onto the stream the worker reads; its fields are `originalId`/`streamName`/...,
+    // not an envelope, so it fails to parse; three failures later it dead-letters *itself*,
+    // adding another entry. One new entry per three failures, indefinitely. Reasoned from the
+    // code paths and not run as a live loop -- what is measured here is that the schema now
+    // refuses the configuration.
+    //
+    // The invariant was stated in three comments (`WORKER_STREAM_CONSTANTS`'s
+    // `DEFAULT_DEAD_LETTER_STREAM` docblock, `.env.example`, and the default-inequality
+    // assertion above) and enforced nowhere. That is the shape S-6 and S-23 were filed for: a
+    // rule an operator can violate with a clean startup.
+    it("rejects a DEAD_LETTER_STREAM equal to REDIS_STREAM_NAME", () => {
+      const collidingName = "telemetry:events:collision";
+
+      expectIssueOn(
+        EnvSchema.safeParse({
+          ...buildBaseEnv(),
+          REDIS_STREAM_NAME: collidingName,
+          DEAD_LETTER_STREAM: collidingName
+        }),
+        "DEAD_LETTER_STREAM"
+      );
+
+      // Also when the collision is against the *defaults* rather than an explicit override --
+      // an operator who sets only `DEAD_LETTER_STREAM` to the shipped stream name.
+      expectIssueOn(
+        EnvSchema.safeParse({
+          ...buildBaseEnv(),
+          DEAD_LETTER_STREAM: WORKER_STREAM_CONSTANTS.DEFAULT_STREAM_NAME
+        }),
+        "DEAD_LETTER_STREAM"
+      );
+
+      // And the message is the constant, not an ad-hoc string, so the operator-facing text has
+      // one definition. Asserted on the issue rather than only on the failure, because a
+      // refinement that fired for the wrong reason would satisfy `expectIssueOn` alone.
+      const parsed = EnvSchema.safeParse({
+        ...buildBaseEnv(),
+        REDIS_STREAM_NAME: collidingName,
+        DEAD_LETTER_STREAM: collidingName
+      });
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) {
+        expect(
+          parsed.error.issues.some(
+            (issue) => issue.message === WORKER_STREAM_CONSTANTS.DEAD_LETTER_STREAM_COLLISION
+          )
+        ).toBe(true);
+      }
+
+      // Anti-vacuity: two *different* names still parse, so the refinement rejects the
+      // collision rather than the field.
+      const distinct = EnvSchema.safeParse({
+        ...buildBaseEnv(),
+        REDIS_STREAM_NAME: collidingName,
+        DEAD_LETTER_STREAM: `${collidingName}:dlq`
+      });
+      expect(distinct.success).toBe(true);
+    });
+  });
+
   describe("core infrastructure configuration", () => {
     // AC7. `env.PORT` is read by nothing in this repo -- `apps/worker-service/src/index.ts:59`
     // binds `process.env.PORT ?? WORKER_SERVICE_STARTUP.DEFAULT_PORT` directly. This asserts the

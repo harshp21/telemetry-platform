@@ -51,8 +51,52 @@ export const EnvSchema = z.object({
     .int()
     .min(WORKER_STREAM_CONSTANTS.BATCH_SIZE_MIN)
     .max(WORKER_STREAM_CONSTANTS.BATCH_SIZE_MAX)
-    .default(WORKER_STREAM_CONSTANTS.DEFAULT_BATCH_SIZE)
-});
+    .default(WORKER_STREAM_CONSTANTS.DEFAULT_BATCH_SIZE),
+  // Dead-letter configuration (T-041, Q10). Read by `DeadLetterService`, which the container
+  // wraps around the processor's handler. `.int()` is load-bearing rather than tidiness:
+  // `z.coerce.number()` accepts "2.5", and a fractional budget makes the `>= MAX_RETRY_COUNT`
+  // threshold comparison mean something nobody chose.
+  MAX_RETRY_COUNT: z.coerce
+    .number()
+    .int()
+    .min(WORKER_STREAM_CONSTANTS.MAX_RETRY_COUNT_MIN)
+    .max(WORKER_STREAM_CONSTANTS.MAX_RETRY_COUNT_MAX)
+    .default(WORKER_STREAM_CONSTANTS.DEFAULT_MAX_RETRY_COUNT),
+  // `.min(1)`, matching the three stream-name fields above and **not** matching
+  // usage-service's `REDIS_STREAM_NAME`, which has no `.min(1)` and parses `""` (S-23). An
+  // empty destination would make `XADD "" ...` write to a key nothing can find.
+  //
+  // Deliberately not `.trim()`ed, for the reason the comment above gives about the other
+  // stream names: trimming one side of a name that operators set per service recreates the
+  // divergence the shared defaults exist to prevent. `.trim()` stays on
+  // `INTERNAL_API_SECRET` only.
+  DEAD_LETTER_STREAM: z
+    .string()
+    .min(1)
+    .default(WORKER_STREAM_CONSTANTS.DEFAULT_DEAD_LETTER_STREAM)
+})
+  // Cross-field, so it cannot live on either field: zod's per-field refinements see only the
+  // value they are attached to. `.superRefine` on the object is the only place both names exist
+  // at once, and it runs after both fields have parsed and defaulted -- which matters, because
+  // the collision an operator is most likely to create is between an explicit
+  // `DEAD_LETTER_STREAM` and the *default* `REDIS_STREAM_NAME`.
+  //
+  // Startup, not runtime: `parseEnv` throws at module load, so a worker configured to republish
+  // its own dead letters never reaches `app.listen`. The `path` names `DEAD_LETTER_STREAM`
+  // because that is the field an operator should change -- `REDIS_STREAM_NAME` has to match
+  // usage-service's producer and is not free to move.
+  .superRefine((parsed, ctx) => {
+    if (parsed.DEAD_LETTER_STREAM === parsed.REDIS_STREAM_NAME) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        // `satisfies` rather than a bare literal: renaming the field is already a type error at
+        // the comparison above, but would be silent here, leaving the issue naming a field that
+        // no longer exists (Gate-4 Round-2 R2-4).
+        path: ["DEAD_LETTER_STREAM" satisfies keyof typeof parsed],
+        message: WORKER_STREAM_CONSTANTS.DEAD_LETTER_STREAM_COLLISION
+      });
+    }
+  });
 
 export type ServiceEnv = z.infer<typeof EnvSchema>;
 

@@ -107,13 +107,19 @@ const start = async (): Promise<void> => {
 	// one that silently re-reads the same backlog forever. `src/events/**` is outside this
 	// package's coverage thresholds (S-25), so no percentage would notice its absence; `U46` in
 	// `tests/index.graceful-shutdown.unit.test.ts` is what does, by asserting that a reclaimed
-	// entry reaches the processor's handler.
+	// entry reaches the handler the container supplied.
+	//
+	// T-041 changes *which* handler that is: `container.messageHandler`, the processor's handler
+	// with the retry policy wrapped around it, composed in `src/config/container.ts`. Reverting
+	// this line to `container.eventProcessor.buildHandler()` leaves the whole
+	// `DeadLetterService` suite green and the feature wired to nothing, which is why `U69`
+	// exists and why it asserts the raw processor handler was **not** the one called.
 	streamConsumer = new StreamConsumer(
 		container.redis,
 		container.logger,
 		container.env,
 		() => shuttingDown,
-		container.eventProcessor.buildHandler()
+		container.messageHandler
 	);
 	await streamConsumer.ensureConsumerGroup();
 

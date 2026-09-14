@@ -625,6 +625,42 @@ const readConfiguredTestTimeout = (configModule: unknown): number => {
  */
 const MAX_BACKOFF_WINDOWS = 4;
 
+/**
+ * The reclaim cadence for the shared `loopEnv`, derived the same way the subject derives it.
+ *
+ * Not a new constant in `src/`: T-041 reuses `RECOVERY_IDLE_MULTIPLIER` rather than adding a
+ * second numeral under a second name. Computing it here from the same two values the subject
+ * reads means this suite cannot pin a *different* cadence than the one that ships -- and `U70`
+ * asserts elapsed time against it, which is the one thing a value copied by hand could get
+ * silently wrong.
+ */
+const RECOVERY_CADENCE_MS = OVERRIDE.BLOCK_MS * WORKER_STREAM_READ.RECOVERY_IDLE_MULTIPLIER;
+
+/**
+ * A deliberately long block interval for `U71`, whose subject is that the cadence does **not**
+ * fire on every iteration.
+ *
+ * `500` makes the cadence 1 000 ms, against a handful of reads that resolve from a mock in
+ * microseconds -- a margin of roughly three orders of magnitude. The shared `OVERRIDE.BLOCK_MS`
+ * of 37 would give a 74 ms window, which is ample in practice and still close enough to a slow
+ * CI tick to be worth not relying on. The resulting cadence stays under `STOP_DEADLINE_MS`, so
+ * a subject that reclaimed on every iteration fails by assertion rather than by deadline.
+ */
+const SLOW_BLOCK_MS = 500;
+
+/** Reads `U71` drives inside one cadence window. More than one, which is the whole claim. */
+const READS_INSIDE_ONE_WINDOW = 5;
+
+/**
+ * Position of `min-idle` in the `XAUTOCLAIM` argument vector
+ * `[stream, group, consumer, minIdle, cursor, COUNT, batch]`.
+ *
+ * Named rather than written as a bare `3`, and declared beside the other positions for the
+ * reason `INDEX`'s docblock gives. `U19` asserts the whole vector; `U70` needs this one slot,
+ * to state that the cadence and the idle filter are the same product.
+ */
+const CLAIM_ARG_MIN_IDLE_INDEX = 3;
+
 describe("StreamConsumer.run", () => {
   let mockRedis: {
     xgroup: ReturnType<typeof vi.fn>;
@@ -1538,6 +1574,75 @@ describe("StreamConsumer.run", () => {
     expect(mockLogger.error).not.toHaveBeenCalled();
   });
 
+  it("U70 - reclaims again inside one run(), once the cadence interval has elapsed", async () => {
+    // The same entry comes back on every reclaim, which is what a permanently-failing entry
+    // does: nothing acknowledges it, so it stays in the pending list.
+    readConnection.xautoclaim.mockResolvedValue(
+      autoclaimReply(WORKER_STREAM_READ.PENDING_START_ID, [ENTRY.RECLAIMED])
+    );
+    readConnection.xreadgroup.mockResolvedValue(null);
+
+    const startedAt = Date.now();
+    // Keyed on the claim count rather than `stopAfter`, for the reason `U39` gives: the
+    // predicate is checked in three places, and a check count would decide the outcome of the
+    // thing under test.
+    await buildLoopConsumer(
+      stopWhen(() => readConnection.xautoclaim.mock.calls.length >= CALLS.TWICE)
+    ).run();
+    const elapsed = Date.now() - startedAt;
+
+    // Before T-041, `recoverPendingEntries` had exactly one call site -- before the `do`/`while`
+    // -- so a second delivery of a failed entry required a **restart**. Measured independently:
+    // `XREADGROUP ... >` does not redeliver an unacknowledged entry (a second read of the same
+    // group returned empty while `XPENDING` still reported 1), so without this cadence the
+    // dead-letter path could not fire in a worker that stays up.
+    expect(readConnection.xautoclaim.mock.calls.length).toBeGreaterThanOrEqual(CALLS.TWICE);
+    // And the entry really was re-offered to the handler -- the claim call on its own would
+    // hold for a reclaim that returned nothing.
+    expect(handled.filter((entry) => entry.id === ENTRY.RECLAIMED.id)).toHaveLength(
+      CALLS.TWICE
+    );
+
+    // Not sooner than the interval. This is why `handled` has two and not two hundred: the
+    // loop spins on a mock that resolves instantly, so an unconditional reclaim would have
+    // claimed thousands of times inside the same window.
+    expect(elapsed).toBeGreaterThanOrEqual(RECOVERY_CADENCE_MS);
+    // The cadence is derived from the same threshold `XAUTOCLAIM`'s `min-idle` uses, not from a
+    // new setting -- reclaiming more often than the idle threshold would find nothing anyway.
+    expect(nthClaimArgs(INDEX.SECOND)[CLAIM_ARG_MIN_IDLE_INDEX]).toBe(RECOVERY_CADENCE_MS);
+  });
+
+  it("U71 - does not reclaim on every iteration: the cadence is the idle threshold, not the read", async () => {
+    readConnection.xreadgroup.mockResolvedValue(null);
+
+    const slowEnv: Partial<ServiceEnv> = { ...loopEnv, STREAM_BLOCK_MS: SLOW_BLOCK_MS };
+    const startedAt = Date.now();
+    await new StreamConsumer(
+      mockRedis as unknown as Redis,
+      mockLogger as unknown as Logger,
+      slowEnv as ServiceEnv,
+      stopWhen(
+        () => readConnection.xreadgroup.mock.calls.length >= READS_INSIDE_ONE_WINDOW
+      ),
+      handler
+    ).run();
+    const elapsed = Date.now() - startedAt;
+
+    // The premise, asserted rather than assumed: if the fixture took longer than one cadence
+    // window, the claim below is about nothing and this line says so instead of passing.
+    const cadenceMs = SLOW_BLOCK_MS * WORKER_STREAM_READ.RECOVERY_IDLE_MULTIPLIER;
+    expect(elapsed, "the fixture ran longer than one cadence window").toBeLessThan(cadenceMs);
+
+    expect(readConnection.xreadgroup.mock.calls.length).toBeGreaterThanOrEqual(
+      READS_INSIDE_ONE_WINDOW
+    );
+    // Exactly the startup pass. An unconditional reclaim would make peer-stealing the loop's
+    // steady state: `XAUTOCLAIM`'s idle filter still guards it, but a worker issuing the
+    // command thousands of times a second against a live peer's work is a round trip per
+    // iteration for nothing.
+    expect(readConnection.xautoclaim).toHaveBeenCalledTimes(CALLS.ONCE);
+  });
+
   it("U50 - every test deadline, and the one case that spends two of them, sits below the runner budget", async () => {
     // `CASE_BUDGET_MS` is only the truth if the runner actually enforces it, so this reads the
     // effective config rather than trusting the constant to describe it. The specifier is a
@@ -1561,5 +1666,16 @@ describe("StreamConsumer.run", () => {
     expect(INTEGRATION_LOOP.RUN_DEADLINE_MS + INTEGRATION_LOOP.BLOCK_MS_LONG).toBeLessThan(
       CASE_BUDGET_MS
     );
+
+    // T-041's two wall-clock windows, enumerated here for the reason this case's neighbours
+    // record: nothing in the type system collects deadlines, so a new one is covered only by
+    // being added to this list. `U70` waits out `RECOVERY_CADENCE_MS` and `U71` must finish
+    // inside one `SLOW_BLOCK_MS` window; both are bounded above by `stopWhen`'s deadline, so
+    // the relationship that matters is each against that rather than against the budget alone.
+    expect(RECOVERY_CADENCE_MS).toBeLessThan(STOP_DEADLINE_MS);
+    expect(SLOW_BLOCK_MS * WORKER_STREAM_READ.RECOVERY_IDLE_MULTIPLIER).toBeLessThanOrEqual(
+      STOP_DEADLINE_MS
+    );
+    expect(STOP_DEADLINE_MS).toBeLessThan(CASE_BUDGET_MS);
   });
 });

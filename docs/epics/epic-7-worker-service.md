@@ -11,7 +11,7 @@
 | Question | Decision needed |
 |---|---|
 | Q9 — Worker concurrency | **Decision: design for horizontal workers, run one locally.** Use consumer groups from day one. |
-| Q10 — DLQ policy | Max retries, retry delay, dead-letter destination |
+| Q10 — DLQ policy | **Decision: 3 retries, `telemetry:dead-letter`, no retry delay.** Attempts are spaced by the existing `XAUTOCLAIM` idle threshold rather than by a timer. The Prometheus counter is deferred to T-057 — see the T-041 section below. |
 
 ---
 
@@ -171,10 +171,35 @@ await redis.xack(streamName, groupName, messageId);
 await redis.hdel(`retries:${streamName}`, messageId);
 ```
 
-**Q10 — DLQ policy** (fill in when decided):
-- Max retry count: `MAX_RETRY_COUNT` env var (default 3)
-- Dead-letter destination: `DEAD_LETTER_STREAM` (default `telemetry:dead-letter`)
-- Alerting: Prometheus counter `telemetry_dead_letter_total` — wire Grafana alert when value > 0
+**Q10 — DLQ policy** (**decided**, and implemented by T-041 —
+`docs/plans/t-041-retry-tracking-dead-letter.md`):
+- Max retry count: `MAX_RETRY_COUNT` env var, default **3**, bounded 1..10.
+- Dead-letter destination: `DEAD_LETTER_STREAM`, default **`telemetry:dead-letter`**.
+- Retry delay: **none**. No sleep, no scheduled re-add, no backoff ladder. What spaces the
+  attempts is `STREAM_BLOCK_MS x RECOVERY_IDLE_MULTIPLIER` — the idle threshold `XAUTOCLAIM`
+  already required — because T-041 also adds a reclaim cadence to the read loop.
+- Alerting: `telemetry_dead_letter_total` is **deferred to T-057**. `prom-client` is in no
+  `package.json` in this workspace. Until then the lever is `XLEN telemetry:dead-letter`.
+
+**What T-041 shipped differs from the snippet above in five ways**, each deliberate and each
+recorded in the plan's §4:
+
+1. **The file is `src/services/dead-letter.service.ts`**, not `src/events/dead-letter.handler.ts`:
+   `vitest.config.mjs` excludes `src/events/**` from coverage, and new failure-handling code
+   belongs inside the thresholds this package sets for itself.
+2. **It is a class with constructor-injected collaborators**, not a free function closing over
+   module-scope `redis`/`streamName`/`groupName`/`originalPayload`/`lastError`/`retryCount`.
+   None of those exist in this repository's shape, and `originalPayload` has no referent — the
+   handler seam is `(id: string, fields: string[])`, so "the original payload" is the flat field
+   list.
+3. **No Prometheus counter** — see above.
+4. **"Clear from PEL so it doesn't block the consumer" is false as stated.** A pending entry
+   blocks nothing: `>` delivers only entries never handed to any consumer, measured on 7.0.15.
+   What a stuck entry actually costs is a permanent PEL row and a recovery page on every start.
+   The `XACK` is right; the reason given for it is not.
+5. **The record carries `groupName` and the full field list.** The field list is decision C and
+   rests on a measurement: a pending entry's payload can be evicted by `MAXLEN` while its id
+   stays pending, so a record holding only `originalId` is unreplayable.
 
 ---
 

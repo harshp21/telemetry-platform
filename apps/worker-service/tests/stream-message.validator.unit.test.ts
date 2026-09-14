@@ -69,6 +69,63 @@ const OCCURRED_AT_OFFSET_NEGATIVE = "2025-12-31T19:00:00.000-05:00";
  */
 const EPIC_METRIC_KEY_FORM = `${EVENT_TYPE}.${UNIT}`;
 
+/**
+ * Sentinel strings for `U60`, the S-31 negative.
+ *
+ * The point of a sentinel is that it can appear in the thrown message by exactly one route --
+ * the parser copying a *value* into it -- so its absence is evidence rather than luck. Each is
+ * distinctive enough that a substring search cannot match it by accident, and they are seeded
+ * into the envelope fields a customer controls plus one metadata **key** and its value.
+ *
+ * The metadata key is not decoration. Measured on this schema (plan §4 F9, re-measured at
+ * Gate 3 against the real `envelopeSchema` rather than a copy): making the schema `.strict()`
+ * produces an `unrecognized_keys` issue carrying the offending key in `issue.keys` and in
+ * `issue.message`. The parser projects each issue to `code` and `path` only, and an
+ * `unrecognized_keys` issue's `path` is empty, so no key reaches the message -- but that is a
+ * property of the projection, and `U60` is what holds it there.
+ */
+const SENTINEL = {
+  EVENT_ID: "SENTINEL-EVENT-ID-8f2a",
+  TENANT_ID: "SENTINEL-TENANT-ID-4b7c",
+  QUANTITY: "SENTINEL-QUANTITY-1d9e",
+  IDEMPOTENCY_KEY: "SENTINEL-IDEMPOTENCY-6c3f",
+  OCCURRED_AT: "SENTINEL-OCCURRED-AT-2e5b",
+  METADATA_KEY: "SENTINEL-META-KEY-7a1d",
+  METADATA_VALUE: "SENTINEL-META-VALUE-0b4c"
+} as const;
+
+/**
+ * Zod issue codes this parser's failures produce, as **observed** on zod 3.25.76.
+ *
+ * Written out rather than imported from zod, for the reason the neighbouring suite gives about
+ * observed Redis reply texts: these are the library's vocabulary and the thing under test is
+ * that the parser surfaces them. Sourcing them from the same expression the implementation
+ * evaluates would make `U59` hold whatever either said.
+ */
+const ZOD_ISSUE_CODE = {
+  /** A field that is absent entirely. */
+  INVALID_TYPE: "invalid_type",
+  /** A present field that fails `.uuid()`, `.regex(...)` or `.datetime(...)`. */
+  INVALID_STRING: "invalid_string"
+} as const;
+
+/** Captures the message of whatever `parseStreamMessage` throws, or fails loudly. */
+const messageThrownBy = (fields: string[]): string => {
+  try {
+    parseStreamMessage(fields);
+  } catch (error) {
+    if (!(error instanceof Error)) {
+      throw new Error(`parseStreamMessage threw a non-Error: ${String(error)}`, {
+        cause: error
+      });
+    }
+
+    return error.message;
+  }
+
+  throw new Error("parseStreamMessage did not throw, so there is no message to inspect");
+};
+
 /** Flattened metadata: sibling top-level fields, every value a string after `XADD`. */
 const METADATA_FIELD = {
   SOURCE_ID: "sourceId",
@@ -284,5 +341,97 @@ describe("parseStreamMessage", () => {
     expect(() => parseStreamMessage([])).toThrowError(
       WORKER_EVENT_PROCESSING.ERROR.INVALID_MESSAGE
     );
+  });
+
+  it("U59 - names every broken field by zod code and path, and the odd list by its length", () => {
+    // One absent field. `invalid_type` is what zod reports for a missing key, and the path is
+    // the field name — which is the whole diagnostic value: before T-041 the operator saw
+    // "Stream entry is not a valid usage event" and nothing else.
+    const missingEventId = messageThrownBy(
+      envelopeFieldsWithout(WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.EVENT_ID)
+    );
+    expect(missingEventId).toContain(WORKER_EVENT_PROCESSING.ERROR.INVALID_MESSAGE);
+    expect(missingEventId).toContain(ZOD_ISSUE_CODE.INVALID_TYPE);
+    expect(missingEventId).toContain(WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.EVENT_ID);
+
+    // A present field that fails its refinement reports a different code, so the two failure
+    // kinds are distinguishable from the message alone.
+    const badTenant = messageThrownBy(
+      envelopeFields({ [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.TENANT_ID]: "not-a-uuid" })
+    );
+    expect(badTenant).toContain(ZOD_ISSUE_CODE.INVALID_STRING);
+    expect(badTenant).toContain(WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.TENANT_ID);
+    // ...and does *not* name a field that was fine. Without this half the case would pass for
+    // an implementation that appended every declared field name unconditionally.
+    expect(badTenant).not.toContain(WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.UNIT);
+
+    // Every broken field, not just the first: an operator fixing one field at a time from a
+    // one-field message pays a redeploy per field.
+    const severalBroken = messageThrownBy(
+      envelopeFields({
+        [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.TENANT_ID]: "not-a-uuid",
+        [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.QUANTITY]: "not-a-number",
+        [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.OCCURRED_AT]: "yesterday"
+      })
+    );
+    for (const field of [
+      WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.TENANT_ID,
+      WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.QUANTITY,
+      WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.OCCURRED_AT
+    ]) {
+      expect(severalBroken, field).toContain(field);
+    }
+
+    // The framing failure gets a **count**, not a value. The list is customer data; its length
+    // is not, and the length is what tells an operator whether a key or a value went missing.
+    const oddFields = [...envelopeFields(), METADATA_FIELD.SOURCE_ID];
+    const oddMessage = messageThrownBy(oddFields);
+    expect(oddMessage).toContain(WORKER_EVENT_PROCESSING.ERROR.ODD_FIELD_LIST);
+    expect(oddMessage).toContain(String(oddFields.length));
+
+    // `U42` asserts the base texts with `toThrowError(<string>)`, which is a **substring**
+    // match on vitest 2.1.9 — re-measured rather than taken from the docs, by the probe in the
+    // plan's Appendix A and by `U42` itself still passing beside this case. That is what lets
+    // the detail ride on the same message without splitting the contract in two.
+    expect(missingEventId.startsWith(WORKER_EVENT_PROCESSING.ERROR.INVALID_MESSAGE)).toBe(true);
+    expect(oddMessage.startsWith(WORKER_EVENT_PROCESSING.ERROR.ODD_FIELD_LIST)).toBe(true);
+  });
+
+  it("U60 - no field value and no metadata key reaches the thrown message (S-31)", () => {
+    // Every customer-controlled field carries a sentinel, and every one of them is invalid, so
+    // each produces an issue. A parser that put the offending *value* in the message — the
+    // obvious way to make a diagnostic helpful — puts customer data into a log line in a
+    // service with no redaction layer.
+    const fields = envelopeFields({
+      [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.EVENT_ID]: SENTINEL.EVENT_ID,
+      [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.TENANT_ID]: SENTINEL.TENANT_ID,
+      [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.QUANTITY]: SENTINEL.QUANTITY,
+      [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.IDEMPOTENCY_KEY]: SENTINEL.IDEMPOTENCY_KEY,
+      [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.OCCURRED_AT]: SENTINEL.OCCURRED_AT,
+      // A metadata key *and* value the customer chose. The key matters separately from the
+      // value: zod's `unrecognized_keys` issue carries a key in `issue.keys` and in
+      // `issue.message`, so a projection that included either would leak it.
+      [SENTINEL.METADATA_KEY]: SENTINEL.METADATA_VALUE
+    });
+
+    const message = messageThrownBy(fields);
+
+    for (const sentinel of Object.values(SENTINEL)) {
+      expect(message, sentinel).not.toContain(sentinel);
+    }
+
+    // Not a vacuous pass: the message did carry the diagnosis it is supposed to carry, so the
+    // absences above are about *what* was included rather than about nothing being included.
+    expect(message).toContain(WORKER_EVENT_PROCESSING.ERROR.INVALID_MESSAGE);
+    expect(message).toContain(WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.EVENT_ID);
+    expect(message).toContain(WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.TENANT_ID);
+
+    // And the odd-length branch, which has no zod issues to project and so takes its own
+    // path through the same rule.
+    const oddMessage = messageThrownBy([...fields, SENTINEL.METADATA_KEY]);
+    for (const sentinel of Object.values(SENTINEL)) {
+      expect(oddMessage, sentinel).not.toContain(sentinel);
+    }
+    expect(oddMessage).toContain(WORKER_EVENT_PROCESSING.ERROR.ODD_FIELD_LIST);
   });
 });

@@ -20,10 +20,13 @@ import {
   INTEGRATION_LOOP_COMMANDS,
   INTEGRATION_LOOP_FIXTURE,
   INTEGRATION_LOOP_REDIS,
+  INTEGRATION_DEAD_LETTER,
+  INTEGRATION_REDELIVERY_MIN_COUNT,
   INTEGRATION_REDIS,
   INTEGRATION_REDIS_COMMANDS,
   INTEGRATION_REDIS_URL_FALLBACK,
-  INTEGRATION_XINFO_FIELDS
+  INTEGRATION_XINFO_FIELDS,
+  INTEGRATION_XPENDING_DELIVERY_COUNT_INDEX
 } from "./integration.constants";
 
 /**
@@ -603,6 +606,50 @@ const hasParkedRead = async (): Promise<boolean> => {
 };
 
 /** Sleeps, so seeded entries age past the reclaim threshold. */
+/**
+ * `XPENDING <key> <group> - + <count>`, keeping the **delivery count** column.
+ *
+ * `readPendingIds` above discards it; `I23` is the one case whose subject is that the count
+ * went up, so it needs the whole row. Throws on any reply it does not recognise, for the reason
+ * that helper's docstring gives: an empty result is an assertion several cases make, so a parse
+ * failure that produced one would pass vacuously.
+ */
+const readPendingDeliveryCounts = async (
+  streamName: string,
+  groupName: string,
+  count: number
+): Promise<Map<string, number>> => {
+  const reply: unknown = await redis.xpending(
+    streamName,
+    groupName,
+    INTEGRATION_LOOP_COMMANDS.XPENDING_MIN_ID,
+    INTEGRATION_LOOP_COMMANDS.XPENDING_MAX_ID,
+    count
+  );
+  if (!isUnknownArray(reply)) {
+    throw new Error(`XPENDING returned a non-array reply for ${streamName}`);
+  }
+
+  const counts = new Map<string, number>();
+  for (const row of reply) {
+    if (!isUnknownArray(row)) {
+      throw new Error(`XPENDING row was not an array for ${streamName}`);
+    }
+
+    const id = row[INTEGRATION_COUNTS.NONE];
+    const delivered = row[INTEGRATION_XPENDING_DELIVERY_COUNT_INDEX];
+    if (typeof id !== "string" || typeof delivered !== "number") {
+      throw new Error(
+        `XPENDING row was not [id, consumer, idle, deliveries] for ${streamName}`
+      );
+    }
+
+    counts.set(id, delivered);
+  }
+
+  return counts;
+};
+
 const settle = (ms: number): Promise<void> =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -753,7 +800,27 @@ describe("StreamConsumer.run (live Redis)", () => {
     // 5 entries at `COUNT 2` — three `XAUTOCLAIM` rounds. A single call, which is what the
     // epic's wording implies, reclaims the first two and strands the rest until the next
     // restart. The whole set, in stream order, is the assertion that catches it.
-    expect(harness.handled).toEqual(abandonedIds);
+    //
+    // **Edited at T-041, deliberately, and not to make a red test pass.** This read
+    // `expect(harness.handled).toEqual(abandonedIds)` — five ids, in order, *and nothing else*.
+    // The last clause stopped being true: T-041 gives `runLoop` a reclaim cadence, so an entry
+    // that is reclaimed and never acknowledged is re-offered roughly every
+    // `blockMs x RECOVERY_IDLE_MULTIPLIER`, and this harness's handler is a bare recorder that
+    // acknowledges nothing. Observed here: `handled` came back as the five ids followed by the
+    // first page's two again, because one read of `BLOCK_MS_SHORT` was enough for the cadence
+    // to elapse. That repeat is the new behaviour working, not a defect, and `U70`/`I23` are
+    // what assert it on purpose.
+    //
+    // The pagination claim this case exists for is untouched and is asserted at full strength:
+    // all five ids, in stream order, from **one** recovery pass. A single-call recovery would
+    // put two ids in that slice and fail exactly as before.
+    expect(harness.handled.slice(0, INTEGRATION_LOOP.ABANDONED_ENTRY_COUNT)).toEqual(
+      abandonedIds
+    );
+    // And the half of the old assertion that *is* still true, kept rather than dropped: no id
+    // outside the abandoned set ever reached the handler. Without this, the slice above would
+    // tolerate an unrelated entry arriving after the fifth.
+    expect(new Set(harness.handled)).toEqual(new Set(abandonedIds));
     expect(INTEGRATION_LOOP.ABANDONED_ENTRY_COUNT).toBeGreaterThan(
       INTEGRATION_LOOP.BATCH_SIZE_SMALL
     );
@@ -844,5 +911,56 @@ describe("StreamConsumer.run (live Redis)", () => {
     expect(elapsed).toBeLessThan(INTEGRATION_LOOP.STOP_BUDGET_MS);
     expect(INTEGRATION_LOOP.STOP_BUDGET_MS).toBeLessThan(INTEGRATION_LOOP.BLOCK_MS_LONG);
     expect(handled).toEqual([]);
+  });
+
+  it("I23 - re-offers a failed entry inside one run(), with no restart (T-041)", async () => {
+    const { streamName, groupName } = nextLoopFixtureNames();
+    const seen: string[] = [];
+    const deadline = Date.now() + INTEGRATION_LOOP.RUN_DEADLINE_MS;
+    const consumer = buildLoopConsumer({
+      streamName,
+      groupName,
+      // Never acknowledges and always fails -- the state T-040 leaves a poison message in. The
+      // rejection reaches `dispatch`, which logs it and continues without acknowledging.
+      handler: (id: string): Promise<void> => {
+        seen.push(id);
+
+        return Promise.reject(new Error(INTEGRATION_DEAD_LETTER.VALUE_POISON));
+      },
+      isShuttingDown: (): boolean =>
+        seen.length >= INTEGRATION_REDELIVERY_MIN_COUNT || Date.now() >= deadline
+    });
+    await consumer.ensureConsumerGroup();
+    const entryId = await addLoopEntry(streamName, INTEGRATION_DEAD_LETTER.VALUE_RETRIED);
+
+    await consumer.run();
+
+    // **The claim, and the finding it closes.** Until T-041, `recoverPendingEntries` had one
+    // call site, before the read loop, and its own docstring said "once, at startup" -- so a
+    // failed entry's second delivery required a `run()` to begin, i.e. a restart. `dispatch`'s
+    // docstring nonetheless said the entry "comes back through `recoverPendingEntries` after
+    // the idle threshold". This case is what makes that sentence true.
+    expect(seen.filter((id) => id === entryId).length).toBeGreaterThanOrEqual(
+      INTEGRATION_REDELIVERY_MIN_COUNT
+    );
+
+    // The mechanism, from the server's own bookkeeping rather than from the handler's count:
+    // Redis increments a per-entry delivery counter, and `>` provably does not redeliver
+    // (measured on 7.0.15 -- a second `XREADGROUP ... >` returned empty while `XPENDING` still
+    // reported the entry). So a count above one can only have come through the pending list.
+    const counts = await readPendingDeliveryCounts(
+      streamName,
+      groupName,
+      INTEGRATION_COUNTS.PAIR
+    );
+    expect(counts.get(entryId)).toBeGreaterThanOrEqual(INTEGRATION_REDELIVERY_MIN_COUNT);
+
+    // Still pending and still on the stream: this loop has no retry policy wrapped around it,
+    // so nothing acknowledged the entry and nothing was dropped. The dead-letter half is
+    // `I26`'s, in the suite that has a processor.
+    expect(await readPendingIds(streamName, groupName, INTEGRATION_COUNTS.PAIR)).toEqual([
+      entryId
+    ]);
+    expect(await redis.xlen(streamName)).toBe(INTEGRATION_COUNTS.SINGLE);
   });
 });

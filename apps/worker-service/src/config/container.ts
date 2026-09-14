@@ -10,6 +10,11 @@ import {
   EventProcessorService,
   type EventRepositoryFactory
 } from "../services/event-processor.service";
+import { DeadLetterService } from "../services/dead-letter.service";
+// Type-only, so nothing from `src/events/**` is loaded here. `src/index.ts` dynamically imports
+// `./events/stream.consumer` *after* `initTracing(...)` on purpose; a value import at this depth
+// would pull that module into the graph ahead of it.
+import type { StreamMessageHandler } from "../events/stream.consumer";
 
 export interface AppContainer {
   readonly serviceName: string;
@@ -26,6 +31,26 @@ export interface AppContainer {
    */
   readonly eventRepositoryFactory: EventRepositoryFactory;
   readonly eventProcessor: EventProcessorService;
+  /**
+   * Retry accounting and the dead-letter write (T-041).
+   *
+   * A singleton, and correctly so, unlike `eventRepositoryFactory` above: it binds no tenant.
+   * Its state is one stream name and one retry budget, both from the parsed environment, and
+   * the counter it maintains is keyed by Redis entry id on a stream that is cross-tenant by
+   * design. There is nothing here for a shared instance to pin.
+   */
+  readonly deadLetterService: DeadLetterService;
+  /**
+   * The handler `src/index.ts` hands `StreamConsumer` -- the processor's, wrapped in the retry
+   * policy.
+   *
+   * Composed **here** rather than in `index.ts` so that the entrypoint stays a wiring file with
+   * no policy in it, and so that the composition is assertable without booting a worker. `U69`
+   * is what stops it being bypassed: an `index.ts` that passed
+   * `container.eventProcessor.buildHandler()` instead would leave every `DeadLetterService`
+   * unit case green and the feature connected to nothing.
+   */
+  readonly messageHandler: StreamMessageHandler;
 }
 
 export const createContainer = (
@@ -63,6 +88,18 @@ export const createContainer = (
     eventRepositoryFactory
   );
 
+  // Handed `redisClient` for the same reason the processor is: `StreamConsumer.run()` parks a
+  // private `duplicate()` on a blocking `XREADGROUP`, and a command queued behind that read
+  // waits it out (an unrelated `PING` during a `BLOCK 2000` came back after 2 080 ms -- T-039's
+  // measurement, inherited and not re-run here). The retry pre-check runs on *every* delivered
+  // entry, so putting it on the loop's connection would add a block window to the happy path.
+  const deadLetterService = new DeadLetterService(redisClient, containerLogger, env);
+  // The order of composition is the contract: the retry policy is on the **outside**, so it
+  // sees the processor's failure and can decide whether to rethrow it or end it. Wrapping the
+  // other way round is not expressible -- `wrap` takes the inner handler and returns the outer
+  // one -- which is the point of the decorator shape (decision A).
+  const messageHandler = deadLetterService.wrap(eventProcessor.buildHandler());
+
   return {
     serviceName,
     env,
@@ -70,6 +107,8 @@ export const createContainer = (
     prisma,
     redis: redisClient,
     eventRepositoryFactory,
-    eventProcessor
+    eventProcessor,
+    deadLetterService,
+    messageHandler
   };
 };

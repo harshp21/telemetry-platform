@@ -2,6 +2,7 @@ import type Redis from "ioredis";
 import type { Logger } from "pino";
 import type { ServiceEnv } from "../config/env";
 import { WORKER_CONSUMER_GROUP_BOOTSTRAP, WORKER_STREAM_READ } from "../constants";
+import { describeError } from "../utils/describe-error";
 
 /**
  * What the loop does with one delivered entry.
@@ -186,10 +187,6 @@ const buildDefaultMessageHandler =
     return Promise.resolve();
   };
 
-/** `error.message` for an `Error`, `String(error)` otherwise. */
-const describeError = (error: unknown): string =>
-  error instanceof Error ? error.message : String(error);
-
 /**
  * StreamConsumer: owns worker-service's side of the `telemetry:events` Redis stream.
  *
@@ -271,8 +268,14 @@ export class StreamConsumer {
     // never be taken on the production path -- `index.ts:74` passes `container.env`, and
     // `container.env` is only ever the output of `parseEnv`.
     //
-    // Measured, not assumed. Against the real schemas
-    // (`EnvSchema.shape.<field>.safeParse("")`, zod 3.25.76):
+    // Measured, not assumed. Against the real schemas, zod 3.25.76.
+    //
+    // Note the recipe differs per service since T-041: worker's `EnvSchema` is now
+    // `z.object({...}).superRefine(...)`, i.e. a `ZodEffects`, which has **no `.shape`**
+    // (measured: `"shape" in EnvSchema` -> false). Use
+    // `EnvSchema.innerType().shape.<field>.safeParse("")` for worker -- measured to give the
+    // identical result -- and `EnvSchema.shape.<field>.safeParse("")` for usage-service, whose
+    // schema is still a plain object:
     //   worker REDIS_STREAM_NAME    ""  -> THROWS "String must contain at least 1 character(s)"
     //   worker REDIS_CONSUMER_GROUP ""  -> THROWS "String must contain at least 1 character(s)"
     //   usage  REDIS_STREAM_NAME    ""  -> OK, parses to ""
@@ -404,13 +407,32 @@ export class StreamConsumer {
    * worker, then read batches until told to stop. Every entry — reclaimed or freshly
    * delivered — goes through the same handler, and nothing is acknowledged here.
    *
+   * **Recovery runs on a cadence, not only at startup** (T-041). After each un-interrupted
+   * read, a reclaim pass is issued if `blockMs x RECOVERY_IDLE_MULTIPLIER` has elapsed since
+   * the last one. That is the same expression as `XAUTOCLAIM`'s own `min-idle` argument and
+   * deliberately not a second setting: reclaiming more often than the idle threshold would find
+   * nothing, and a second knob would be one more thing to keep in step with the first.
+   *
+   * The cadence is what gives retry accounting anything to count. Measured: `XREADGROUP ... >`
+   * does **not** redeliver an unacknowledged entry — a second read of the same group returned
+   * empty while `XPENDING` still reported 1 — so before this, an entry's second delivery
+   * required a `run()` to begin, i.e. a restart. `U70` pins the second pass, `U71` pins that it
+   * is not every iteration, and `I23` pins it against live Redis.
+   *
+   * **What is not claimed:** that this bounds redelivery latency. The check happens after a
+   * read that may block for `STREAM_BLOCK_MS`, so observed spacing is the threshold *plus* up
+   * to one block — 10–15 s per cycle at the shipped defaults.
+   *
    * **The shutdown predicate is read once per read iteration**, before the iteration rather
    * than between the entries of a batch, which is T-043's "exits after current batch". A
    * mid-batch check would abandon entries already delivered to this consumer; they would not
    * be lost (nothing is acknowledged) but they would wait out an idle timeout for no reason.
    *
    * The real sequence, stated precisely because an earlier revision glossed it (Round 1,
-   * L-7): guard -> `recoverPendingEntries` -> first read -> `do`/`while` condition. Recovery
+   * L-7): guard -> `recoverPendingEntries` -> first read -> cadence check -> `do`/`while`
+   * condition. The cadence check is T-041's and is the only step added to that list; it issues
+   * no round trip until an interval has elapsed, and the predicate is still read exactly once
+   * per iteration, at the bottom. The *startup* recovery
    * sits *between* the guard and the first read and is unbounded in wall-clock time, so the
    * guard does not gate the first read in the way the old wording implied — it gates
    * *recovery*. A predicate that flips during recovery ends the pagination at the next page
@@ -438,13 +460,27 @@ export class StreamConsumer {
     const readConnection = this.redis.duplicate();
     this.readConnection = readConnection;
 
+    // Derived, not configured. The same product `recoverPendingEntries` passes as `min-idle`,
+    // computed once here so the two cannot drift within a single loop.
+    const recoveryCadenceMs = this.blockMs * WORKER_STREAM_READ.RECOVERY_IDLE_MULTIPLIER;
+
     try {
       await this.recoverPendingEntries(readConnection);
+      // Seeded from the startup pass rather than from the loop's start, so the first cadence
+      // pass is one full interval after the last reclaim and not after an arbitrary earlier
+      // instant. A `let` local rather than an instance field: it belongs to one `run()`, and a
+      // field would carry the last loop's timestamp into the next one.
+      let lastRecoveryAt = Date.now();
 
       do {
         const interrupted = await this.readBatch(readConnection);
         if (interrupted) {
           break;
+        }
+
+        if (Date.now() - lastRecoveryAt >= recoveryCadenceMs) {
+          await this.recoverPendingEntries(readConnection);
+          lastRecoveryAt = Date.now();
         }
       } while (!this.shouldStop());
     } finally {
@@ -603,11 +639,18 @@ export class StreamConsumer {
   }
 
   /**
-   * Reclaims entries a previous worker took and never acknowledged, once, at startup.
+   * Reclaims entries that were delivered and never acknowledged — at startup, and then on a
+   * cadence for as long as the loop runs.
+   *
+   * **This docstring said "once, at startup" until T-041, and that is no longer true.** It had
+   * one call site, before the `do`/`while`; it now has two, and `runLoop` issues the second
+   * every `blockMs x RECOVERY_IDLE_MULTIPLIER`. The change is what makes a *retry* possible
+   * without a restart, because `XREADGROUP ... >` does not redeliver an unacknowledged entry.
    *
    * Paginated, which the epic's one-line "re-claim them with `XAUTOCLAIM`" omits: the command
    * returns a cursor, and a single call leaves everything past the first `COUNT` stranded
-   * until the next restart. Measured — 5 pending entries at `COUNT 2` needed three rounds
+   * until the next pass — which was "the next restart" before T-041's cadence and is now one
+   * cadence window. Measured — 5 pending entries at `COUNT 2` needed three rounds
    * (2 + 2 + 1) before the cursor came back `0-0`.
    *
    * The idle threshold is `STREAM_BLOCK_MS x RECOVERY_IDLE_MULTIPLIER`, so an entry a *live*
@@ -615,11 +658,22 @@ export class StreamConsumer {
    *
    * **Best effort.** A failure is logged and swallowed: a worker that refuses to start
    * because it could not reclaim old work is strictly worse than one that starts and reclaims
-   * on the next restart, and the entries stay in the pending list regardless.
+   * on the next pass, and the entries stay in the pending list regardless. That "next pass" is
+   * now one cadence window rather than the next restart, which makes the stance cheaper than it
+   * was — but see `WORKER_STREAM_READ.RECOVERY_MAX_PAGES` for the other side of that: a failure
+   * that persists now logs on every pass.
    *
-   * Periodic reclaim — as opposed to this startup pass — is not specified by the epic and is
-   * not done here, so work abandoned by a worker that dies *while this one is running* waits
-   * for the next restart.
+   * Two consequences of the cadence, both worth stating because the startup-only version had
+   * neither. Work abandoned by a worker that dies *while this one is running* is now picked up
+   * without waiting for a restart — which is the epic's motivation for `XAUTOCLAIM` in the
+   * first place. And peer-stealing becomes a steady-state possibility rather than a
+   * startup-only one: the idle threshold still guards it, so an entry is taken only after
+   * `blockMs x RECOVERY_IDLE_MULTIPLIER` of no activity on it, and T-040's
+   * `@@unique([tenantId, idempotencyKey])` upsert makes a double-process idempotent at the
+   * database (`I14`). What that does **not** make harmless is the accounting: two workers
+   * failing the same entry can each increment its counter, so one logical failure can spend two
+   * of the retry budget. That is reasoned rather than measured — no test here runs two live
+   * workers — and is recorded as such.
    */
   private async recoverPendingEntries(readConnection: Redis): Promise<void> {
     const minIdleMs = this.blockMs * WORKER_STREAM_READ.RECOVERY_IDLE_MULTIPLIER;
@@ -657,10 +711,28 @@ export class StreamConsumer {
         // batch size — after being told to stop. It does not delay shutdown (`index.ts` never
         // awaits `run()`), it is just work nobody asked for. `U36` pins it.
         //
-        // Between pages rather than at the top of the loop, deliberately: `run()` checks
-        // immediately before calling this, so a check before the first page would be the same
-        // check twice, and one page of recovery is bounded work. The guard belongs where it
-        // prevents a round trip.
+        // Between pages rather than at the top of this method, and the justification changed at
+        // T-041. It used to be "`run()` checks immediately before calling this, so a check
+        // before the first page would be the same check twice". That is still true of the
+        // **startup** call site, which directly follows `runLoop`'s own guard — and false of the
+        // **cadence** call site, where the most recent check is the previous iteration's
+        // `while (!this.shouldStop())`, separated by a `readBatch` that may block for
+        // `STREAM_BLOCK_MS`. On that path this guard is the *first* check the pass makes, not a
+        // duplicate of one.
+        //
+        // Kept between pages rather than promoted to the top of the method, deliberately, and
+        // the exposure is bounded: `isShutdownInterrupt` is keyed on `stopRequested`, and
+        // `src/index.ts` sets the shutdown flag and then `await`s `stop()` with only a
+        // synchronous log between them — so in practice `stop()` disconnects the read
+        // connection, `readBatch` returns interrupted, and the loop breaks before the cadence
+        // check is reached. The worst case is one unnecessary `XAUTOCLAIM` page in a narrow
+        // window, which this guard then ends.
+        //
+        // A top-of-method guard was considered and declined for a test-harness reason worth
+        // recording rather than hiding: `stopAfter(n)` in `tests/stream.consumer.unit.test.ts`
+        // counts predicate *checks*, so an extra check per recovery pass shifts every case that
+        // uses it — a suite-wide change bought for a one-page exposure the guard below already
+        // catches.
         if (this.shouldStop()) {
           this.logger.info(
             {
@@ -741,7 +813,20 @@ export class StreamConsumer {
    * treating it as one would abandon the rest of the batch and pause the loop for
    * `ERROR_BACKOFF_MS`. Nothing is acknowledged here, so a failed entry stays in the pending
    * list and comes back through `recoverPendingEntries` after the idle threshold; that is the
-   * epic's "on failure, leave in PEL", and retry accounting for it is T-041's.
+   * epic's "on failure, leave in PEL".
+   *
+   * **That sentence was false when it was written and is true now.** It described continuous,
+   * idle-threshold-driven redelivery, while `recoverPendingEntries` had a single call site
+   * before the read loop and its own docstring said "once, at startup" — so on the shipped code
+   * a failed entry came back only on a restart. T-041's cadence in `runLoop` is what makes the
+   * claim hold; `U70` and `I23` are what hold it there.
+   *
+   * Retry accounting is **not** here and deliberately so (T-041, decision A). It lives in
+   * `DeadLetterService`, which wraps the handler from outside, so this method keeps its
+   * "nothing is acknowledged here" contract: a retryable failure is still rethrown into this
+   * `catch` and still logged against its entry id. The one behaviour change visible from here
+   * is that a *terminal* failure no longer reaches this `catch` at all — the wrapper has
+   * already recorded the entry to the dead-letter stream and acknowledged it, and it resolves.
    */
   private async dispatch(parsed: ParsedEntries): Promise<void> {
     if (parsed.malformed > 0) {

@@ -6,12 +6,18 @@ import { PrismaClient } from "@prisma/client";
 import type { Logger } from "pino";
 import type { TenantId } from "@telemetry/shared-types";
 import type { ServiceEnv } from "../src/config/env";
-import { WORKER_EVENT_PROCESSING, WORKER_STREAM_READ } from "../src/constants";
+import {
+  WORKER_DEAD_LETTER,
+  WORKER_EVENT_PROCESSING,
+  WORKER_STREAM_READ
+} from "../src/constants";
 import { EventRepository } from "../src/repositories/event.repository";
 import { EventProcessorService } from "../src/services/event-processor.service";
+import { DeadLetterService } from "../src/services/dead-letter.service";
 import { StreamConsumer, type StreamMessageHandler } from "../src/events/stream.consumer";
 import { parseStreamMessage } from "../src/validators/stream-message.validator";
 import {
+  INTEGRATION_DEAD_LETTER,
   INTEGRATION_LOOP,
   INTEGRATION_LOOP_COMMANDS,
   INTEGRATION_PROCESSOR_COUNTS,
@@ -134,6 +140,28 @@ const nextFixtureNames = (): { streamName: string; groupName: string } => {
   return {
     streamName: `${INTEGRATION_PROCESSOR_REDIS.STREAM_NAME_PREFIX}${RUN_ID}-${caseIndex}`,
     groupName: `${INTEGRATION_PROCESSOR_REDIS.CONSUMER_GROUP_PREFIX}${RUN_ID}-${caseIndex}`
+  };
+};
+
+/**
+ * A stream, group and **dead-letter stream** unique to one T-041 case.
+ *
+ * Never the shipped `telemetry:dead-letter` default: on a developer's machine that name means
+ * "real usage events were dropped from the billing path", and a suite writing there would leave
+ * records an operator could mistake for the real thing. Database 14 only, and the guarded
+ * `FLUSHDB` collects them either way.
+ */
+const nextDeadLetterFixtureNames = (): {
+  streamName: string;
+  groupName: string;
+  deadLetterStream: string;
+} => {
+  caseIndex += INTEGRATION_PROCESSOR_COUNTS.SINGLE;
+
+  return {
+    streamName: `${INTEGRATION_DEAD_LETTER.STREAM_NAME_PREFIX}${RUN_ID}-${caseIndex}`,
+    groupName: `${INTEGRATION_DEAD_LETTER.CONSUMER_GROUP_PREFIX}${RUN_ID}-${caseIndex}`,
+    deadLetterStream: `${INTEGRATION_DEAD_LETTER.DEAD_LETTER_STREAM_PREFIX}${RUN_ID}-${caseIndex}`
   };
 };
 
@@ -526,14 +554,27 @@ describe("EventProcessorService through the consumer loop (live Postgres + Redis
   const runLoopOver = async (
     streamName: string,
     groupName: string,
-    expected: number
+    expected: number,
+    // T-041. When given, the processor's handler is wrapped in a real `DeadLetterService`
+    // exactly as `createContainer` wraps it -- same composition order, same connection. Absent,
+    // the loop runs the raw processor handler, so `I13`-`I22` are unchanged.
+    deadLetterStream?: string
   ): Promise<{ seen: string[]; logger: Partial<Record<keyof Logger, ReturnType<typeof vi.fn>>> }> => {
     const env = {
       REDIS_STREAM_NAME: streamName,
       REDIS_CONSUMER_GROUP: groupName,
       REDIS_CONSUMER_NAME: INTEGRATION_PROCESSOR_REDIS.CONSUMER_NAME,
       STREAM_BLOCK_MS: INTEGRATION_LOOP.BLOCK_MS_SHORT,
-      STREAM_BATCH_SIZE: INTEGRATION_LOOP.BATCH_SIZE_SMALL
+      STREAM_BATCH_SIZE: INTEGRATION_LOOP.BATCH_SIZE_SMALL,
+      MAX_RETRY_COUNT: INTEGRATION_DEAD_LETTER.MAX_RETRY_COUNT,
+      // Spread rather than `deadLetterStream ?? ""`. The empty string is a value the shipped
+      // schema **rejects** (`.min(1)`, and it would also fail the collision refinement against
+      // nothing), and this object reaches `DeadLetterService` through an `as ServiceEnv` cast
+      // that bypasses parsing entirely. It was unreachable -- the `undefined` branch is the only
+      // one that produced it, and that branch constructs no `DeadLetterService` -- but writing
+      // down a value the contract forbids, a few lines from the case that proves it forbidden,
+      // is how a fixture teaches the wrong thing. Now no rejected value is ever constructed.
+      ...(deadLetterStream === undefined ? {} : { DEAD_LETTER_STREAM: deadLetterStream })
     } as ServiceEnv;
 
     const processorRedis = new RedisClient(reservedDbUrl, {
@@ -553,7 +594,15 @@ describe("EventProcessorService through the consumer loop (live Postgres + Redis
     );
 
     const seen: string[] = [];
-    const inner = processor.buildHandler();
+    const processorHandler = processor.buildHandler();
+    // Composed in the same order `createContainer` composes it: the retry policy on the
+    // **outside**, so it sees the processor's failure and decides whether to rethrow it.
+    const inner =
+      deadLetterStream === undefined
+        ? processorHandler
+        : new DeadLetterService(processorRedis, logger as unknown as Logger, env).wrap(
+            processorHandler
+          );
     const countingHandler: StreamMessageHandler = async (id, fields) => {
       try {
         await inner(id, fields);
@@ -687,5 +736,259 @@ describe("EventProcessorService through the consumer loop (live Postgres + Redis
       // rule flagged.
       WORKER_STREAM_READ.LOG.HANDLER_FAILED
     );
+  });
+
+  /** The retry hash the service keeps for one stream: `retries:<streamName>`. */
+  const retryKeyFor = (streamName: string): string =>
+    `${WORKER_DEAD_LETTER.RETRY_KEY_PREFIX}${streamName}`;
+
+  /** The dead-letter stream's records, each folded from its flat field list. Throws on a bad shape. */
+  const readDeadLetterRecords = async (
+    deadLetterStream: string
+  ): Promise<Array<Record<string, string>>> => {
+    const entries = await redis.xrange(
+      deadLetterStream,
+      INTEGRATION_LOOP_COMMANDS.XPENDING_MIN_ID,
+      INTEGRATION_LOOP_COMMANDS.XPENDING_MAX_ID
+    );
+
+    return entries.map(([, flat]) => {
+      if (flat.length % WORKER_EVENT_PROCESSING.FIELD_PAIR_STRIDE !== 0) {
+        throw new Error(`dead-letter entry in ${deadLetterStream} had an odd field list`);
+      }
+
+      const record: Record<string, string> = {};
+      for (
+        let index = INTEGRATION_PROCESSOR_INDEX_FIRST;
+        index < flat.length;
+        index += WORKER_EVENT_PROCESSING.FIELD_PAIR_STRIDE
+      ) {
+        const key = flat[index];
+        const value = flat[index + WORKER_EVENT_PROCESSING.FIELD_VALUE_OFFSET];
+        if (key === undefined || value === undefined) {
+          throw new Error(`dead-letter entry in ${deadLetterStream} had a dangling field`);
+        }
+
+        record[key] = value;
+      }
+
+      return record;
+    });
+  };
+
+  /**
+   * A group created before any entry is added, which `$` requires (the property `I5` pins).
+   *
+   * Built on the suite's own connection with an inert predicate: it never calls `run()`.
+   */
+  const bootstrapGroup = async (streamName: string, groupName: string): Promise<void> => {
+    await new StreamConsumer(
+      redis,
+      silentLogger,
+      { REDIS_STREAM_NAME: streamName, REDIS_CONSUMER_GROUP: groupName } as ServiceEnv,
+      () => false
+    ).ensureConsumerGroup();
+  };
+
+  it("I24 - a failure increments the retry counter and leaves the entry pending (T-041)", async () => {
+    const { streamName, groupName, deadLetterStream } = nextDeadLetterFixtureNames();
+    await bootstrapGroup(streamName, groupName);
+
+    // The deterministic permanent failure this suite already fixtures: a syntactically valid
+    // UUID with no `Tenant` row behind it, which `Event_tenantId_fkey` rejects *after* the
+    // message has parsed cleanly.
+    const fields = streamFields({
+      [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.TENANT_ID]:
+        INTEGRATION_PROCESSOR_EVENT.UNKNOWN_TENANT_ID
+    });
+    const entryId = await addEntry(streamName, fields);
+
+    // One delivery only, so the counter is observed mid-budget rather than after it.
+    await runLoopOver(
+      streamName,
+      groupName,
+      INTEGRATION_PROCESSOR_COUNTS.SINGLE,
+      deadLetterStream
+    );
+
+    expect(await redis.hget(retryKeyFor(streamName), entryId)).toBe(
+      String(INTEGRATION_PROCESSOR_COUNTS.SINGLE)
+    );
+    // The TTL is on the key and is refreshed on each increment -- `HEXPIRE` does not exist on
+    // Redis 7.0.15, so there is no per-field expiry and an orphaned field would otherwise live
+    // forever. `> 0` rather than an exact value: `TTL` counts down from the instant it was set.
+    expect(await redis.ttl(retryKeyFor(streamName))).toBeGreaterThan(
+      INTEGRATION_PROCESSOR_COUNTS.NONE
+    );
+
+    // Below the budget the wrapper rethrows, so nothing changed about T-040's contract: the
+    // entry is still pending and nothing was dead-lettered.
+    expect(await readPendingIds(streamName, groupName)).toEqual([entryId]);
+    expect(await redis.exists(deadLetterStream)).toBe(INTEGRATION_PROCESSOR_COUNTS.NONE);
+  });
+
+  it("I25 - a success clears an existing retry counter (T-041)", async () => {
+    const { streamName, groupName, deadLetterStream } = nextDeadLetterFixtureNames();
+    await bootstrapGroup(streamName, groupName);
+
+    const fields = streamFields();
+    const payload = parseStreamMessage(fields);
+    const entryId = await addEntry(streamName, fields);
+    // A counter left behind by an earlier delivery, seeded out of band so the case does not
+    // depend on having produced a failure first. Below the budget, or the pre-check would
+    // dead-letter the entry instead of processing it -- which is `U67`'s subject, not this one.
+    await redis.hset(
+      retryKeyFor(streamName),
+      entryId,
+      String(INTEGRATION_PROCESSOR_COUNTS.SINGLE)
+    );
+
+    const { seen } = await runLoopOver(
+      streamName,
+      groupName,
+      INTEGRATION_PROCESSOR_COUNTS.SINGLE,
+      deadLetterStream
+    );
+
+    expect(seen).toContain(entryId);
+    // The counter is gone. Without the conditional `HDEL`, every entry that ever failed once
+    // would keep a field for `RETRY_KEY_TTL_SECONDS` and a later redelivery of the same id
+    // would inherit a budget it never spent.
+    expect(await redis.hget(retryKeyFor(streamName), entryId)).toBeNull();
+    // A hash whose last field is deleted deletes itself, so nothing is left behind at all.
+    expect(await redis.exists(retryKeyFor(streamName))).toBe(
+      INTEGRATION_PROCESSOR_COUNTS.NONE
+    );
+
+    // And the entry really did succeed -- rows stored, acknowledged, nothing dead-lettered.
+    expect(await readPendingIds(streamName, groupName)).toEqual([]);
+    expect(await admin.event.count({ where: { id: payload.event.eventId } })).toBe(
+      INTEGRATION_PROCESSOR_COUNTS.SINGLE
+    );
+    expect(await redis.exists(deadLetterStream)).toBe(INTEGRATION_PROCESSOR_COUNTS.NONE);
+  });
+
+  it("I26 - MAX_RETRY_COUNT failures inside one run() dead-letter the entry, clear the PEL and the counter (T-041)", async () => {
+    const { streamName, groupName, deadLetterStream } = nextDeadLetterFixtureNames();
+    await bootstrapGroup(streamName, groupName);
+
+    const fields = streamFields({
+      [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.TENANT_ID]:
+        INTEGRATION_PROCESSOR_EVENT.UNKNOWN_TENANT_ID
+    });
+    const payload = parseStreamMessage(fields);
+    const entryId = await addEntry(streamName, fields);
+
+    // **Inside one `run()`.** Every delivery after the first comes from T-041's reclaim
+    // cadence: `XREADGROUP ... >` does not redeliver an unacknowledged entry, so without the
+    // cadence this loop sees the entry exactly once and the case fails on the pending list
+    // below rather than on a timeout.
+    const { seen } = await runLoopOver(
+      streamName,
+      groupName,
+      INTEGRATION_DEAD_LETTER.MAX_RETRY_COUNT,
+      deadLetterStream
+    );
+
+    expect(seen.filter((id) => id === entryId).length).toBeGreaterThanOrEqual(
+      INTEGRATION_DEAD_LETTER.MAX_RETRY_COUNT
+    );
+
+    // Acknowledged, so it has left the pending list -- the epic's "clear from PEL". Observed
+    // as its effect on the server, not as a spy call.
+    expect(await readPendingIds(streamName, groupName)).toEqual([]);
+    // And the counter is gone, so a future entry reusing the id starts fresh.
+    expect(await redis.hget(retryKeyFor(streamName), entryId)).toBeNull();
+
+    const records = await readDeadLetterRecords(deadLetterStream);
+    expect(records).toHaveLength(INTEGRATION_PROCESSOR_COUNTS.SINGLE);
+    const record = records[INTEGRATION_PROCESSOR_INDEX_FIRST] ?? {};
+    expect(record[WORKER_DEAD_LETTER.FIELD.ORIGINAL_ID]).toBe(entryId);
+    expect(record[WORKER_DEAD_LETTER.FIELD.STREAM_NAME]).toBe(streamName);
+    expect(record[WORKER_DEAD_LETTER.FIELD.GROUP_NAME]).toBe(groupName);
+    expect(record[WORKER_DEAD_LETTER.FIELD.RETRY_COUNT]).toBe(
+      String(INTEGRATION_DEAD_LETTER.MAX_RETRY_COUNT)
+    );
+    // The payload is the whole original field list, which is what makes the record replayable
+    // after the source stream's `MAXLEN` has rolled past the entry. Re-measured at Gate 3:
+    // five pending ids survived a trim that left `XLEN` at 1, so a pending id is not a handle
+    // on its data.
+    expect(JSON.parse(record[WORKER_DEAD_LETTER.FIELD.PAYLOAD] ?? "null")).toEqual(fields);
+    // The failure that ended it, named. This is the FK rejection, not a parse failure.
+    expect(record[WORKER_DEAD_LETTER.FIELD.FAILURE_REASON]).toBeTruthy();
+    expect(record[WORKER_DEAD_LETTER.FIELD.FAILURE_REASON]).not.toBe(
+      WORKER_DEAD_LETTER.REASON_BUDGET_EXHAUSTED
+    );
+
+    // Nothing was half-written: the dead letter is the *only* record of this event.
+    expect(await admin.event.count({ where: { id: payload.event.eventId } })).toBe(
+      INTEGRATION_PROCESSOR_COUNTS.NONE
+    );
+    expect(await admin.usageLine.count({ where: { eventId: payload.event.eventId } })).toBe(
+      INTEGRATION_PROCESSOR_COUNTS.NONE
+    );
+  });
+
+  it("I27 - a malformed message's dead-letter reason names the field, never its value (S-31)", async () => {
+    const { streamName, groupName, deadLetterStream } = nextDeadLetterFixtureNames();
+    await bootstrapGroup(streamName, groupName);
+
+    // A quantity the parser rejects, plus a metadata key and value a customer chose. The key is
+    // the half that separates a `code`/`path` projection from one that reads `issue.message`:
+    // a `.strict()` schema's `unrecognized_keys` issue carries the key in both `keys` and
+    // `message`.
+    const fields = streamFields({
+      [WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.QUANTITY]:
+        INTEGRATION_DEAD_LETTER.SENTINEL_QUANTITY,
+      [INTEGRATION_DEAD_LETTER.SENTINEL_METADATA_KEY]:
+        INTEGRATION_DEAD_LETTER.SENTINEL_METADATA_VALUE
+    });
+    const entryId = await addEntry(streamName, fields);
+
+    const { seen, logger } = await runLoopOver(
+      streamName,
+      groupName,
+      INTEGRATION_DEAD_LETTER.MAX_RETRY_COUNT,
+      deadLetterStream
+    );
+    expect(seen).toContain(entryId);
+
+    const records = await readDeadLetterRecords(deadLetterStream);
+    expect(records).toHaveLength(INTEGRATION_PROCESSOR_COUNTS.SINGLE);
+    const reason = records[INTEGRATION_PROCESSOR_INDEX_FIRST]?.[
+      WORKER_DEAD_LETTER.FIELD.FAILURE_REASON
+    ] ?? "";
+
+    // The diagnosis: the base message, and the field that was wrong. Before T-041 an operator
+    // got only the base message and had to guess.
+    expect(reason).toContain(WORKER_EVENT_PROCESSING.ERROR.INVALID_MESSAGE);
+    expect(reason).toContain(WORKER_EVENT_PROCESSING.ENVELOPE_FIELD.QUANTITY);
+
+    // The negative, and the reason the retired S-31 entry was LOW rather than MEDIUM: no value and no
+    // customer-chosen key reaches the reason -- nor any log line this loop wrote.
+    const sentinels = [
+      INTEGRATION_DEAD_LETTER.SENTINEL_QUANTITY,
+      INTEGRATION_DEAD_LETTER.SENTINEL_METADATA_KEY,
+      INTEGRATION_DEAD_LETTER.SENTINEL_METADATA_VALUE
+    ];
+    const loggedCalls = JSON.stringify([
+      ...(logger.info?.mock.calls ?? []),
+      ...(logger.warn?.mock.calls ?? []),
+      ...(logger.error?.mock.calls ?? []),
+      ...(logger.debug?.mock.calls ?? [])
+    ]);
+    expect(loggedCalls.length).toBeGreaterThan(INTEGRATION_PROCESSOR_COUNTS.NONE);
+    for (const sentinel of sentinels) {
+      expect(reason, sentinel).not.toContain(sentinel);
+      expect(loggedCalls, sentinel).not.toContain(sentinel);
+    }
+
+    // The **record** keeps them, and that is the design rather than an inconsistency: the
+    // dead-letter payload is the only surviving copy of the event and has to be replayable.
+    // What the retired S-31 rule governed is what travels in a *message* -- into logs, and into the
+    // reason field an operator reads first.
+    expect(
+      records[INTEGRATION_PROCESSOR_INDEX_FIRST]?.[WORKER_DEAD_LETTER.FIELD.PAYLOAD]
+    ).toContain(INTEGRATION_DEAD_LETTER.SENTINEL_METADATA_VALUE);
   });
 });

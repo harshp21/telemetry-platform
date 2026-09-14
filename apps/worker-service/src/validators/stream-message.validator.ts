@@ -113,6 +113,32 @@ const envelopeSchema = z.object({
 });
 
 /**
+ * A zod failure -> the shortest text that names what was wrong, carrying no customer data.
+ *
+ * Each issue becomes `<code>:<path>`. `code` is zod's vocabulary (`invalid_type` for an absent
+ * field, `invalid_string` for one that fails `.uuid()`/`.regex()`/`.datetime()`); `path` is the
+ * envelope field name. **`issue.message` is deliberately not read**, and neither is
+ * `issue.keys` on an `unrecognized_keys` issue -- those are the two places zod puts a value or
+ * a customer-chosen key. See `WORKER_EVENT_PROCESSING.ERROR.DETAIL` for the measurement and
+ * the scope.
+ *
+ * Every issue, not just the first: an operator fixing one field per deploy is the cost of a
+ * one-field diagnosis.
+ */
+const describeIssues = (issues: readonly z.ZodIssue[]): string =>
+  issues
+    .map((issue) => {
+      const path = issue.path.join(
+        WORKER_EVENT_PROCESSING.ERROR.DETAIL.PATH_SEGMENT_SEPARATOR
+      );
+
+      return `${issue.code}${WORKER_EVENT_PROCESSING.ERROR.DETAIL.CODE_PATH_SEPARATOR}${
+        path === "" ? WORKER_EVENT_PROCESSING.ERROR.DETAIL.ROOT_PATH : path
+      }`;
+    })
+    .join(WORKER_EVENT_PROCESSING.ERROR.DETAIL.ISSUE_SEPARATOR);
+
+/**
  * `[k, v, k, v, ...]` -> `{ k: v }`.
  *
  * Throws on an odd length rather than dropping the dangling key, because the list is
@@ -125,7 +151,11 @@ const envelopeSchema = z.object({
  */
 const foldFields = (fields: readonly string[]): Record<string, string> => {
   if (fields.length % WORKER_EVENT_PROCESSING.FIELD_PAIR_STRIDE !== 0) {
-    throw new Error(WORKER_EVENT_PROCESSING.ERROR.ODD_FIELD_LIST);
+    // The **length**, never the list. The length is the one number that says whether a key or
+    // a value went missing; the list itself is customer data.
+    throw new Error(
+      `${WORKER_EVENT_PROCESSING.ERROR.ODD_FIELD_LIST}${WORKER_EVENT_PROCESSING.ERROR.DETAIL.SEPARATOR}${WORKER_EVENT_PROCESSING.ERROR.DETAIL.FIELD_COUNT_LABEL}${fields.length}`
+    );
   }
 
   const record: Record<string, string> = {};
@@ -185,16 +215,25 @@ const collectMetadata = (record: Record<string, string>): Record<string, string>
  * a message this function rejects stays in the group's pending list. Returning a partial
  * payload, or a default, would mean acknowledging something that was never understood.
  *
- * The consequence is worth naming because it is currently unbounded: a message that can never
- * parse is reclaimed and retried on every worker restart, indefinitely, until T-041 adds retry
- * accounting and a dead-letter destination. That is the epic's stated T-040 behaviour, not an
- * oversight.
+ * That consequence used to be unbounded, and this paragraph used to say so: a message that
+ * could never parse was reclaimed and retried on every worker restart, indefinitely. T-041
+ * bounded it. `DeadLetterService` wraps this parser's caller, counts the failures in Redis, and
+ * after `MAX_RETRY_COUNT` of them copies the entry to `DEAD_LETTER_STREAM` and acknowledges it
+ * -- so an unparseable message now terminates instead of recurring.
+ *
+ * **The thrown message names the offending fields**, by zod `code` and `path`, and carries no
+ * value from the entry. It reaches two places unchanged: `dispatch`'s `HANDLER_FAILED` log line
+ * through `describeError`, and the dead-letter record's `failureReason`. See
+ * `WORKER_EVENT_PROCESSING.ERROR.DETAIL` for what may and may not appear in it, and `U60` for
+ * the negative that holds the rule.
  */
 export const parseStreamMessage = (fields: readonly string[]): StreamEventPayload => {
   const record = foldFields(fields);
   const parsed = envelopeSchema.safeParse(record);
   if (!parsed.success) {
-    throw new Error(WORKER_EVENT_PROCESSING.ERROR.INVALID_MESSAGE);
+    throw new Error(
+      `${WORKER_EVENT_PROCESSING.ERROR.INVALID_MESSAGE}${WORKER_EVENT_PROCESSING.ERROR.DETAIL.SEPARATOR}${describeIssues(parsed.error.issues)}`
+    );
   }
 
   const envelope = parsed.data;

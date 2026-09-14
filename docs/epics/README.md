@@ -14,7 +14,7 @@ Implementation sequence based on architectural dependencies and open decision ga
 | Q5 — Refresh token delivery | Epic 4 |
 | Q8 — External vs internal API consumers (**decided**: external only via gateway; internal routes private + `X-Internal-Secret`) | Epic 6 |
 | Q9 — Worker concurrency (**decided**: horizontal-ready, single instance locally) | Epic 7 |
-| Q10 — DLQ retry policy | Epic 7 |
+| Q10 — DLQ retry policy (**decided**: `MAX_RETRY_COUNT` 3, `DEAD_LETTER_STREAM` `telemetry:dead-letter`, no retry delay, alerting counter deferred to T-057) | Epic 7 |
 | Q2 — Pricing model | Epic 8 |
 | Q3 — UTC aggregation timezone | Epic 9 |
 | Q11 — Dashboard scope | Epic 11 |
@@ -28,6 +28,29 @@ Implementation sequence based on architectural dependencies and open decision ga
 - Evolution rule (v1): additive-only changes in `payload`; no breaking removals/renames.
 - Why now: protects replay, idempotency, and contract governance while keeping ingestion simple.
 - Revisit trigger: multiple producer SDKs, frequent breaking changes, or cross-language schema generation needs.
+
+#### Q10 — DLQ retry policy
+
+- Decision: 3 retries, then a Redis stream `telemetry:dead-letter`, with **no retry delay**.
+- Retry storage: `HINCRBY retries:{streamName} {messageId} 1`, with a key-level TTL. The count
+  is checked before processing, so an entry arriving with an exhausted budget is dead-lettered
+  without being processed again.
+- **"No retry delay" means no timer, not no spacing.** Nothing sleeps, schedules or backs off.
+  The attempts are spaced by a threshold that already existed —
+  `STREAM_BLOCK_MS x RECOVERY_IDLE_MULTIPLIER`, the minimum idle time `XAUTOCLAIM` needs before
+  it will reclaim an entry — because T-041 also gives the read loop a reclaim cadence. That one
+  threshold now does double duty: peer safety and retry spacing. At the shipped defaults three
+  attempts span roughly 20–30 seconds.
+- Alerting: the specified Prometheus counter `telemetry_dead_letter_total` is **deferred to
+  T-057**. `prom-client` is in no `package.json` in this workspace, so there is no metrics
+  substrate to add it to. Until then the operational lever is `XLEN telemetry:dead-letter`, and
+  the dead-letter stream is unwatched — a known, stated hole.
+- The dead-letter record carries the **whole original field list**, not just the entry id:
+  measured on Redis 7.0.15, a pending entry's payload can be evicted by `MAXLEN` while its id
+  stays in the pending list, so an id-only record is unreplayable.
+- Implemented by T-041 (`docs/plans/t-041-retry-tracking-dead-letter.md`).
+- Revisit trigger: a dead-letter stream that accumulates during normal operation, which would
+  mean the budget is too small for the platform's real failure durations.
 
 #### Q6 — Multi-tenancy scope
 

@@ -140,6 +140,7 @@ describe("graceful shutdown (worker-service)", () => {
     buildApp: ReturnType<typeof vi.fn>;
     processorHandler: ReturnType<typeof vi.fn>;
     buildHandler: ReturnType<typeof vi.fn>;
+    wrappedMessageHandler: ReturnType<typeof vi.fn>;
   }> => {
     const logger = {
       info: vi.fn(),
@@ -189,6 +190,16 @@ describe("graceful shutdown (worker-service)", () => {
     // later task extends one place rather than four call sites.
     const processorHandler = vi.fn().mockResolvedValue(undefined);
     const buildHandler = vi.fn(() => processorHandler);
+
+    // T-041: the container now exposes a `messageHandler` -- the processor's handler wrapped in
+    // `DeadLetterService`'s retry policy -- and `start()` must pass **that** to the consumer.
+    //
+    // Deliberately **not** delegating to `processorHandler`. Two independent spies are what make
+    // the two cases below distinguishable: `U46` asserts the entry reaches the handler the
+    // container supplied, and `U69` asserts that handler is the wrapped one by asserting the raw
+    // processor handler was not called instead. If this spy delegated, reverting `index.ts` to
+    // `container.eventProcessor.buildHandler()` would leave both green.
+    const wrappedMessageHandler = vi.fn().mockResolvedValue(undefined);
     const readDisconnect = vi.fn();
     const redisDuplicate = vi.fn(() => ({
       xreadgroup: readXreadgroup,
@@ -212,7 +223,8 @@ describe("graceful shutdown (worker-service)", () => {
           xgroup: redisXgroup,
           duplicate: redisDuplicate
         },
-        eventProcessor: { buildHandler }
+        eventProcessor: { buildHandler },
+        messageHandler: wrappedMessageHandler
       },
       close: appClose,
       listen: appListen
@@ -270,7 +282,8 @@ describe("graceful shutdown (worker-service)", () => {
       readDisconnect,
       buildApp,
       processorHandler,
-      buildHandler
+      buildHandler,
+      wrappedMessageHandler
     };
   };
 
@@ -452,7 +465,7 @@ describe("graceful shutdown (worker-service)", () => {
     expect(exitCodes).toContain(0);
   });
 
-  it("U46 - hands the processor's handler to the consumer, so a delivered entry reaches the database path", async () => {
+  it("U46 - hands the container's message handler to the consumer, so a delivered entry reaches the database path", async () => {
     const context = await setupIndexModule({ reclaimOneEntry: true });
 
     // Behaviour, not a construction-argument snapshot. Asserting `new StreamConsumer` was
@@ -460,13 +473,12 @@ describe("graceful shutdown (worker-service)", () => {
     // argument the consumer never used. This drives a real entry through the real consumer and
     // checks where it lands.
     await vi.waitFor(() => {
-      if (context.processorHandler.mock.calls.length === 0) {
-        throw new Error("the reclaimed entry never reached the processor's handler");
+      if (context.wrappedMessageHandler.mock.calls.length === 0) {
+        throw new Error("the reclaimed entry never reached the container's message handler");
       }
     });
 
-    expect(context.buildHandler).toHaveBeenCalledTimes(1);
-    expect(context.processorHandler).toHaveBeenCalledWith(
+    expect(context.wrappedMessageHandler).toHaveBeenCalledWith(
       RECLAIMED_ENTRY_ID,
       RECLAIMED_ENTRY_FIELDS
     );
@@ -475,6 +487,35 @@ describe("graceful shutdown (worker-service)", () => {
     // reporting healthy. `src/events/**` is outside the coverage thresholds (S-25), so no
     // percentage notices; this case is the only thing that does.
     expect(context.appListen).toHaveBeenCalledTimes(1);
+
+    // **Edited at T-041, deliberately and not to make a red test pass.** This case previously
+    // asserted `buildHandler` had been called once and that `processorHandler` saw the entry.
+    // Both were claims about `index.ts`, and both stopped being true of `index.ts`: the
+    // container now calls `buildHandler()` and wraps the result, and `index.ts` passes the
+    // wrapped handler. Neither assertion was weakened -- the "was it wired at all" claim is
+    // unchanged and now reads the handler `index.ts` really passes, the `buildHandler` call
+    // moved to the container's own suite, and `U69` below asserts the stronger property this
+    // case used to imply.
+  });
+
+  it("U69 - passes the retry-wrapped handler, not the processor's raw one", async () => {
+    const context = await setupIndexModule({ reclaimOneEntry: true });
+
+    await vi.waitFor(() => {
+      if (context.wrappedMessageHandler.mock.calls.length === 0) {
+        throw new Error("the reclaimed entry never reached the container's message handler");
+      }
+    });
+
+    // The negative is the case. An `index.ts` that still passed
+    // `container.eventProcessor.buildHandler()` would deliver the entry to `processorHandler`
+    // and every case in `tests/dead-letter.service.unit.test.ts` would still pass -- the whole
+    // feature would be wired to nothing. This is the only case that can see that, because it is
+    // the only one that runs the real `index.ts`.
+    expect(context.processorHandler).not.toHaveBeenCalled();
+    // `index.ts` does not build the handler itself either; that is the container's job, and a
+    // `buildHandler()` call here would mean a second, unwrapped handler existed.
+    expect(context.buildHandler).not.toHaveBeenCalled();
   });
 
   it("U8 - fails closed and never binds the listener when Redis is unreachable", async () => {
