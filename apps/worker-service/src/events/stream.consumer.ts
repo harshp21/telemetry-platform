@@ -769,7 +769,7 @@ export class StreamConsumer {
             entryId: entry.id,
             error: describeError(error)
           },
-          "Stream entry handler failed"
+          WORKER_STREAM_READ.LOG.HANDLER_FAILED
         );
       }
     }

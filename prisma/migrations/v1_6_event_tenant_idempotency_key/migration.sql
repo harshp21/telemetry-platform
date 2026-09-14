@@ -1,0 +1,29 @@
+-- T-040. Scope the event idempotency key to the tenant.
+--
+-- The idempotency key that travels on the Redis stream is tenant-less by construction:
+-- `DeduplicationService` owns the tenant segment of the dedup keyspace (S-1), so the raw key
+-- usage-service publishes is whatever the customer sent, or `<eventType>:<sourceId>:<occurredAt>`.
+-- A GLOBAL unique on that column therefore turns any cross-tenant key collision into a message
+-- the worker can never process and never discard.
+--
+-- Measured as `telemetry_app` (NOSUPERUSER, NOBYPASSRLS) with tenant A holding the key and
+-- tenant B replaying it, against all three shapes an upsert can compile to. Under the global
+-- unique, every one of them fails, and two of them fail in ways that are worse than an error:
+--
+--   read-then-write   SELECT returns 0 rows (RLS hides A's row), INSERT -> duplicate key value
+--                     violates unique constraint "Event_idempotencyKey_key"
+--   ON CONFLICT DO NOTHING   INSERT 0 0, and the transaction stays alive and would COMMIT --
+--                     i.e. the worker acknowledges a message it never stored
+--   ON CONFLICT DO UPDATE    ERROR: new row violates row-level security policy (USING
+--                     expression) for table "Event"
+--
+-- With this index in place instead, the same three shapes return INSERT 0 1 for tenant B while
+-- a same-tenant replay still collapses to the existing row (DO NOTHING returns no id, DO UPDATE
+-- returns the existing id, one row total).
+--
+-- Forward-only, and no data change: "Event" held 0 rows when this was written, so there is no
+-- backfill and no deduplication pass. Shape mirrors v1_1_user_email_global_unique -- the object
+-- being replaced is an INDEX, not a CONSTRAINT (pg_constraint on "Event" lists only Event_pkey
+-- and Event_tenantId_fkey), even though PostgreSQL's violation message calls it one.
+DROP INDEX IF EXISTS "Event_idempotencyKey_key";
+CREATE UNIQUE INDEX "Event_tenantId_idempotencyKey_key" ON "Event"("tenantId", "idempotencyKey");

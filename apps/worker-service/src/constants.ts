@@ -264,6 +264,31 @@ export const WORKER_STREAM_READ = {
    */
   MISSING_GROUP_ERROR_PREFIX: "NOGROUP",
   /**
+   * Log messages this file's consumer writes that more than one non-test site needs to name.
+   *
+   * Only `HANDLER_FAILED` is here, and the narrowness is deliberate rather than an oversight.
+   * `StreamConsumer` writes **sixteen** log calls; fifteen of those messages are named by
+   * exactly one production site and one test-local constant, which is two copies and below the
+   * threshold
+   * `.claude/rules/constants.md` sets. `HANDLER_FAILED` reached a **third** copy when T-040's
+   * `I18` asserted it from a second test file, and the rule asks for promotion before the third
+   * copy — so this member exists because that line crossed the threshold, not because log
+   * messages are being promoted as a class.
+   *
+   * **`tests/stream.consumer.unit.test.ts`'s `LOG_MESSAGE.HANDLER_FAILED` deliberately does
+   * NOT import this**, and must not be changed to. That object is a restatement of the
+   * subject's log text *as the thing under test*: `U29` asserts the exact wording, and an
+   * assertion sourced from the same constant the subject writes would hold no matter what
+   * either said. That is the rule the file's own docstring states for the observed Redis reply
+   * texts, applied to the same situation. `I18` is different and does import this: its subject
+   * is that a failed entry stays pending and the failure is attributed to its entry id, and the
+   * message is a selector for the right log line rather than the claim being made.
+   */
+  LOG: {
+    /** `dispatch`, per-entry handler failure. */
+    HANDLER_FAILED: "Stream entry handler failed"
+  },
+  /**
    * The rejection an in-flight blocking read produces when its connection is disconnected —
    * i.e. what `stop()` causes, and the one read failure that is a normal shutdown rather than
    * a fault.
@@ -279,3 +304,139 @@ export const WORKER_STREAM_READ = {
    */
   CONNECTION_CLOSED_ERROR_MESSAGE: "Connection is closed."
 } as const;
+
+/**
+ * Event-processing vocabulary (T-040): the stream envelope, the derivation rules, and the log
+ * and error messages the processor writes.
+ *
+ * A **sibling** of `WORKER_STREAM_READ` for the same reason that object is a sibling of
+ * `WORKER_STREAM_CONSTANTS`: nothing here feeds `src/config/env.ts`, and none of it is
+ * operator-overridable. These are the shape of the message on the wire and the decisions this
+ * task made about what to write from it.
+ *
+ * **The envelope is the wire format, not the specified one.** `docs/epics/README.md` records
+ * Q1 as decided with required fields `eventId, tenantId, eventType, occurredAt, receivedAt,
+ * source, idempotencyKey, version, payload`. The producer publishes none of `receivedAt`,
+ * `source`, `version` or `payload`, and does publish `quantity`, `unit` and `timestamp`.
+ * Measured with `XRANGE telemetry:events` while planning, against both entries on the live
+ * stream, and confirmed against `apps/usage-service/src/services/ingestion.service.ts`'s
+ * `publishEvent` literal. Divergence reported at Gate 3; the parser reads what is written.
+ */
+export const WORKER_EVENT_PROCESSING = {
+  /**
+   * The fields the producer treats as the envelope, i.e. everything it will **not** flatten
+   * metadata into.
+   *
+   * A copy of usage-service's `RESERVED_STREAM_FIELDS`
+   * (`apps/usage-service/src/services/ingestion.service.ts`), and deliberately a copy rather
+   * than an import: that set is a module-private `const` in another service's service layer
+   * with no `export` keyword, and importing across two services' internals to share it would
+   * couple the consumer's parse to the producer's implementation detail.
+   *
+   * **Nothing asserts that the two sets agree, and this copy is therefore unguarded.** Stated
+   * as measured: the two sets match today — both are the same **eight** names, in the same
+   * order (`eventId, tenantId, eventType, quantity, unit, occurredAt, idempotencyKey,
+   * timestamp`), compared programmatically against the producer's declaration rather than by
+   * eye. But `grep -rn "RESERVED_STREAM_FIELDS" apps packages --include=*.ts` (excluding
+   * `dist/`) returns **five** lines: the producer's declaration, the producer's single use, and
+   * three *prose comments* — the two in this docblock (the sentence above naming the constant,
+   * and this sentence, which contains the grep pattern and so matches itself) and the
+   * `stream-message.validator.unit.test.ts` docstring. Counted, after the Gate-5 review found
+   * the earlier figure of four short by exactly the self-match.
+   * No test references it. `U41` pins **this** constant against **this** parser, which is a
+   * different property: it asserts that a field named here reaches neither a column nor
+   * `metadata`, and it stays green no matter what the producer's set contains.
+   *
+   * The drift is directional and the exposed direction is a producer-side *addition*: a field
+   * added there and not here lands in every event's customer-facing `metadata` blob with `U41`
+   * green. Q1's `receivedAt`, `source` and `version` are the named pending candidates. Filed
+   * as **S-27**; the reason for not importing stays sound, so the fix is promotion rather than
+   * a manufactured import.
+   *
+   * `.claude/rules/constants.md` asks for promotion before the third copy: this is the second,
+   * and the shared home when a third appears is `@telemetry/shared-types`, alongside
+   * `EVENT_STREAM_CONSTANTS`.
+   *
+   * `PRODUCER_TIMESTAMP` is the one member with no column behind it. It is `Date.now()` at
+   * publish time, which is bookkeeping about the *transport*, not about the event — the
+   * event's own instant is `occurredAt`. It is listed here so that it is excluded from
+   * metadata; it is absent from `StreamEventPayload` so that it cannot be persisted.
+   */
+  ENVELOPE_FIELD: {
+    EVENT_ID: "eventId",
+    TENANT_ID: "tenantId",
+    EVENT_TYPE: "eventType",
+    QUANTITY: "quantity",
+    UNIT: "unit",
+    OCCURRED_AT: "occurredAt",
+    IDEMPOTENCY_KEY: "idempotencyKey",
+    PRODUCER_TIMESTAMP: "timestamp"
+  },
+  /**
+   * Step size for walking the flat `[key, value, key, value, ...]` field list `XREADGROUP`
+   * returns.
+   *
+   * A stride, not a cardinality — named separately for the reason
+   * `INTEGRATION_FIELD_PAIR_STRIDE` gives in `tests/integration.constants.ts`.
+   */
+  FIELD_PAIR_STRIDE: 2,
+  /**
+   * Offset from a key's position to its value's, within the same flat field list.
+   *
+   * Named separately from `FIELD_PAIR_STRIDE` although both describe the same pairing: one is
+   * how far to step to reach the next *pair*, the other how far to reach *this pair's value*.
+   * They are different quantities that happen to be adjacent, and `INDEX` vs `CALLS` in
+   * `tests/stream.consumer.unit.test.ts` is the same distinction one layer up.
+   */
+  FIELD_VALUE_OFFSET: 1,
+  /**
+   * What a `quantity` on the wire may look like.
+   *
+   * `Event.quantity` and `UsageLine.quantity` are `Decimal(18,6)`, which exceeds IEEE-754
+   * safe precision, so the value crosses this boundary as a **string** and is never
+   * converted. Measured (plan Appendix A/P-DEC): `12345678901.123456` bound as a JS `number`
+   * was stored as `12345678901.123460` with no error at all, while the same value bound as a
+   * string or a `Prisma.Decimal` was stored exactly.
+   *
+   * Scope of the pattern, stated as what it accepts rather than as a general decimal rule: an
+   * optional leading `-`, then digits, then optionally a `.` and more digits. It therefore
+   * rejects exponent notation (`1e6`), a bare `.5`, a trailing `1.`, and `NaN`/`Infinity`.
+   * Exponent notation is rejected rather than supported because nothing produces it —
+   * usage-service publishes `String(event.quantity)` over a value its own validator has
+   * already constrained to an integer — and accepting a form no test covers is how a
+   * precision rule acquires an untested arm.
+   *
+   * The sign is permitted although nothing sends one today: the column accepts it, and the
+   * producer owns the business rule about what a legal quantity is. This boundary owns
+   * precision, not policy.
+   */
+  QUANTITY_PATTERN: /^-?\d+(\.\d+)?$/,
+  ERROR: {
+    /**
+     * A field list whose length is odd, so its last key has no value.
+     *
+     * Distinguished from `INVALID_MESSAGE` because it is a *framing* failure rather than a
+     * content one: folding an odd list anyway would pair every key from the defect onward
+     * with the following key's value, which is the quiet mis-parse
+     * `stream.consumer.ts`'s `parseEntry` refuses for the same reason.
+     */
+    ODD_FIELD_LIST: "Stream entry field list has an odd length",
+    /** Any envelope field that is absent, empty, or not the shape its column needs. */
+    INVALID_MESSAGE: "Stream entry is not a valid usage event"
+  },
+  LOG: {
+    PROCESSED: "Processed stream entry into an event and usage line",
+    ACK_FAILED: "Failed to acknowledge a processed stream entry"
+  }
+} as const;
+
+/**
+ * The envelope field names as a lookup, for "is this field metadata?".
+ *
+ * Derived from `WORKER_EVENT_PROCESSING.ENVELOPE_FIELD` rather than written out a second time,
+ * so a field added there cannot be left out of the exclusion set — which would put it in every
+ * event's customer-facing `metadata` blob.
+ */
+export const WORKER_ENVELOPE_FIELD_NAMES: ReadonlySet<string> = new Set(
+  Object.values(WORKER_EVENT_PROCESSING.ENVELOPE_FIELD)
+);

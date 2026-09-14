@@ -8,6 +8,7 @@ import {
   WORKER_STREAM_READ
 } from "../src/constants";
 import { StreamConsumer, type StreamMessageHandler } from "../src/events/stream.consumer";
+import { CASE_BUDGET_MS, INTEGRATION_LOOP } from "./integration.constants";
 
 /**
  * Unit suite for T-038's consumer-group bootstrap.
@@ -146,7 +147,17 @@ const LOG_MESSAGE = {
   RECOVERY_STOPPED: "Stopped reclaiming pending stream entries: shutdown requested",
   /** `recoverPendingEntries`, the `RECOVERY_MAX_PAGES` liveness bound. */
   RECOVERY_PAGE_LIMIT: "Stopped reclaiming pending stream entries at the page limit",
-  /** `dispatch`, per-entry handler failure. */
+  /**
+   * `dispatch`, per-entry handler failure.
+   *
+   * **Stays a literal even though `WORKER_STREAM_READ.LOG.HANDLER_FAILED` now exists**, and the
+   * promotion that added that constant (T-040, LOW-1) deliberately did not touch this line. Like
+   * the observed Redis reply texts above, this is the wording *under test*: `U29` asserts that
+   * the subject logs exactly this string, and sourcing the expectation from the constant the
+   * subject writes would make the assertion hold whatever either of them said. T-040's `I18`
+   * does import the constant, because there the message selects a log line rather than being
+   * the claim.
+   */
   HANDLER_FAILED: "Stream entry handler failed",
   /** `dispatch`, the reply elements that did not have the shape of an entry. */
   MALFORMED_ELEMENTS: "Skipped stream reply elements that were not entries",
@@ -543,10 +554,67 @@ const INDEX = {
 } as const;
 
 /**
- * Wall-clock ceiling for a `stopWhen` predicate, well inside vitest's 5 000 ms per-case
- * budget so the case's own assertions report the failure rather than the runner.
+ * Wall-clock ceiling for a `stopWhen` predicate, well inside the runner's per-case budget so
+ * the case's own assertions report the failure rather than the runner.
+ *
+ * `U50` asserts that relationship against `CASE_BUDGET_MS` rather than leaving it to this
+ * comment, which is the T-040/S1 half of the inherited deadline-vs-budget item.
  */
 const STOP_DEADLINE_MS = 2_000;
+
+/**
+ * `0` **milliseconds**, for `vi.advanceTimersByTimeAsync` — drain the microtask queue without
+ * moving the clock.
+ *
+ * A duration, not a call count. Two sites (`U16` and `U17`) previously passed `CALLS.NONE`
+ * here: the numeral was right and the meaning was wrong, and a reader checking whether the
+ * retry had been paced could not tell the argument was a duration at all. Named separately
+ * from `CALLS.NONE` for the same reason `INDEX` is named separately from `CALLS`.
+ */
+const ADVANCE_NO_TIME_MS = 0;
+
+/**
+ * A cursor that is not a string, in `XAUTOCLAIM`'s cursor slot.
+ *
+ * Not a shape Redis 7.0.15 was observed to produce — the cursor came back a string on all
+ * three pages of the 5-entry scan T-039 measured. It is the shape `parseClaimReply`'s
+ * `typeof rawCursor === "string"` guard exists for, and `U39` pins what the guard does with
+ * it. `null` rather than some other non-string because it is what a truncated or
+ * differently-encoded reply would most plausibly yield.
+ */
+const NON_STRING_CLAIM_CURSOR = null;
+
+/**
+ * `vitest.config.mjs`, resolved from this file rather than named as a static import.
+ *
+ * A variable specifier on purpose: the config is outside this package's `tsconfig.json`
+ * `include` (`src/**` and `tests/**` only) and has no declaration, so a literal
+ * `import "../vitest.config.mjs"` is a `TS2307`. Resolving it at runtime keeps `U50`'s claim
+ * about the *effective* budget rather than about a numeral copied into a constant.
+ */
+const VITEST_CONFIG_URL = new URL("../vitest.config.mjs", import.meta.url).href;
+
+/**
+ * `testTimeout` out of the imported config, or a throw.
+ *
+ * Throws rather than returning a default in every direction a vacuous pass could come from —
+ * no default export, no `test` block, no `testTimeout`, or one that is not a number. Without
+ * that, deleting the declaration from `vitest.config.mjs` would leave `U50` asserting
+ * `undefined === undefined` and reporting green (`.claude/rules/testing.md`: a helper that
+ * locates a thing must throw when it is missing).
+ */
+const readConfiguredTestTimeout = (configModule: unknown): number => {
+  const exported = (configModule as { default?: unknown }).default;
+  const testBlock = (exported as { test?: unknown } | undefined)?.test;
+  const testTimeout = (testBlock as { testTimeout?: unknown } | undefined)?.testTimeout;
+  if (typeof testTimeout !== "number") {
+    throw new Error(
+      `vitest.config.mjs declares no numeric test.testTimeout (got ${String(testTimeout)})`
+    );
+  }
+
+  return testTimeout;
+};
 
 /**
  * How many `ERROR_BACKOFF_MS` windows `settleWithBackoffs` will advance before giving up.
@@ -899,7 +967,7 @@ describe("StreamConsumer.run", () => {
     // *explicitly*. Previously this case installed fake timers, never advanced them, and let
     // completion stand in for "no pause" — which meant the "repaired but also backed off"
     // mutation failed it by a 5 000 ms timeout rather than by an assertion (Round 1, L-1).
-    await vi.advanceTimersByTimeAsync(CALLS.NONE);
+    await vi.advanceTimersByTimeAsync(ADVANCE_NO_TIME_MS);
     expect(readConnection.xreadgroup).toHaveBeenCalledTimes(CALLS.TWICE);
     // The `NOGROUP` repair is the one read failure that is not logged as one: no error line,
     // therefore no backoff, because the backoff only follows that line.
@@ -928,7 +996,7 @@ describe("StreamConsumer.run", () => {
     const runPromise = buildLoopConsumer(stopAfter(CALLS.TWICE)).run();
     // Drains microtasks without moving the clock: the rejection has been handled and logged,
     // and the retry must still be waiting.
-    await vi.advanceTimersByTimeAsync(CALLS.NONE);
+    await vi.advanceTimersByTimeAsync(ADVANCE_NO_TIME_MS);
 
     expect(mockLogger.error).toHaveBeenCalledWith(
       {
@@ -1433,5 +1501,65 @@ describe("StreamConsumer.run", () => {
     // Truncated recovery is best-effort, like a failed one: the loop starts anyway and the
     // remainder is reclaimed on the next restart.
     expect(readConnection.xreadgroup).toHaveBeenCalledTimes(CALLS.ONCE);
+  });
+  it("U39 - a non-string XAUTOCLAIM cursor stops pagination rather than restarting it", async () => {
+    // The reply the `typeof rawCursor === "string"` guard exists for. The entries on this page
+    // are still claimed and dispatched — the cursor governs whether there is a *next* page.
+    readConnection.xautoclaim
+      .mockResolvedValueOnce([
+        NON_STRING_CLAIM_CURSOR,
+        [[ENTRY.RECLAIMED.id, [...ENTRY.RECLAIMED.fields]]],
+        []
+      ])
+      // Only reached if the guard is removed. A second page that terminates keeps the mutation
+      // failing by assertion rather than by the runner's timeout: without it, a cursor of
+      // `String(null)` would be re-sent forever up to `RECOVERY_MAX_PAGES`.
+      .mockResolvedValue(autoclaimReply(WORKER_STREAM_READ.PENDING_START_ID, []));
+
+    // A condition on the read count, not `stopAfter`, and this is the whole case. `stopAfter`
+    // counts predicate *checks*, and one of the subject's check sites is the between-pages
+    // guard inside recovery — so `stopAfter(CALLS.ONCE)` stops the pagination itself, and
+    // recovery makes exactly one claim whether the cursor guard is present or not. Measured:
+    // with the guard mutated to `String(rawCursor)` this case passed 36/36 under `stopAfter`.
+    // Keyed on the read instead, recovery is allowed to paginate as far as it wants to.
+    // Same reason `U36` and `U38` use a condition rather than a check count.
+    await buildLoopConsumer(
+      stopWhen(() => readConnection.xreadgroup.mock.calls.length >= CALLS.ONCE)
+    ).run();
+
+    // "Stop paginating", not "start over": a `null` cursor coerced to a string would be sent
+    // back as the next scan position, and `0-0` — the only terminal value — would never arrive
+    // from a server that keeps replying in the same shape.
+    expect(readConnection.xautoclaim).toHaveBeenCalledTimes(CALLS.ONCE);
+    // The page that did arrive is not discarded by the guard.
+    expect(handled).toEqual([{ id: ENTRY.RECLAIMED.id, fields: [...ENTRY.RECLAIMED.fields] }]);
+    // A malformed cursor is not a recovery failure: recovery is best effort and the loop runs.
+    expect(readConnection.xreadgroup).toHaveBeenCalledTimes(CALLS.ONCE);
+    expect(mockLogger.error).not.toHaveBeenCalled();
+  });
+
+  it("U50 - every test deadline, and the one case that spends two of them, sits below the runner budget", async () => {
+    // `CASE_BUDGET_MS` is only the truth if the runner actually enforces it, so this reads the
+    // effective config rather than trusting the constant to describe it. The specifier is a
+    // variable so TypeScript does not try to resolve `vitest.config.mjs`, which is outside this
+    // package's `tsconfig.json` `include`.
+    const configModule: unknown = await import(VITEST_CONFIG_URL);
+    expect(readConfiguredTestTimeout(configModule)).toBe(CASE_BUDGET_MS);
+
+    // Each deadline on its own. A deadline at or above the budget cannot fire: the runner kills
+    // the case first and reports `Test timed out in 5000ms`, naming nothing — which is what
+    // `RUN_DEADLINE_MS` (10 000) and `BLOCK_MS_LONG` (5 000) each did before they were lowered.
+    expect(INTEGRATION_LOOP.RUN_DEADLINE_MS).toBeLessThan(CASE_BUDGET_MS);
+    expect(INTEGRATION_LOOP.STOP_BUDGET_MS).toBeLessThan(CASE_BUDGET_MS);
+    expect(INTEGRATION_LOOP.BLOCK_MS_LONG).toBeLessThan(CASE_BUDGET_MS);
+    expect(STOP_DEADLINE_MS).toBeLessThan(CASE_BUDGET_MS);
+
+    // The condition the two prior per-constant fixes both missed. `I12` is the one case that
+    // can spend both: it waits up to `RUN_DEADLINE_MS` for the read to park, and a regressed
+    // `stop()` would then wait out `BLOCK_MS_LONG`. Each is individually under budget at
+    // 3 000 ms and their sum is 6 000, so the pair would time out where neither alone does.
+    expect(INTEGRATION_LOOP.RUN_DEADLINE_MS + INTEGRATION_LOOP.BLOCK_MS_LONG).toBeLessThan(
+      CASE_BUDGET_MS
+    );
   });
 });

@@ -57,10 +57,13 @@ running the thing it forbade:
 | the parity assertion catches drift in *either* direction | it caught one; the other compiled clean |
 | the half-fixed cast shape *cannot* be composed outside the module | the cast is SQL text and needs no import |
 | producer and consumer *cannot* drift in code | two edits diverged them with the whole gate green |
+| the suite collision *always* fails as `NOGROUP`, naming the stream key | 14 runs; the tenth failed as a wrong *delivery set*, no error, no key named |
 
 The pattern is always the same: probes that varied **one** dimension, written up as a general
 mechanism. Four `IN SCHEMA` probes. One drift direction. Five header paddings that were all
-SP or HTAB.
+SP or HTAB. Twenty-four runs of a flaky suite that all happened to fail the same way — that one
+had **four** observers across three gates before a fifth varied the run count and found the
+other shape, so a universal surviving several independent reviews is not evidence it is true.
 
 **Diagrams are claims too.** A `sequenceDiagram` asserts call order; an `erDiagram` asserts
 relations. Check each arrow against the `file:line` it cites, and check that anything not yet

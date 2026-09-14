@@ -14,6 +14,25 @@
 /** Redis connection default, matching `tests/setup.ts:9`. */
 export const INTEGRATION_REDIS_URL_FALLBACK = "redis://localhost:6379";
 
+/**
+ * The runner's per-case budget: `testTimeout` in `apps/worker-service/vitest.config.mjs`.
+ *
+ * Every wall-clock deadline in this package's suites has to sit **below** this, because a
+ * deadline at or above it cannot fire — the runner kills the case first and reports
+ * `Test timed out in 5000ms`, naming nothing, instead of the assertion written for the
+ * regression. That has now been the same defect three times: `RUN_DEADLINE_MS` at 10 000
+ * (Gate-4 Round 2), `BLOCK_MS_LONG` at 5 000 (Gate-5 QA F-3), and the pair of them summing to
+ * 6 000 in `I12`, which neither per-constant fix looked at.
+ *
+ * Declared here rather than only in the config so the relationship is assertable. `U50`
+ * (`tests/stream.consumer.unit.test.ts`) imports the config at runtime and pins
+ * `config.test.testTimeout === CASE_BUDGET_MS`, so the two cannot drift silently: changing
+ * one without the other turns that case red. Scope of that: it holds for the deadlines `U50`
+ * enumerates. A deadline constant added later is not automatically covered — nothing in the
+ * type system enumerates them — so add it to `U50` when you add it here.
+ */
+export const CASE_BUDGET_MS = 5_000;
+
 export const INTEGRATION_REDIS = {
   /**
    * Redis logical database reserved for this suite.
@@ -217,14 +236,26 @@ export const INTEGRATION_LOOP = {
    * paragraph above claims to convert away. Mirrors `STOP_DEADLINE_MS` in
    * `stream.consumer.unit.test.ts`, which got the inequality right in the same round.
    *
-   * 3 000 ms is ample: the whole integration file runs in ~450 ms, and the longest legitimate
-   * wait is `I12`'s read parking, which is milliseconds. `I12` does not use
-   * `buildLoopHarness`, so this being *equal to* `BLOCK_MS_LONG` is safe: `I12` uses
-   * `RUN_DEADLINE_MS` only for the `vi.waitFor` that observes the read parking (~26 ms
-   * measured), never as a loop deadline. (Said "below" until F-3 lowered `BLOCK_MS_LONG` to
-   * the same 3 000; corrected at the Gate-6 review, L-12.)
+   * 1 500 ms is ample: the whole integration file runs in ~450 ms, and the longest legitimate
+   * wait is `I12`'s read parking, which is milliseconds.
+   *
+   * **Lowered from 3 000 at T-040/S1, and the reason is the sum rather than this constant.**
+   * The Gate-6 note this paragraph replaces argued that being *equal to* `BLOCK_MS_LONG` was
+   * safe because `I12` does not use `buildLoopHarness` — true, and beside the point. `I12`
+   * spends **both**: it waits up to `RUN_DEADLINE_MS` for the read to park (:832) and then, if
+   * `stop()` has regressed to waiting the block out, up to `BLOCK_MS_LONG` for `run()` to
+   * resolve (:804). At 3 000 each that is 6 000 against a 5 000 `CASE_BUDGET_MS`, so the very
+   * regression `I12` exists to name would have been reported as `Test timed out in 5000ms` —
+   * the third instance of the defect two prior per-constant fixes each addressed one of.
+   * Measured, not reasoned: `U50` asserted the sum and failed `expected 6000 to be less than
+   * 5000` before this line changed.
+   *
+   * This constant is the one that moved, not `BLOCK_MS_LONG`, because `BLOCK_MS_LONG` is
+   * pinned from below — `I12:845` asserts `STOP_BUDGET_MS < BLOCK_MS_LONG`, without which the
+   * case passes vacuously (a block shorter than the budget returns on its own and proves
+   * nothing about `stop()`). `RUN_DEADLINE_MS` has no such floor: its measured use is ~26 ms.
    */
-  RUN_DEADLINE_MS: 3_000,
+  RUN_DEADLINE_MS: 1_500,
   /** Poll interval while waiting for an out-of-band condition (a re-created group, a parked read). */
   POLL_INTERVAL_MS: 10
 } as const;
@@ -255,4 +286,112 @@ export const INTEGRATION_LOOP_FIXTURE = {
   VALUE_ABANDONED: "t039-abandoned",
   VALUE_AFTER_RECREATE: "t039-after-recreate",
   VALUE_AFTER_TIMEOUT: "t039-after-timeout"
+} as const;
+
+/**
+ * Fixture vocabulary for T-040's event-processor cases (`I13`-`I20`).
+ *
+ * Its own prefixes, for the reason `INTEGRATION_LOOP_REDIS` gives: these cases share logical
+ * database 14 and one `FLUSHDB` with the `t038` and `t039` sets, and a key that says which task
+ * created it is the difference between reading a leftover and guessing at one.
+ */
+export const INTEGRATION_PROCESSOR_REDIS = {
+  STREAM_NAME_PREFIX: "telemetry:events:t040:",
+  CONSUMER_GROUP_PREFIX: "worker-group-t040-",
+  CONSUMER_NAME: "t040-worker"
+} as const;
+
+/**
+ * Quantities chosen for what they do to `Decimal(18,6)`, not for readability.
+ */
+export const INTEGRATION_PROCESSOR_QUANTITY = {
+  /**
+   * Exact through a string bind, lossy through a JS `number` bind.
+   *
+   * Measured: bound as a `number` this was stored as `12345678901.123460` with **no error**
+   * (plan Appendix A/P-DEC). It is the value `I20` reads back with `quantity::text`, because
+   * comparing through the ORM's `Decimal` would hide a difference the column actually kept.
+   */
+  FULL_PRECISION: "12345678901.123456",
+  /**
+   * Thirteen integer digits, against a column that allows twelve (`18 - 6`).
+   *
+   * Raises PostgreSQL `22003` *at the second write*, which is what `I16` needs: a failure after
+   * the `Event` row has been inserted, so that "zero rows of both kinds" is evidence of a
+   * rollback rather than of an insert that never happened.
+   */
+  OVERFLOWS_COLUMN: "9999999999999.000000"
+} as const;
+
+/** Fixture event vocabulary. `metricKey` is asserted to equal `EVENT_TYPE` (D1). */
+export const INTEGRATION_PROCESSOR_EVENT = {
+  EVENT_TYPE: "api.request",
+  UNIT: "request",
+  SOURCE_ID_FIELD: "sourceId",
+  SOURCE_ID_VALUE: "sdk-web",
+  OCCURRED_AT_ISO: "2026-01-01T00:00:00.000Z",
+  /** A syntactically valid UUID that is deliberately absent from `Tenant` (`Event_tenantId_fkey`). */
+  UNKNOWN_TENANT_ID: "11111111-1111-4111-8111-111111111111"
+} as const;
+
+/** Small cardinalities, named so no bare numeral carries meaning in an assertion. */
+export const INTEGRATION_PROCESSOR_COUNTS = {
+  NONE: 0,
+  SINGLE: 1,
+  PAIR: 2
+} as const;
+
+/**
+ * How many entries the `XPENDING <key> <group> - + <count>` probe asks for.
+ *
+ * A *page size for a read*, not a batch size for the consumer, and named separately for that
+ * reason: reusing `INTEGRATION_LOOP.BATCH_SIZE_SMALL` here would read as "the consumer's batch"
+ * and would silently change what the probe sees if that constant were ever retuned. Larger than
+ * any case seeds, so "the pending list is empty" is never an artefact of the page ending.
+ */
+export const INTEGRATION_PROCESSOR_PENDING_PAGE_SIZE = 10;
+
+/**
+ * First element of a query result or a reply list.
+ *
+ * A *position*, declared separately from `INTEGRATION_PROCESSOR_COUNTS.NONE` even though they
+ * share a value -- the reason `tests/stream.consumer.unit.test.ts` separates `INDEX` from
+ * `CALLS`: a cardinality standing in for an offset reads wrong even when the numeral is right.
+ */
+export const INTEGRATION_PROCESSOR_INDEX_FIRST = 0;
+
+/**
+ * Session time zone `I22` pins on its own connection, and the query-string form that pins it.
+ *
+ * **Pinned rather than inherited.** `CLAUDE.md` § *Raw SQL and timestamps* records that CI's
+ * `postgres:16-alpine` defaults `TimeZone` to `UTC`, where a correct and a broken raw-SQL
+ * timestamp path are indistinguishable. Measured on this host, the developer server is not UTC
+ * either — `pg_settings` reports `TimeZone|Asia/Kolkata|configuration file`. Neither ambient
+ * value can be relied on, so the case brings its own.
+ *
+ * **`America/New_York`, and the choice is load-bearing rather than arbitrary.** It must differ
+ * from *both* plausible ambient defaults, or the assertion that the pin took effect cannot
+ * fail. Measured: with the zone set to `Asia/Kolkata` and the suffix mutated to the bare
+ * `?timezone=` form — the one `CLAUDE.md` says is accepted and silently ignored — `I22` stayed
+ * **green on this host**, because the ignored pin left the session on the server default, which
+ * was the very zone being asserted. Under `America/New_York` that mutation reddens on a
+ * `Asia/Kolkata` host and on a UTC one alike.
+ *
+ * **What the pin does and does not currently buy, stated as measured.** `I22`'s failure under
+ * the discarded-offset mutation comes from the JavaScript side — `new Date(...)` resolving the
+ * offset — and reproduces under any session zone, because the ORM binds an absolute instant
+ * against a naive column. So the pin is **not** what makes the case catch today's mutation. It
+ * is there so the case is already running somewhere a *future* raw-SQL cast could be caught,
+ * which is the S-18 shape worker-service is exposed to by having no `TimeZone` pin in its
+ * `withTenant` (S-19). Do not describe it as the thing that makes `I22` work.
+ *
+ * The `options=-c timezone=` form is used because the bare `?timezone=` is silently ignored.
+ * Verified honoured through Prisma rather than assumed: a client opened with this form reported
+ * `SHOW timezone` -> `UTC` when pinned to UTC, against the same server whose default is
+ * `Asia/Kolkata`.
+ */
+export const INTEGRATION_PROCESSOR_SESSION_TIME_ZONE = {
+  NON_UTC: "America/New_York",
+  URL_SUFFIX: "?options=-c%20timezone%3DAmerica%2FNew_York",
+  SHOW_TIMEZONE: "SHOW timezone"
 } as const;

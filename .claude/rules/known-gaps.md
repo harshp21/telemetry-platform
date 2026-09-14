@@ -395,13 +395,25 @@ Consequence: the other four services' `withTenant` opens a transaction whose ses
 whatever the server defaults to. Their columns are the same `timestamp(3) without time zone`, so
 the first raw timestamp predicate written in any of them inherits S-18 exactly.
 
-**How bad it is today, stated no stronger than measured:** latent, not live.
-`grep -rn "extends TenantScopedRepository" apps/*/src` finds exactly one real subclass in the
-whole repository — `UsageRepository` (`apps/usage-service/src/repositories/usage.repository.ts:150`).
-The other four base classes have no subclass at all; the only other matches are the `EventRepository`
-example inside each file's own docstring. So no query is wrong right now. What is wrong is that
-the fix is in the copy that happened to have the bug, and four copies will silently disagree
-with it.
+**How bad it is today, stated no stronger than measured — and this changed with T-040.**
+`grep -rn "extends TenantScopedRepository" apps/*/src` now finds **two** real subclasses:
+`UsageRepository` (`apps/usage-service/src/repositories/usage.repository.ts`) over the copy that
+*has* the `TimeZone` pin, and worker-service's `EventRepository`
+(`apps/worker-service/src/repositories/event.repository.ts`, added by T-040) over a copy that
+does **not**. The remaining three base classes still have no subclass; the only other matches are
+the `EventRepository` example inside each file's own docstring.
+
+So worker-service is the first service to run a live tenant-scoped data path over an unpinned
+copy. **No query is wrong today** and T-040 shipped on that basis: it carries an explicit
+ORM-only commitment for timestamp writes, and the ORM path is measured safe (`CLAUDE.md`
+§ *Raw SQL and timestamps*) — the only raw SQL in worker-service is the `set_config` template,
+which takes no timestamp. The exposure is the *next* raw timestamp predicate written there,
+which inherits S-18 exactly.
+
+Until T-040 this paragraph read "latent, not live … exactly one real subclass". That was true
+when written and T-040 falsified it, which is the whole hazard this entry describes: the fix is
+in the copy that happened to have the bug, and the other four disagree with it silently.
+Corrected in T-040's own commit, at the Gate-6 review (LOW-7).
 
 One thing the obvious fix would still not reach, recommended by the S-18 reviewer and recorded
 here so it is not lost: auth-service's two pre-authentication resolver calls
@@ -808,3 +820,199 @@ was **disclosed by the implementer at Gate 3**, passed through two review rounds
 raised, and was found independently by QA at Gate 5. Then this entry — written to capture it —
 was itself wrong three times over and was corrected at Gate 6. A volunteered caveat in a hand-off
 report is not a finding, and a finding written from one configuration is not a general claim.
+
+---
+
+## S-27 · Nothing keeps worker's stream envelope in step with usage-service's `RESERVED_STREAM_FIELDS` — **MEDIUM, open**
+
+The producer decides which stream fields are *envelope* and flattens everything else into
+sibling top-level fields; the consumer decides the same thing independently, from its own copy
+of the list, and treats everything not on it as customer metadata. The two lists are unrelated
+declarations. **When they disagree, the difference is written to a customer-facing column.**
+
+Each claim below with the command that established it.
+
+- **The two sets match today: 8 names, same order.** Compared programmatically rather than by
+  eye — a script parsed `RESERVED_STREAM_FIELDS` out of
+  `apps/usage-service/src/services/ingestion.service.ts` and `ENVELOPE_FIELD` out of
+  `apps/worker-service/src/constants.ts` and diffed them both ways: `only in producer: (none)`,
+  `only in consumer: (none)`, `same order: true`. Both are
+  `eventId, tenantId, eventType, quantity, unit, occurredAt, idempotencyKey, timestamp`.
+- **Nothing asserts it.** `grep -rn "RESERVED_STREAM_FIELDS" apps packages --include=*.ts`
+  (excluding `dist/`) returns **five** lines: the producer's declaration, the producer's single
+  use, and three *prose comments* — worker's `constants.ts` docblock (two lines: the one naming
+  the constant, and the one carrying this grep pattern, which therefore matches itself) and the
+  `stream-message.validator.unit.test.ts` docstring. An earlier revision said **four**, short by
+  exactly that self-match; corrected at the Gate-5 review (QA-1).
+  No test references it. Worker's `U41` pins worker's constant against worker's parser, which is
+  a different property: it asserts a field named in `ENVELOPE_FIELD` reaches neither a column nor
+  `metadata`, and it stays green whatever the producer's set contains.
+- **The exposed direction is a producer-side *addition*, and the exposure is measured rather than
+  reasoned about.** Feeding worker's `parseStreamMessage` an otherwise-valid entry carrying the
+  three Q1 envelope fields returned
+  `metadata = {"receivedAt":"2026-01-01T00:00:01.000Z","source":"sdk-web","version":"1"}`.
+  So if the producer starts publishing any of them, they land in `Event.metadata` for every
+  event — the blob a customer-facing API would return — with the whole suite green. `receivedAt`,
+  `source` and `version` are not hypothetical: `docs/epics/README.md` records Q1 as **decided**
+  with them required, and they are simply not on the wire yet (S-29).
+- **A producer-side *removal* is the harmless direction**: the field would stop being reserved
+  there and start arriving as metadata here, which is the same outcome by intent rather than by
+  accident. Not tested; stated as the asymmetry, not as a measurement.
+
+MEDIUM rather than LOW because the failure mode is a data-exposure path rather than a
+correctness one, it is silent, and the triggering change lives in a different service from the
+one that leaks.
+
+**Why the copy exists, and why the fix is not "just import it".** `RESERVED_STREAM_FIELDS` is a
+module-private `const` with no `export` keyword, inside another service's service layer.
+Importing across two services' internals would couple worker's parse to usage-service's
+implementation detail, which is a real objection and not a rationalisation.
+
+**Fix direction:** promote the set to `@telemetry/shared-types` alongside
+`EVENT_STREAM_CONSTANTS`, have both services read it, and delete both copies. If promotion is
+deferred, the cheap interim is a test that imports both and asserts set equality — which is only
+possible once the producer's side is exported, so exporting it is the first step either way.
+
+---
+
+## S-28 · The `UsageLine` tenant predicate cannot be tested, and removing it is green — **LOW, open**
+
+`EventRepository.upsertEventWithUsageLine` addresses the `UsageLine` through
+`this.where({ eventId })`, which the tenant-isolation rule requires. **No behavioural test can
+fail when that predicate is removed**, and this is recorded so that nobody deletes it on the
+evidence that deleting it is green.
+
+Measured, three times over, at T-040 Gate 3 and again at the Gate-4 review: replacing
+`this.where({ eventId })` with a bare `{ eventId }` typechecks clean and leaves **all** of
+worker-service's integration cases passing. The only failure is `U51`
+(`tests/event.repository.unit.test.ts`), which asserts the *shape* of the `where` object rather
+than an isolation outcome.
+
+**The cause is the schema, not the test suite.** `UsageLine.eventId` is globally `@unique`
+(`prisma/schema.prisma`, `eventId String @unique`; live index
+`CREATE UNIQUE INDEX "UsageLine_eventId_key" ON public."UsageLine" USING btree ("eventId")`), and
+the value is always an `Event.id`, itself a global primary key. So reaching another tenant's
+`UsageLine` through that key would require this tenant to hold an `Event` with that id, which the
+primary key forbids. The cross-tenant address is not merely unreached — it is unrepresentable
+under this schema, which is why no integration case exists rather than why one was not written.
+
+Contrast the **`Event`** lookup in the same method, whose predicate *is* load-bearing and *is*
+tested: two tenants genuinely do share idempotency keys, which is the whole reason for migration
+`v1_6`, and `I15` exercises it.
+
+**Keep the predicate.** `.claude/rules/tenant-isolation.md` requires an explicit `tenantId` on
+every tenant-scoped query, and the property should survive a schema in which `eventId` stops
+being globally unique — at which point the exploit becomes reachable and this entry becomes a
+live gap rather than a dormant one.
+
+**Fix direction:** none available while `eventId` is globally unique. Revisit if `UsageLine.eventId`
+ever loses its global `@unique`, or if `UsageLine` gains a second tenant-scoped lookup key that is
+*not* derived from a global primary key — write the cross-tenant case then.
+
+---
+
+## S-29 · `docs/epics/epic-7-worker-service.md`'s T-040 section diverges from the shipped code in four ways — **LOW, open**
+
+Same class as S-17, different epic. Filed so that T-041 and T-043 — which are specified in the
+same file — are not read as contract without checking the code first. Each line re-derived.
+
+- **`:114` names a file the atomicity requirement at `:116` forbids.** It lists
+  `repositories/event.repository.ts`, `repositories/usage-line.repository.ts`; `:116` requires
+  "Entire operation runs in a Prisma transaction". On this codebase those conflict:
+  `TenantScopedRepository.withTenant` owns the transaction and `TransactionClient` is declared
+  without `export` in all five copies of `base.repository.ts`, so two repositories mean either
+  two transactions or an edit to `base.repository.ts` in one service alone (S-19). T-040 shipped
+  one repository (Gate-2 decision D4).
+- **`:126` writes `where: { idempotencyKey: payload.idempotencyKey }`**, which migration `v1_6`
+  has made a **compile error**, not merely a bad idea. Verified by writing exactly that form
+  into the shipped repository and running `tsc`:
+  `error TS2322: Type '{ idempotencyKey: string; }' is not assignable to type
+  'EventWhereUniqueInput'`, whose cascaded detail line reads `… is missing the following
+  properties from type '{ id: string; tenantId_idempotencyKey: … }': id,
+  tenantId_idempotencyKey`. `EventWhereUniqueInput` is now `AtLeast<…, "id" |
+  "tenantId_idempotencyKey">`, so the epic's snippet cannot be typed, let alone run.
+- **`:143`'s `metricKey` rule yields an unpriceable key.** It says
+  `${event.eventType}.${event.unit}` — e.g. `"api.request.requests"`. Against the entries on the
+  live stream that produces `"api.request.request"`, matching no `Meter` seeded by
+  `prisma/seed.ts` (`DEFAULT_METRICS = ["api.request", "storage.write", "storage.read"]`) or by
+  usage-service's integration fixtures. T-040 shipped the bare `eventType` (D1).
+  **One qualifier, in the epic's favour, that T-040's plan omitted:** `:143` continues
+  *"Adjust if Q1 decision specifies a different convention."* So the epic invites the override
+  rather than flatly contradicting the code, and the plan's "the epic is wrong" framing was
+  stronger than the text supports. The divergence worth recording is that the adjustment has
+  been made and the line still reads as the default.
+- **Q1's envelope is recorded as decided and is not on the wire.** `docs/epics/README.md` records
+  Q1 with `receivedAt`, `source`, `version` and `payload` required. The producer publishes none
+  of them, and does publish `quantity`, `unit` and `timestamp`, which Q1 does not list. See S-27
+  for the consequence if that is ever reconciled producer-first.
+
+**Fix direction:** decide contract-first in each case — correct the epic, or change the code and
+say so. Do not "fix" any of them by editing a test: T-040's suite pins the shipped behaviour
+deliberately, with the reasons inline.
+
+---
+
+## S-30 · `prisma/schema.prisma` omits the `@default("")` that `v1_3` gave `User.firstName`/`lastName` — **LOW, open, pre-existing**
+
+**Not introduced by T-040** — found incidentally during its Gate-4 review and re-measured at the
+rework. `git show 7dc7392:prisma/schema.prisma` already declares `firstName String` and
+`lastName String` with no `@default`, so the drift predates the change that found it and belongs
+to whoever owns `v1_3`.
+
+Measured in both directions with `prisma migrate diff`, which is read-only:
+
+- `--from-schema-datamodel prisma/schema.prisma --to-url <db>` emits exactly one statement —
+  `ALTER TABLE "public"."User" ALTER COLUMN "firstName" SET DEFAULT '', ALTER COLUMN "lastName"
+  SET DEFAULT '';` — and **nothing else**, which is also the evidence that T-040's `v1_6`
+  `Event` index and `prisma/schema.prisma` agree exactly.
+- The inverse, `--from-url <db> --to-schema-datamodel prisma/schema.prisma`, emits
+  `ALTER TABLE "User" ALTER COLUMN "firstName" DROP DEFAULT, ALTER COLUMN "lastName" DROP
+  DEFAULT;` — which is the shape the next `prisma migrate dev` would generate. Stated as the
+  measured diff in that direction; `migrate dev` itself was **not** run, because it would write a
+  migration.
+- Live columns: `information_schema.columns` reports `firstName|''::text|NO` and
+  `lastName|''::text|NO`. `prisma/migrations/v1_3_add_user_names/migration.sql` is where the
+  defaults came from (`ADD COLUMN … TEXT NOT NULL DEFAULT ''`).
+
+Nothing is broken today: the database has the stricter-looking state, registration always
+supplies both fields, and `migrate status` reports the schema up to date.
+
+**Fix direction:** add `@default("")` to both fields in `prisma/schema.prisma` so the model
+matches `v1_3`, in a commit that does nothing else — or, if the defaults were only ever a
+backfill convenience, drop them in a forward-only migration and leave the schema as is. Decide
+which, rather than letting the next `migrate dev` decide by emitting a `DROP DEFAULT` nobody
+intended.
+
+---
+
+## S-31 · A malformed stream message is undiagnosable, and retries forever — **LOW, open**
+
+`apps/worker-service/src/validators/stream-message.validator.ts` discards the reason a message
+failed to parse. `envelopeSchema.safeParse(record)` produces a `ZodError` whose `issues[]` names
+the offending field and why; the parser throws
+`new Error(WORKER_EVENT_PROCESSING.ERROR.INVALID_MESSAGE)` instead — one fixed string, the same
+for every malformation. `foldFields` does the same for an odd-length field list
+(`ERROR.ODD_FIELD_LIST`).
+
+**Consequence, and it compounds.** T-040's contract is deliberate and correct: if processing
+throws, the entry is **not** acknowledged, so it stays in the pending list and is redelivered.
+For a transient failure that is exactly right. For a *malformed* message it is a poison entry —
+redelivered forever, failing identically each time, with a log line that says a message was
+invalid and not which field or why. The operator's only route to the cause is reading the raw
+entry out of Redis by hand, and only while it is still in the stream.
+
+**The safe fix is available and narrow.** Zod's `issues[].path` is field **names**, not values —
+so including the paths (and `code`, not `message`, if the wording is a concern) diagnoses the
+failure without logging any tenant data. Verified at the Gate-5 review: the paths carry no
+payload content.
+
+**Not fixed in T-040 deliberately.** It changes production behaviour, and the change was already
+past its review gate when the gap was found. Note the *retry-forever* half is **T-041's**
+territory — retry accounting and a dead-letter destination are that task's stated scope, and the
+parser docstring already says so. This entry exists so the two halves are connected: T-041 will
+stop the infinite retry, but a dead-lettered message with no diagnosis is still undiagnosable.
+
+**Fix direction:** include `issues[].path` (and optionally `code`) in the thrown error or the log
+fields, in T-041 alongside the dead-letter work, and assert in a test that no *value* from the
+message reaches the log — the negative is the part worth pinning, since the whole reason this is
+LOW rather than MEDIUM is that nothing tenant-bearing is emitted today.

@@ -22,6 +22,22 @@ const XGROUP_OK_REPLY = "OK";
 const XAUTOCLAIM_EMPTY_REPLY = ["0-0", [], []];
 
 /**
+ * One reclaimed entry, for the case that has to observe the *handler* rather than the loop.
+ *
+ * Recovery is the only place a fixture-controlled entry can reach the handler in this suite:
+ * `readXreadgroup` never settles on purpose (a healthy worker is parked on a blocking read),
+ * so `XAUTOCLAIM` is the delivery path a test can drive. Terminal cursor, so recovery makes one
+ * pass.
+ */
+const RECLAIMED_ENTRY_ID = "1789101023804-0";
+const RECLAIMED_ENTRY_FIELDS = ["eventId", "3c9d8ee5-1b2a-4c3d-8e4f-5a6b7c8d9e0f"];
+const XAUTOCLAIM_ONE_ENTRY_REPLY = [
+  "0-0",
+  [[RECLAIMED_ENTRY_ID, RECLAIMED_ENTRY_FIELDS]],
+  []
+];
+
+/**
  * The rejection ioredis produced when the container's own client options
  * (`maxRetriesPerRequest: 2`, `enableReadyCheck: true`, `lazyConnect: true`) were pointed at
  * a port nothing listens on: `MaxRetriesPerRequestError`, after ~160 ms. Reproduced here as a
@@ -108,6 +124,7 @@ describe("graceful shutdown (worker-service)", () => {
     closeError?: Error;
     loadEnvFileError?: EnvLoadError;
     xgroupError?: unknown;
+    reclaimOneEntry?: boolean;
   }): Promise<{
     moduleUnderTest: WorkerIndexModule;
     logger: { info: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
@@ -121,6 +138,8 @@ describe("graceful shutdown (worker-service)", () => {
     readXautoclaim: ReturnType<typeof vi.fn>;
     readDisconnect: ReturnType<typeof vi.fn>;
     buildApp: ReturnType<typeof vi.fn>;
+    processorHandler: ReturnType<typeof vi.fn>;
+    buildHandler: ReturnType<typeof vi.fn>;
   }> => {
     const logger = {
       info: vi.fn(),
@@ -159,7 +178,17 @@ describe("graceful shutdown (worker-service)", () => {
     // immediately (`mockResolvedValueOnce(null)`), the flag still reported `false` and the
     // suite still reported 12 passed, so it did not observe settlement at all.
     const readXreadgroup = vi.fn(() => new Promise(() => undefined));
-    const readXautoclaim = vi.fn().mockResolvedValue(XAUTOCLAIM_EMPTY_REPLY);
+    const readXautoclaim = vi
+      .fn()
+      .mockResolvedValue(
+        options?.reclaimOneEntry ? XAUTOCLAIM_ONE_ENTRY_REPLY : XAUTOCLAIM_EMPTY_REPLY
+      );
+
+    // T-040: the container now carries the processor whose handler `start()` must hand to the
+    // consumer. Stubbed on the same shared container object as `xgroup` and `duplicate`, so a
+    // later task extends one place rather than four call sites.
+    const processorHandler = vi.fn().mockResolvedValue(undefined);
+    const buildHandler = vi.fn(() => processorHandler);
     const readDisconnect = vi.fn();
     const redisDuplicate = vi.fn(() => ({
       xreadgroup: readXreadgroup,
@@ -182,7 +211,8 @@ describe("graceful shutdown (worker-service)", () => {
           disconnect: redisDisconnect,
           xgroup: redisXgroup,
           duplicate: redisDuplicate
-        }
+        },
+        eventProcessor: { buildHandler }
       },
       close: appClose,
       listen: appListen
@@ -238,7 +268,9 @@ describe("graceful shutdown (worker-service)", () => {
       readXreadgroup,
       readXautoclaim,
       readDisconnect,
-      buildApp
+      buildApp,
+      processorHandler,
+      buildHandler
     };
   };
 
@@ -418,6 +450,31 @@ describe("graceful shutdown (worker-service)", () => {
     expect(closeOrder).toBeDefined();
     expect(stopOrder).toBeLessThan(closeOrder as number);
     expect(exitCodes).toContain(0);
+  });
+
+  it("U46 - hands the processor's handler to the consumer, so a delivered entry reaches the database path", async () => {
+    const context = await setupIndexModule({ reclaimOneEntry: true });
+
+    // Behaviour, not a construction-argument snapshot. Asserting `new StreamConsumer` was
+    // called with five arguments would need the class mocked, and would then pass for a fifth
+    // argument the consumer never used. This drives a real entry through the real consumer and
+    // checks where it lands.
+    await vi.waitFor(() => {
+      if (context.processorHandler.mock.calls.length === 0) {
+        throw new Error("the reclaimed entry never reached the processor's handler");
+      }
+    });
+
+    expect(context.buildHandler).toHaveBeenCalledTimes(1);
+    expect(context.processorHandler).toHaveBeenCalledWith(
+      RECLAIMED_ENTRY_ID,
+      RECLAIMED_ENTRY_FIELDS
+    );
+    // Without the fifth argument the consumer falls back to `buildDefaultMessageHandler`, which
+    // logs and acknowledges nothing -- so the worker would read the same backlog forever while
+    // reporting healthy. `src/events/**` is outside the coverage thresholds (S-25), so no
+    // percentage notices; this case is the only thing that does.
+    expect(context.appListen).toHaveBeenCalledTimes(1);
   });
 
   it("U8 - fails closed and never binds the listener when Redis is unreachable", async () => {

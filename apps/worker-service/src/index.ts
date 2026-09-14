@@ -100,11 +100,20 @@ const start = async (): Promise<void> => {
 	// change -- a worker can no longer start without a reachable Redis. Against a port
 	// nothing listens on, the container's client options rejected in ~160 ms with
 	// `MaxRetriesPerRequestError`, so the failure is fast rather than a hang.
+	//
+	// T-040 supplies the fifth argument, `handler`. Without it the consumer falls back to
+	// `buildDefaultMessageHandler`, which logs an entry and acknowledges nothing -- correct
+	// while no processor existed, and now the difference between a worker that stores usage and
+	// one that silently re-reads the same backlog forever. `src/events/**` is outside this
+	// package's coverage thresholds (S-25), so no percentage would notice its absence; `U46` in
+	// `tests/index.graceful-shutdown.unit.test.ts` is what does, by asserting that a reclaimed
+	// entry reaches the processor's handler.
 	streamConsumer = new StreamConsumer(
 		container.redis,
 		container.logger,
 		container.env,
-		() => shuttingDown
+		() => shuttingDown,
+		container.eventProcessor.buildHandler()
 	);
 	await streamConsumer.ensureConsumerGroup();
 
