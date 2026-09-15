@@ -382,10 +382,15 @@ describe("billing-service env schema", () => {
           headers: { [BILLING_HEADERS.INTERNAL_SECRET]: parsedSecret }
         });
 
-        expect(accepted.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
+        // T-045 replaced the stub handler with the real one, so an authenticated request with
+        // no body now reaches the controller and fails validation. Updated rather than relaxed:
+        // the subject of this case is *which secret authenticates*, and a 400 proves the
+        // request got past the guard exactly as the stub's 200 did. The `not.toBe(401)` states
+        // that directly, so a future handler change cannot make this pass on a rejection.
+        expect(accepted.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_BAD_REQUEST);
+        expect(accepted.statusCode).not.toBe(BILLING_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
         expect(accepted.json()).toMatchObject({
-          status: BILLING_RESPONSES.STATUS_ACCEPTED,
-          workflow: BILLING_RESPONSES.WORKFLOW_BILLING_GENERATION
+          code: BILLING_RESPONSES.CODE_VALIDATION_ERROR
         });
 
         const rejected = await app.inject({
@@ -433,7 +438,9 @@ describe("billing-service env schema", () => {
           headers: { [BILLING_HEADERS.INTERNAL_SECRET]: overrideSecret }
         });
 
-        expect(accepted.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
+        // Same T-045 update as the case above: past the guard, then rejected by the schema.
+        expect(accepted.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_BAD_REQUEST);
+        expect(accepted.statusCode).not.toBe(BILLING_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
 
         const rejected = await app.inject({
           method: "POST",

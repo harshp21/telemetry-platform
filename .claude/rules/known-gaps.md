@@ -64,7 +64,7 @@ corrected at T-044's Gate-4 review (M-1).
    T-037 declared `INTERNAL_API_SECRET` in worker-service's `EnvSchema` with
    `.trim().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)`; T-044 did the same for
    billing-service. Both parse at module load and both read the parsed value in `app.ts`
-   (`apps/worker-service/src/app.ts:27`, `apps/billing-service/src/app.ts:29`). Before T-044,
+   (`apps/worker-service/src/app.ts:27`, `apps/billing-service/src/app.ts:26`). Before T-044,
    billing built its app with `process.env.INTERNAL_API_SECRET ?? ""`: reproduced at Gate 3 on
    `961d222` through `app.inject`, `INTERNAL_API_SECRET=short` (5 characters) booted and returned
    `200` on `POST /v1/internal/billing/generate`. On the fixed tree the same 5-character value,
@@ -93,7 +93,22 @@ corrected at T-044's Gate-4 review (M-1).
    registration is now at `apps/worker-service/src/app.ts:59`.) An unauthenticated
    caller still gets its body parsed and validated before rejection, and the un-`return`ed
    `reply.status(401).send(...)` inside an async hook relies on Fastify's `reply.sent` check
-   rather than stating the short-circuit.
+   rather than stating the short-circuit. **The cost of this grew at T-045**: measured, a wrong
+   secret gives `401` with the route handler never running (`handlerRan = 0`), but
+   `bodyParsed = 1` — so an unauthenticated caller's body is now parsed and validated against a
+   real schema rather than an empty stub.
+4. **billing picks the first value of a duplicated header where usage-service rejects it.**
+   `apps/billing-service/src/middleware/internal-auth.middleware.ts:7` does
+   `Array.isArray(provided) ? provided[0] : provided`; usage-service (`:50`) treats any
+   non-string as smuggling and rejects. **Measured at T-045's Gate 1 before being called a
+   hole, and it is not one:** over a real `net`/`http` socket *and* via `app.inject`, a
+   duplicated `x-internal-secret` arrives **joined** as `"good-secret, evil"` — type `string`,
+   never an array — so the `provided[0]` arm is unreachable through HTTP at fastify 5.10.0, and
+   the joined value fails the comparison into a `401`. Scope of that: this header, this version,
+   two transports; `set-cookie` is the documented array-valued exception and was **not** probed.
+   Listed because it is a real divergence between two guards that should be identical, not
+   because it is exploitable. T-045's plan §10 said it should be listed here and it was not —
+   caught at that task's Gate-6 review (R2-LOW-3).
 
 **Fix direction:** add `.trim()` before `.min(...)` in usage-service's and gateway's
 `EnvSchema`, so all **four secret schemas** declare the field identically. Note that is
@@ -145,7 +160,9 @@ than keeping three copies of the middleware, and adopt each service's
 `HTTP_STATUS_UNAUTHORIZED` constant instead of the literal `401` at
 `internal-auth.middleware.ts:10` — worker-service and billing-service both now define
 `HTTP_STATUS_OK` / `HTTP_STATUS_UNAUTHORIZED` (`apps/worker-service/src/constants.ts:39-40`,
-`apps/billing-service/src/constants.ts:25-26`, both added so their env suites could assert
+`apps/billing-service/src/constants.ts:28` and `:31` (T-045 inserted six status constants
+between them, so they are no longer contiguous and the old `:25-26` range was wrong twice over),
+both added so their env suites could assert
 statuses without literals) and both middlewares still write the literal.
 
 ---
@@ -468,25 +485,45 @@ Consequence: the other four services' `withTenant` opens a transaction whose ses
 whatever the server defaults to. Their columns are the same `timestamp(3) without time zone`, so
 the first raw timestamp predicate written in any of them inherits S-18 exactly.
 
-**How bad it is today, stated no stronger than measured — and this changed with T-040.**
-`grep -rn "extends TenantScopedRepository" apps/*/src` now finds **two** real subclasses:
-`UsageRepository` (`apps/usage-service/src/repositories/usage.repository.ts`) over the copy that
-*has* the `TimeZone` pin, and worker-service's `EventRepository`
-(`apps/worker-service/src/repositories/event.repository.ts`, added by T-040) over a copy that
-does **not**. The remaining three base classes still have no subclass; the only other matches are
-the `EventRepository` example inside each file's own docstring.
+**How bad it is today, stated no stronger than measured — and it has now changed twice.**
+`grep -rn "extends TenantScopedRepository" apps/*/src` finds **four** real subclasses across
+**three** services, in nine total matches (the other five are the `EventRepository` example
+inside each base file's own docstring):
 
-So worker-service is the first service to run a live tenant-scoped data path over an unpinned
-copy. **No query is wrong today** and T-040 shipped on that basis: it carries an explicit
-ORM-only commitment for timestamp writes, and the ORM path is measured safe (`CLAUDE.md`
-§ *Raw SQL and timestamps*) — the only raw SQL in worker-service is the `set_config` template,
-which takes no timestamp. The exposure is the *next* raw timestamp predicate written there,
-which inherits S-18 exactly.
+| Subclass | Base copy | `TimeZone` pin | Added by |
+|---|---|---|---|
+| `apps/usage-service/src/repositories/usage.repository.ts:150` | usage | **yes** | S-18 era |
+| `apps/worker-service/src/repositories/event.repository.ts:64` | worker | no | T-040 |
+| `apps/billing-service/src/repositories/meter.repository.ts:35` | billing | no | T-045 |
+| `apps/billing-service/src/repositories/invoice.repository.ts:94` | billing | no | T-045 |
 
-Until T-040 this paragraph read "latent, not live … exactly one real subclass". That was true
-when written and T-040 falsified it, which is the whole hazard this entry describes: the fix is
-in the copy that happened to have the bug, and the other four disagree with it silently.
-Corrected in T-040's own commit, at the Gate-6 review (LOW-7).
+Line numbers are as of the T-045 tree and re-derived from
+`grep -rn "extends TenantScopedRepository" apps/*/src`, filtered to lines beginning
+`export class` — the unfiltered grep also returns five docstring examples. They have already
+rotted once: the `invoice.repository.ts` citation was written at `:87`, was `:92` by the time
+Gate 4 measured it, and is `:94` on the tree that shipped, because the fix for that review moved
+it. Re-run the grep rather than trusting the column.
+
+So three of the four live tenant-scoped data paths run over an unpinned copy, and analytics and
+auth still have no subclass at all. **No query is wrong today**, and both T-040 and T-045 shipped
+on that basis by committing explicitly to the ORM for every date predicate, which is measured
+safe (`CLAUDE.md` § *Raw SQL and timestamps*). T-045 re-measured it on billing's own tables
+before relying on it: over four session zones (`UTC`, `Asia/Kolkata`, `America/New_York`,
+`Asia/Kathmandu`) an ORM `findUnique` on `Invoice @@unique([tenantId, periodStart, periodEnd])`
+found its row in all four, while `$queryRaw` equality with a bound JS `Date` found it in `UTC`
+only. The exposure is the *next* raw timestamp predicate written in any of the three unpinned
+services. In billing that mutation has been run rather than reasoned about: rewriting
+`InvoiceRepository.findByPeriod` as `$queryRaw` with bound `Date`s turns
+`apps/billing-service/tests/billing.integration.test.ts` **BI7** red, and — because BI7 pins
+`Asia/Kolkata` in its own connection string — it stays green under that same defect when the pin
+is changed to `UTC`, which is what makes the case a guard rather than a restatement of this
+host's server default.
+
+Until T-040 this paragraph read "latent, not live … exactly one real subclass"; T-040 took it to
+two and T-045 to four. That is the whole hazard this entry describes: the fix is in the copy that
+happened to have the bug, and the other four disagree with it silently. Each correction landed in
+its own task's commit — T-040 at its Gate-6 review (LOW-7), T-045 as slice S7 of
+`docs/plans/t-045-internal-metering-endpoint.md`.
 
 One thing the obvious fix would still not reach, recommended by the S-18 reviewer and recorded
 here so it is not lost: auth-service's two pre-authentication resolver calls
@@ -1177,7 +1214,7 @@ bottom. A count you cannot re-run is not evidence.
 | `constants.ts`: `WORKER_STREAM_CONSTANTS`' member count "feeds `env.ts`", with a `grep -c` to check it | `git show <rev>:apps/worker-service/src/config/env.ts \| grep -c 'WORKER_STREAM_CONSTANTS\.'` | **7** at `7ad9375`, `b558641`, `7dc7392` and `c88a933` alike — the claim was *true* until T-041. T-041's `.superRefine` took it to **12**; the task first wrote **11**, so the correction was itself wrong and only a second pass fixed it |
 | `constants.ts`: "the workspace's **single** production `xadd` call site" | `grep -rn "\.xadd(" apps packages --include=*.ts` excluding `dist/` and `tests/` | **two** call sites — T-041's own `dead-letter.service.ts` refuted it. The grep returns **three** lines: the third is the comment carrying the pattern, matching itself |
 | `constants.ts` + S-27: the `RESERVED_STREAM_FIELDS` grep "returns **four** lines" | `grep -rn "RESERVED_STREAM_FIELDS" apps packages --include=*.ts` | **five** — same self-match |
-| S-19: "exactly one real subclass … **latent, not live**" | `grep -rn "extends TenantScopedRepository" apps/*/src` | **two** since T-040 added worker's `EventRepository`, making a live data path over a base copy without the `TimeZone` pin |
+| S-19: "exactly one real subclass … **latent, not live**" | `grep -rn "extends TenantScopedRepository" apps/*/src` | **two** at T-040, which added worker's `EventRepository` — the first live data path over a base copy without the `TimeZone` pin. **Four** at T-045, which added billing's `MeterRepository` and `InvoiceRepository` over a third unpinned copy. Re-counted in each task rather than trusted; the entry now carries the table rather than a number in prose |
 | T-043 `stream.consumer.unit.test.ts`: the `dispatch`-guard mutation "reddens **nine** cases", with the nine listed | apply `if (this.shouldStop()) return;` at the top of `dispatch`'s per-entry loop, then `pnpm --filter @telemetry/worker-service exec vitest run tests/stream.consumer.unit.test.ts` | **eleven** — `Tests 11 failed \| 43 passed (54)`; the list omitted `U37` and `U70`. Caught at T-043's Gate 4 as LOW-2, inside a comment written in this entry's own style |
 
 **A second shape, and it is not a count: a measurement attached to the wrong mutation.** S-26's
@@ -1378,3 +1415,83 @@ raised for other reasons, this is the first case to add.
 
 **Do not close this by loosening `U79`.** It asserts the right thing; it simply asserts it
 against fake timers. The gap is the absence of a live sibling, not a defect in the unit case.
+
+---
+
+## S-37 · `Tenant.deletedAt` has no writer and no reader, and billing has now made it a contract — **LOW, open**
+
+Filed by T-045's Gate-4 review. Not a defect in anything shipped: it is a policy question that
+nothing has answered and that one service now silently answers by omission.
+
+**Measured on this tree**, `grep -rn "deletedAt" apps packages prisma --include=*.ts
+--include=*.prisma` excluding `dist/`, returns exactly three lines:
+
+- `prisma/schema.prisma:17` — the column, `DateTime?`.
+- `prisma/seed.ts:24` — a `deletedAt: null` in a script that cannot run (S-13).
+- `apps/billing-service/src/repositories/invoice.repository.ts` — a docstring in `tenantExists`
+  recording the choice below.
+
+So **nothing on the platform ever writes the column**, and nothing reads it. The database has no
+opinion either: `pg_policy` on `"Tenant"` gives **four** policies — `tenant_self_select`,
+`tenant_self_update`, `tenant_self_delete` and `tenant_self_insert` — all keyed on
+`(id = current_setting('app.tenant_id', true))`, and **none** carries a `deletedAt` term. (An
+earlier revision of this entry listed three, omitting the INSERT policy; corrected at Gate 5 of
+T-045, QA-2, which re-read `pg_policy` and confirmed the INSERT policy has no `deletedAt` term
+either, so the conclusion is unchanged.)
+
+**What billing does today.** `InvoiceRepository.tenantExists` counts `"Tenant"` by id with no
+`deletedAt` predicate, so a soft-deleted tenant is treated as live and is invoiced normally. That
+was a deliberate choice at T-045 and the review ruled it correct: refusing to invoice a
+recently-deleted tenant loses revenue for usage already incurred, which is T-045's own D1
+argument — refuse rather than quietly lose money — pointed at a different target. Inventing a
+billing-time soft-delete policy with no writer, no product decision and no other consumer would
+have been exactly the silent resolution `CLAUDE.md` tells agents to refuse.
+
+**Why it is still open.** The moment anything writes `deletedAt` — an account-closure flow in
+Epic 4 or Epic 11 is the obvious candidate — billing's behaviour becomes a contract nobody chose,
+and it will be discovered by a customer invoice rather than by a test. The cost of deciding it
+later is not the code; it is that the first writer will not know billing has an opinion.
+
+**Fix direction:** decide the policy *before* the first writer lands, and record it in
+`docs/epics/README.md` as a decision gate rather than only in a repository docstring. If the
+answer is "do not invoice a soft-deleted tenant", the change is one predicate
+(`where: { id: tenantId, deletedAt: null }`) plus one integration case that seeds `deletedAt` —
+measured as the whole diff, not estimated. If the answer is "invoice it anyway", say so in the
+epic so the next reader stops re-deriving it. Either way, whoever adds the first writer should be
+made to look here.
+
+---
+
+## S-38 · The `P2002` re-read path has no test against a real connection — **LOW, open**
+
+`apps/billing-service/src/repositories/invoice.repository.ts`'s `createDraftInvoice` catches
+Prisma's `P2002` on `Invoice @@unique([tenantId, periodStart, periodEnd])` and re-reads to return
+the existing `invoiceId`. That catch is the **real** idempotency serializer — the step-2 existence
+check is an optimisation, not a guarantee, because it and the insert are not serializable against
+a concurrent caller.
+
+**It is covered by unit tests only.** They seed a `P2002` on a repository double, so they pin the
+branch and the re-read, but nothing standing drives that path through a real PostgreSQL unique
+violation. The gate run confirms it: zero `prisma:error` lines across all 806 tests.
+
+**The behaviour is correct — verified by hand, once.** Gate 5 of T-045 drove genuinely parallel
+callers, 4 rounds at 2 and 4 concurrent: always one `201` and the rest `200` with the same invoice
+id, 1 invoice, 1 line item, 20/20 lines billed, no `409`, no `500`. That run also confirmed the
+`meta.target = null` scoping, with Prisma logging `Unique constraint failed on the (not available)`
+as `telemetry_app`. **Nothing stands behind that verification now the session has ended**, which is
+what this entry records.
+
+**Why it was recorded rather than written.** The obvious test — `Promise.all` over two
+`createDraftInvoice` calls — **can pass vacuously**: if the two callers happen to serialise, one
+returns `201`, the other returns `200` from the *existence check* rather than from the `P2002`
+catch, and the assertion is satisfied without the path under test ever running. A test that is
+green whether or not it exercised its subject is worse than a recorded gap, and this file has
+already spent a round on a guard that turned out to be decoration (`BU40b`).
+
+**Fix direction:** a test here has to *prove the overlap*, not assume it — advisory locks, a
+`pg_sleep` inside one transaction, or asserting on the Prisma error log rather than on the status
+code. Whoever writes it should make the vacuous form fail first: with the `P2002` catch removed,
+the case must go red, and if it does not, it is measuring the existence check instead.
+
+**Not a correctness risk today.** Both paths return the same `200 { data: { invoiceId } }`, so a
+lost race is already indistinguishable to the caller. What is untested is that it *stays* that way.

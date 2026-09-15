@@ -2,13 +2,10 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { registerGlobalErrorHandler } from "@telemetry/shared-utils";
 import { env, type ServiceEnv } from "./config/env";
 import { createContainer, type AppContainer } from "./config/container";
-import {
-  BILLING_RESPONSES,
-  BILLING_ROUTES,
-  BILLING_SERVICE_NAME
-} from "./constants";
+import { BILLING_RESPONSES, BILLING_ROUTES, BILLING_SERVICE_NAME } from "./constants";
 import { InternalApiSecretMissingError } from "./errors";
 import { buildInternalAuthMiddleware } from "./middleware/internal-auth.middleware";
+import { registerInternalBillingRoutes } from "./routes/internal.routes";
 
 interface BuildBillingServiceAppOptions {
   internalApiSecret?: string;
@@ -58,12 +55,10 @@ export const buildBillingServiceApp = (
 
     internalRoutes.addHook("preHandler", internalAuth);
 
-    internalRoutes.post(BILLING_ROUTES.INTERNAL_BILLING_GENERATE, async () => {
-      return {
-        status: BILLING_RESPONSES.STATUS_ACCEPTED,
-        workflow: BILLING_RESPONSES.WORKFLOW_BILLING_GENERATION
-      };
-    });
+    // Registered inside this `app.register` callback, so the guard above covers it. Moving
+    // the call outside the callback is what would put an unauthenticated invoice generator on
+    // the network; `tests/internal-billing.route.test.ts` BU61 goes red when it does.
+    registerInternalBillingRoutes(internalRoutes, container.internalController);
   });
 
   return app as unknown as FastifyInstance & { container: AppContainer };

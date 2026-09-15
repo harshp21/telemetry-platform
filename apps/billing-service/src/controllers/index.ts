@@ -1,1 +1,1 @@
-export {};
+export { InternalController } from "./internal.controller";

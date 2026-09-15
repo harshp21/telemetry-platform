@@ -15,7 +15,7 @@ Implementation sequence based on architectural dependencies and open decision ga
 | Q8 — External vs internal API consumers (**decided**: external only via gateway; internal routes private + `X-Internal-Secret`) | Epic 6 |
 | Q9 — Worker concurrency (**decided**: horizontal-ready, single instance locally) | Epic 7 |
 | Q10 — DLQ retry policy (**decided**: `MAX_RETRY_COUNT` 3, `DEAD_LETTER_STREAM` `telemetry:dead-letter`, no retry delay, alerting counter deferred to T-057) | Epic 7 |
-| Q2 — Pricing model | Epic 8 |
+| Q2 — Pricing model (**decided**: flat only for v1 — `amount = summedQuantity x unitPrice`; `Meter.tierJson` unread; tiered deferred pending a graduated-vs-volume ruling) | Epic 8 |
 | Q3 — UTC aggregation timezone | Epic 9 |
 | Q11 — Dashboard scope | Epic 11 |
 
@@ -51,6 +51,28 @@ Implementation sequence based on architectural dependencies and open decision ga
 - Implemented by T-041 (`docs/plans/t-041-retry-tracking-dead-letter.md`).
 - Revisit trigger: a dead-letter stream that accumulates during normal operation, which would
   mean the budget is too small for the platform's real failure durations.
+
+#### Q2 — Pricing model
+
+- Decision: **flat rate only for v1.** A line item's amount is `summedQuantity x unitPrice`,
+  where `unitPrice` comes from the `Meter` active as of `periodStart`.
+- `Meter.tierJson` (`prisma/schema.prisma:113`) stays `null` and unread: no Zod schema for it,
+  no tier evaluation, no tier tests. `docs/epics/epic-8-billing-service.md`'s step 7 reads
+  "flat: `quantity x unitPrice`; tiered: evaluate `tierJson`" — only the first arm is in scope.
+- **Tiered is deferred, not forgotten, and the reason is a product decision rather than an
+  implementation one.** *Graduated* and *volume* tiering give different totals for the same
+  input and the same tier table: graduated charges each band's rate on the quantity falling in
+  that band, volume charges the whole quantity at the band the total lands in. `tierJson`
+  records neither, so a later implementer reading the column cannot recover which was intended.
+  That has to be answered before code, not during it.
+- Per-meter `Meter.currency` versus the single `Invoice.currency` column: a period whose
+  matched meters disagree on currency is **rejected** (`422 METER_CURRENCY_CONFLICT`) rather
+  than resolved by picking one, because any choice would be silently wrong. Likewise a
+  `metricKey` with unbilled usage and no active meter is `422 METER_NOT_FOUND` — an invoice
+  that silently omits a metric is money missing from a document that looks complete.
+- Implemented by T-045 (`docs/plans/t-045-internal-metering-endpoint.md`).
+- Revisit trigger: the first customer contract that prices by band, or any `Meter` row written
+  with a non-null `tierJson`.
 
 #### Q6 — Multi-tenancy scope
 

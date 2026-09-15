@@ -1,1 +1,1 @@
-export {};
+export { registerInternalBillingRoutes } from "./internal.routes";
