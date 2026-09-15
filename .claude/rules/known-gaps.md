@@ -36,7 +36,7 @@ production code reads it. The enforced cap is a hard-coded `BATCH_SIZE_MAX: 100`
 
 ---
 
-## S-8 · billing / worker internal-auth guards are weaker than usage-service's — **MEDIUM, open**
+## S-8 · the three internal-auth guards still diverge, and their four secret schemas disagree — **MEDIUM, open**
 
 Found while fixing S-4, and deliberately not folded into it: changing two other services'
 startup contracts inside a usage-service security fix breaks the one-task-per-commit rule.
@@ -44,36 +44,109 @@ startup contracts inside a usage-service security fix breaks the one-task-per-co
 `apps/billing-service/src/middleware/internal-auth.middleware.ts:9` and
 `apps/worker-service/src/middleware/internal-auth.middleware.ts:9` are the same file, and both
 differ from `apps/usage-service/src/middleware/internal-auth.middleware.ts` in three ways
-(item 2 now applies to **billing-service only** — worker's env schema enforces the minimum at
-module load, so worker differs in two):
+(items 1 and 3 apply to both; item 2 no longer applies to either — T-037 declared the field for
+worker-service and T-044 for billing-service, so what is left of item 2 is **usage-service's and
+gateway's**, and it is a different defect from the one originally recorded):
+
+**Counts, because the two differ and the title used to conflate them.** There are **three**
+guards — `ls apps/*/src/middleware/internal-auth.middleware.ts` returns billing, usage and worker
+— and **four** schemas declaring the secret, `grep -rln "INTERNAL_API_SECRET" apps/*/src/config/env.ts`
+adding gateway. Gateway has a schema and no guard because it is the *caller*
+(`docs/reviewer-checklist.md:28` says so), which is why item 2 reaches four services and items 1
+and 3 reach three. An earlier revision of this title said "the four internal-auth guards";
+corrected at T-044's Gate-4 review (M-1).
 
 1. **`!==`, not a timing-safe comparison.** String comparison short-circuits at the first
    differing byte, so response latency leaks how many leading bytes a guess got right. See the
    `secretsMatch` helper in usage-service for the SHA-256 + `timingSafeEqual` form.
-2. **The secret bypasses the env schema — billing-service only.**
-   `apps/billing-service/src/app.ts:23` reads `process.env.INTERNAL_API_SECRET ?? ""` directly, so
-   `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH` is not enforced and a 1-character secret starts
-   cleanly. The `.trim()` check it does run happens *after* the DI container is built.
-   worker-service no longer has this: T-037 declared `INTERNAL_API_SECRET` in its `EnvSchema`
-   with `.trim().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)`, parsed at module load, and
-   `apps/worker-service/src/app.ts:27` reads the parsed value.
+2. **~~The secret bypasses the env schema~~ — closed for billing and worker; what remains is
+   usage-service's **and gateway's** untrimmed `.min()`.**
+   T-037 declared `INTERNAL_API_SECRET` in worker-service's `EnvSchema` with
+   `.trim().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)`; T-044 did the same for
+   billing-service. Both parse at module load and both read the parsed value in `app.ts`
+   (`apps/worker-service/src/app.ts:27`, `apps/billing-service/src/app.ts:29`). Before T-044,
+   billing built its app with `process.env.INTERNAL_API_SECRET ?? ""`: reproduced at Gate 3 on
+   `961d222` through `app.inject`, `INTERNAL_API_SECRET=short` (5 characters) booted and returned
+   `200` on `POST /v1/internal/billing/generate`. On the fixed tree the same 5-character value,
+   and 33 spaces, both fail at module load with
+   `Invalid environment configuration for INTERNAL_API_SECRET: String must contain at least 32 character(s)`.
+
+   **Still open:** `apps/usage-service/src/config/env.ts:15` and `apps/gateway/src/config/env.ts:14`
+   are `.min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)` with no `.trim()`. Measured against
+   usage-service's real schema field (`EnvSchema.shape.INTERNAL_API_SECRET.safeParse`, zod
+   3.25.76): 32 spaces → `success: true`, parsed length 32; 32 tabs → likewise; a 31-character
+   core padded to 35 → `success: true`, parsed length 35; a bare 31-character value → rejected.
+   So the *length* minimum is enforced and the *whitespace* hole is not. usage-service also has
+   no blank-secret guard in `app.ts` — it passes `env.INTERNAL_API_SECRET` straight to
+   `registerUsageInternalAuthMiddleware` (`apps/usage-service/src/app.ts:27`) — where billing and
+   worker both throw `InternalApiSecretMissingError` on a blank value. Note the docblock at
+   `apps/usage-service/src/middleware/internal-auth.middleware.ts:37-38` says the secret is
+   "Validated non-empty and at least `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH` long by the env
+   schema". Stated precisely: a 32-space string **is** literally non-empty, so the comment is not
+   false on its own words — it is misleading, because the property a reader takes from it is
+   *not blank*, and that is what an untrimmed `.min()` does not give. It should be reworded by
+   whichever task adds the `.trim()`. T-044 left usage-service alone deliberately
+   (decision D1-A in `docs/plans/t-044-billing-service-env-schema.md`): reaching into the live
+   ingestion service's startup contract from a billing env task is the move this gap twice
+   declined.
 3. **`preHandler`, not `onRequest`, and `reply.send(...)` is not returned.** (worker's
    registration is now at `apps/worker-service/src/app.ts:59`.) An unauthenticated
    caller still gets its body parsed and validated before rejection, and the un-`return`ed
    `reply.status(401).send(...)` inside an async hook relies on Fastify's `reply.sent` check
    rather than stating the short-circuit.
 
-**Fix direction:** move `INTERNAL_API_SECRET` into billing-service's `EnvSchema` with
-`.trim().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)` — the `.trim()` matters and is not
-decoration: `.min()` alone accepts an all-whitespace secret of the right length, which is the
-hole T-037 closed in worker-service. Note usage-service still carries the untrimmed
-`.min()` form and should be aligned in the same change, so all three end up identical.
+**Fix direction:** add `.trim()` before `.min(...)` in usage-service's and gateway's
+`EnvSchema`, so all **four secret schemas** declare the field identically. Note that is
+*schemas*, not services: gateway has a schema and no guard, so items 1 and 3 reach only the
+three services that have `internal-auth.middleware.ts`. An earlier revision said "so all four
+services end up identical", which the counts above refute. Order is load-bearing, not decoration, and
+the two wrong forms fail differently — measured against billing's real schema at Gate 3 of
+T-044 by mutating the declaration and re-running
+`apps/billing-service/tests/env.schema.unit.test.ts`:
+
+
+| Declaration | 32 spaces | 31-char core padded to 35 | Named tests red |
+|---|---|---|---|
+| `.trim().min(32)` (shipped) | rejected | rejected | none |
+| `.min(32)` (usage, gateway today) | accepted, parses to 32 spaces | accepted, parses to 35 | `rejects an all-whitespace …`, `rejects an INTERNAL_API_SECRET that reaches the minimum only by its padding`, `strips surrounding whitespace …` |
+| `.min(32).trim()` | accepted, parses to `""` | accepted, parses to 31 | the first two of those three |
+
+Note the third row: `.min(32).trim()` reads like a fix, passes the "strips surrounding
+whitespace" case, and still admits a 31-character secret. A suite that only asserts the trimmed
+*output* does not distinguish it.
+
+**Addendum — `.trim()` is narrower than it reads, and this applies to worker-service too
+(T-044 Gate 5).** `String.prototype.trim` strips the **ECMAScript `WhiteSpace` + `LineTerminator`
+set**: every `Zs`, plus TAB/VT/FF/CR/LF, plus U+2028/U+2029, **plus U+FEFF specifically**. It is
+*not* "all `Zs`, no `Cf`" — U+FEFF is `Cf` and **is** stripped, while U+00AD (also `Cf`) is not.
+Measured across 17 characters against billing's real schema (`z.string().trim().min(32)`, 32
+repetitions of each):
+
+| Stripped, so rejected | Not stripped, so **accepted as a 32-character secret** |
+|---|---|
+| U+0020, U+00A0, U+2000, U+3000 (`Zs`) · U+0009, U+000A, U+000B, U+000C, U+000D · U+2028, U+2029 · **U+FEFF (`Cf`)** | **U+200B, U+2060, U+180E, U+200C, U+00AD** — all `Cf` |
+
+So the guard the `.trim()` adds is "not made of whitespace **as ECMAScript defines it**", not "not
+made of invisible characters". An earlier revision of this addendum said `trim()` strips `Zs` and
+not `Cf`; that was generalised from a single `Cf` probe (U+200B) without trying the one that
+refutes it, and was corrected at T-044's Gate-6 review (H-1) after re-measuring the whole set.
+
+Severity is LOW and it **fails closed**: such a secret is accepted by the schema, but the caller
+must then send byte-identical invisible characters in `X-Internal-Secret` for the comparison to
+succeed, so the failure mode is a service that refuses every request rather than one that accepts
+a weak credential. It is recorded here rather than fixed because the fix belongs with the rest of
+this entry: worker-service has the identical `.trim().min(...)` form and the identical gap, so
+tightening one service's declaration and not the other would add a fourth strictness to an entry
+whose whole subject is that four already disagree. Whoever closes items 1-3 should decide the
+normalisation once, for all of them.
 
 Then promote the guard to `onRequest` in both, share one timing-safe comparison helper rather
 than keeping three copies of the middleware, and adopt each service's
 `HTTP_STATUS_UNAUTHORIZED` constant instead of the literal `401` at
-`internal-auth.middleware.ts:10` — worker-service defines the constant but its middleware still
-writes the literal.
+`internal-auth.middleware.ts:10` — worker-service and billing-service both now define
+`HTTP_STATUS_OK` / `HTTP_STATUS_UNAUTHORIZED` (`apps/worker-service/src/constants.ts:39-40`,
+`apps/billing-service/src/constants.ts:25-26`, both added so their env suites could assert
+statuses without literals) and both middlewares still write the literal.
 
 ---
 
@@ -755,7 +828,6 @@ suites sharing an index. `grep -rln 'CLIENT LIST\|INFO clients' apps/*/tests` re
 only `apps/worker-service/tests/stream.consumer.integration.test.ts` and its
 `integration.constants.ts`, so the surface is one suite.
 
-
 ---
 
 ## S-26 · worker-service's shutdown teardown log lines raced `process.exit` — **LOW, largely closed by T-043**
@@ -1164,7 +1236,6 @@ Do **not** address this by deleting the counts. They are load-bearing: the `xadd
 counts are evidence for security-relevant claims, and a vaguer comment would be worse than a
 stale precise one. The number should stay and become checkable.
 
-
 ---
 
 ## S-34 · The consumer-registry leak became unbounded when consumer names became instance-unique — **LOW, open**
@@ -1272,7 +1343,6 @@ scheduler stops producing work before the consumer drains what it has.
 Recorded here **and** in the epic's T-042 section because it previously lived only in
 `docs/plans/t-043-worker-graceful-shutdown.md`, and `CLAUDE.md` is explicit that nothing may read
 `docs/plans/` as a record. S-15 says the same of the epic files, which is why it is in both.
-
 
 ---
 
