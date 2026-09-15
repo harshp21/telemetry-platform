@@ -1,7 +1,11 @@
 import type Redis from "ioredis";
 import type { Logger } from "pino";
 import type { ServiceEnv } from "../config/env";
-import { WORKER_CONSUMER_GROUP_BOOTSTRAP, WORKER_STREAM_READ } from "../constants";
+import {
+  WORKER_CONSUMER_GROUP_BOOTSTRAP,
+  WORKER_SHUTDOWN,
+  WORKER_STREAM_READ
+} from "../constants";
 import { describeError } from "../utils/describe-error";
 
 /**
@@ -43,6 +47,50 @@ interface ParsedClaim extends ParsedEntries {
 }
 
 const EMPTY_PARSE: ParsedEntries = { entries: [], malformed: 0 };
+
+/**
+ * How `stop()`'s drain ended. **Only `COMPLETED` permits deregistration** (T-043).
+ *
+ * Three outcomes rather than a boolean, because the two non-completing ones are different
+ * facts and a boolean would collapse them into "did not deregister" with no way to log which:
+ * `NOT_STARTED` means this consumer never registered a name at all, and `TIMED_OUT` means it
+ * holds work it can no longer account for.
+ *
+ * Module-local rather than a member of `WORKER_SHUTDOWN`: nothing outside this file names
+ * these, and they are internal control flow rather than protocol or operator vocabulary.
+ */
+const DRAIN_OUTCOME = {
+  /** `run()` was never called, so no `XINFO CONSUMERS` row was ever created for this name. */
+  NOT_STARTED: "not-started",
+  /** The loop settled — successfully or by rejecting — inside the bound. */
+  COMPLETED: "completed",
+  /** The bound expired with the loop still running. */
+  TIMED_OUT: "timed-out"
+} as const;
+
+type DrainOutcome = (typeof DRAIN_OUTCOME)[keyof typeof DRAIN_OUTCOME];
+
+/**
+ * What `XINFO CONSUMERS` said about **this** consumer's own row.
+ *
+ * A three-way reading rather than a `number | null`, because the safe action differs in each
+ * case and the compiler should force the caller to say which it handled. `UNREADABLE` in
+ * particular must not collapse into "no pending entries": a reply this code cannot parse is
+ * precisely when it does **not** know what it holds.
+ */
+const CONSUMER_READING = {
+  /** No row carries this consumer's name — measured: a consumer that read nothing leaves none. */
+  ABSENT: "absent",
+  /** A row was found and its `pending` field read as a number. */
+  FOUND: "found",
+  /** The reply, or the row, was not the shape this parser recognises. */
+  UNREADABLE: "unreadable"
+} as const;
+
+type ConsumerReading =
+  | { readonly kind: typeof CONSUMER_READING.ABSENT }
+  | { readonly kind: typeof CONSUMER_READING.FOUND; readonly pending: number }
+  | { readonly kind: typeof CONSUMER_READING.UNREADABLE };
 
 /**
  * `Array.isArray` narrows `unknown` to `any[]`, which re-introduces `any` into every
@@ -169,6 +217,68 @@ const parseClaimReply = (reply: unknown): ParsedClaim => {
 };
 
 /**
+ * `XINFO CONSUMERS`' reply -> what it says about one named consumer.
+ *
+ * Shape-checked rather than cast, for the reason `parseReadReply`'s docstring gives: ioredis
+ * declares this command `Result<unknown, Context>`, so a cast would be a lie the compiler
+ * accepts. Measured through ioredis 5.11.1 on Redis 7.0.15 at Gate 3, over three states of one
+ * group — that is the scope of the claim, not "no other shape exists":
+ *
+ *   nobody has read from the group -> `[]`
+ *   c1 holding two entries         -> `[["name","c1","pending",2,"idle",0]]`
+ *   c1 after acknowledging both    -> `[["name","c1","pending",0,"idle",1]]`
+ *
+ * Two properties of that reply are load-bearing and both were checked rather than assumed.
+ * `pending` arrives as a JavaScript **number**, not a string — `typeof` on the live reply was
+ * `number` — so a non-number here means the reply is not what this code was written against,
+ * and the reading is `UNREADABLE` rather than coerced. And the row **persists at `pending 0`**,
+ * which is what makes deregistering worth issuing: an implementation that expected the row to
+ * disappear on the last acknowledgement would never find one to delete.
+ *
+ * Walked **by key**, not by position. The field order above is what this Redis returned, but a
+ * version that inserted a field ahead of `pending` would shift every position, and reading a
+ * neighbouring field as a pending count is the one mistake here that destroys data.
+ */
+const parseConsumerReading = (reply: unknown, consumerName: string): ConsumerReading => {
+  if (!isUnknownArray(reply)) {
+    return { kind: CONSUMER_READING.UNREADABLE };
+  }
+
+  for (const rawRow of reply) {
+    if (!isUnknownArray(rawRow)) {
+      return { kind: CONSUMER_READING.UNREADABLE };
+    }
+
+    let name: unknown;
+    let pending: unknown;
+    for (
+      let index = 0;
+      index + 1 < rawRow.length;
+      index += WORKER_SHUTDOWN.CONSUMER_INFO_FIELD_STRIDE
+    ) {
+      const key = rawRow[index];
+      if (key === WORKER_SHUTDOWN.CONSUMER_INFO_FIELD_NAME) {
+        name = rawRow[index + 1];
+      } else if (key === WORKER_SHUTDOWN.CONSUMER_INFO_FIELD_PENDING) {
+        pending = rawRow[index + 1];
+      }
+    }
+
+    if (name !== consumerName) {
+      continue;
+    }
+
+    if (typeof pending !== "number") {
+      return { kind: CONSUMER_READING.UNREADABLE };
+    }
+
+    return { kind: CONSUMER_READING.FOUND, pending };
+  }
+
+  return { kind: CONSUMER_READING.ABSENT };
+};
+
+/**
  * The default `StreamMessageHandler`: logs that an entry arrived and does **not** acknowledge
  * it (D2-A), so it is re-delivered once T-040 wires a real processor.
  *
@@ -235,6 +345,41 @@ export class StreamConsumer {
    * predicate still stops it.
    */
   private stopRequested = false;
+
+  /**
+   * The in-flight `runLoop()`, retained so `stop()` can wait for it (T-043, slice 1).
+   *
+   * **Assigned in `run()` and never cleared**, which is a deliberate departure from the plan's
+   * "cleared in a `finally`". Two properties depend on it staying set:
+   *
+   * - `null` means **`run()` was never called**, which is what lets `stop()` on a consumer that
+   *   only bootstrapped issue no Redis command at all (`U75`). A field that were cleared on
+   *   completion could not tell that apart from a loop that ran and finished, so a
+   *   bootstrap-only `stop()` would go on to read the registry and delete a name it never used.
+   * - A loop that has already finished still needs deregistering — `stop()` after a completed
+   *   `run()` is exactly the shape `tests/event.processor.integration.test.ts` uses.
+   *
+   * Retaining a settled promise holds nothing: its value is `undefined` and its reaction list
+   * is already drained.
+   *
+   * **This is what keeps `src/index.ts`'s `void streamConsumer.run()` unchanged.** S-26's fix
+   * direction — "await the loop with a bounded timeout before `process.exit(0)`" — reads as an
+   * instruction to drop that `void`, and doing so was measured as a wide failure of
+   * `tests/index.graceful-shutdown.unit.test.ts`. Holding the promise *here* means `index.ts`
+   * awaits the drain through `stop()`, which it already awaits, and the mutation is structurally
+   * unavailable rather than merely warned against.
+   */
+  private loopPromise: Promise<void> | null = null;
+
+  /**
+   * Whether deregistration has been attempted, keyed on the **attempt** and not its outcome.
+   *
+   * `stop()` is safe to call more than once, and a second `XGROUP DELCONSUMER` is not a harmless
+   * repeat: between two calls a restarted instance could have taken the same name — which an
+   * operator-pinned `REDIS_CONSUMER_NAME` makes possible — and the repeat would then delete a
+   * live consumer's registration along with whatever it holds. `U76` pins it.
+   */
+  private deregisterAttempted = false;
 
   constructor(
     private readonly redis: Redis,
@@ -386,7 +531,13 @@ export class StreamConsumer {
    */
   async run(): Promise<void> {
     try {
-      await this.runLoop();
+      // Two statements inside the `try` rather than one, and the claim above survives it: what
+      // that paragraph rests on is that nothing sits **outside** the `try`, and nothing does.
+      // `runLoop` is `async`, so it returns a rejected promise rather than throwing
+      // synchronously; the assignment cannot itself throw.
+      const loopPromise = this.runLoop();
+      this.loopPromise = loopPromise;
+      await loopPromise;
     } catch (error) {
       this.logger.error(
         {
@@ -501,15 +652,264 @@ export class StreamConsumer {
    * immediately (205 ms, `Connection is closed.`). `index.ts` therefore calls this **before**
    * `app.close()`, whose `onClose` hook quits the container's connection.
    *
-   * Safe to call before `run()`, after it, and more than once: the flag latches and
-   * `readConnection` is `null` outside the loop.
+   * Safe to call before `run()`, after it, and more than once: the flag latches,
+   * `readConnection` is `null` outside the loop, and the deregistration is attempted at most
+   * once.
    *
-   * `async` with nothing awaited today, deliberately: T-043 owns draining in-flight work on
-   * shutdown, and that drain belongs here. Callers already `await` it.
+   * **Then it drains, and only then does it deregister** (T-043). The order is the contract and
+   * every step of it is load-bearing:
+   *
+   * 1. **Drain first.** Deregistering before the drain would hit probe P1 against this
+   *    consumer's *own* work — the entries the handler is still processing are pending at that
+   *    moment, and `XGROUP DELCONSUMER` destroys pending entries.
+   * 2. **Only if the drain completed.** On a timeout this consumer cannot show what it still
+   *    holds, so it must not delete. Fail closed.
+   * 3. **Only after reading `pending 0` for its own name.** See `deleteConsumerIfIdle`.
+   *
+   * Disconnecting the read connection does **not** abort in-flight handler work, which is what
+   * makes the drain worth waiting for rather than a formality. Measured at Gate 3 (probe P16):
+   * an entry was delivered, the read connection was disconnected mid-handler, and the handler
+   * completed 302 ms later and acknowledged successfully on the container's connection
+   * (`XPENDING` -> 0).
+   *
+   * Nothing here throws. A shutdown path that can reject on a Redis failure is a worker that
+   * exits non-zero because it could not tidy a registry row.
    */
   async stop(): Promise<void> {
     this.stopRequested = true;
     this.readConnection?.disconnect();
+
+    if ((await this.drain()) !== DRAIN_OUTCOME.COMPLETED) {
+      return;
+    }
+
+    await this.deregisterConsumer();
+  }
+
+  /**
+   * Waits for the retained loop, bounded by `WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS`.
+   *
+   * A **rejected** loop counts as completed: it has finished, which is the only question this
+   * method asks. `run()` already awaits and logs it, so the `.then`'s rejection arm here is not
+   * swallowing anything — it is declining to re-report it.
+   *
+   * The losing timer is cleared in a `finally` covering both arms, so a fast drain leaves no
+   * handle holding the event loop open past `index.ts`'s `process.exit(0)`. That matters only
+   * for test determinism — production's exit is explicit — which is why `U74` can drive the
+   * bound under fake timers without a wall-clock sleep.
+   */
+  private async drain(): Promise<DrainOutcome> {
+    const loopPromise = this.loopPromise;
+    if (loopPromise === null) {
+      return DRAIN_OUTCOME.NOT_STARTED;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      loopPromise.then(
+        () => DRAIN_OUTCOME.COMPLETED,
+        () => DRAIN_OUTCOME.COMPLETED
+      ),
+      new Promise<DrainOutcome>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(DRAIN_OUTCOME.TIMED_OUT);
+        }, WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS);
+      })
+    ]).finally(() => {
+      clearTimeout(timer);
+    });
+
+    if (outcome === DRAIN_OUTCOME.TIMED_OUT) {
+      // WARN, and it deliberately leaves the registration row and the pending entries in place:
+      // a timed-out drain is abandoned work, and a shutdown that looked clean would hide it.
+      this.logger.warn(
+        {
+          streamName: this.streamName,
+          groupName: this.groupName,
+          consumerName: this.consumerName,
+          drainTimeoutMs: WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS
+        },
+        "Timed out draining in-flight stream work on shutdown"
+      );
+    }
+
+    return outcome;
+  }
+
+  /**
+   * Reads this consumer's own registry row and hands it to the one method that may delete.
+   *
+   * **Every failure here is swallowed, and the asymmetry is what decides that**: a lingering
+   * `XINFO CONSUMERS` row is a cosmetic leak an operator can delete by hand, while a destroyed
+   * pending entry is unrecoverable and silent — the events stay visible in the stream while
+   * being invisible to every consumer, so it surfaces as an under-count on an invoice weeks
+   * later. Anything this method is unsure about, it leaves alone.
+   *
+   * The `XINFO` failure classification is a **sibling** of the read loop's, not a reuse of it.
+   * `WORKER_SHUTDOWN.GROUP_GONE_ERROR_PREFIXES` carries three measured shapes for one condition;
+   * `WORKER_STREAM_READ.MISSING_GROUP_ERROR_PREFIX` matches only the first, and widening *that*
+   * constant would change how the read loop classifies its own failures, which is a different
+   * decision.
+   */
+  private async deregisterConsumer(): Promise<void> {
+    if (this.deregisterAttempted) {
+      return;
+    }
+    this.deregisterAttempted = true;
+
+    let reading: ConsumerReading;
+    try {
+      reading = parseConsumerReading(
+        await this.redis.xinfo(
+          WORKER_SHUTDOWN.SUBCOMMAND_CONSUMERS,
+          this.streamName,
+          this.groupName
+        ),
+        this.consumerName
+      );
+    } catch (error) {
+      this.logDeregistrationFailure(
+        error,
+        "Skipped stream consumer deregistration: could not read the consumer registry"
+      );
+
+      return;
+    }
+
+    await this.deleteConsumerIfIdle(reading);
+  }
+
+  /**
+   * The **only** site in this file that issues `XGROUP DELCONSUMER`, and it takes the registry
+   * reading as its argument rather than taking none.
+   *
+   * That shape is the point. `XGROUP DELCONSUMER` against a consumer holding pending entries
+   * **destroys them**, permanently and without an error — measured on Redis 7.0.15 (probe P1,
+   * re-run at Gate 3): two entries delivered, the command returned `2`, `XPENDING` dropped to 0,
+   * `XAUTOCLAIM ... 0 0-0` and `XREADGROUP ... >` both came back empty, and `XLEN` still
+   * reported 2. Making the reading a *parameter* means a future caller cannot reach the command
+   * by forgetting to check something; it has to supply a reading, and this method decides.
+   *
+   * Stated no stronger than it is: TypeScript is structural, so a caller inside this module
+   * could construct `{ kind: CONSUMER_READING.FOUND, pending: 0 }` by hand. What this rules out
+   * is the *omission*, not the deliberate act — and the type is not exported, so there is no
+   * call site outside this file at all (`TS2459` if one tried).
+   *
+   * Three of the four branches decline, and each for its own measured reason:
+   *
+   * - `UNREADABLE` — the reply was not the shape this parser was written against, so the pending
+   *   count is unknown. Unknown is not zero.
+   * - `ABSENT` — no row carries this name, so there is nothing to delete. **Skipped rather than
+   *   issued**, which is a deliberate departure from the plan's "delete when absent": the delete
+   *   would be a no-op (measured: `DELCONSUMER` on a name that never existed returns `0` and does
+   *   not error), and under an operator-pinned shared name (plan R4) "absent when I looked" is
+   *   exactly the P11 race — a peer can create the row and take an entry between the read and
+   *   the delete. Identical end state, strictly less risk, one fewer round trip.
+   * - a non-zero `pending` — the P1 case. WARN with the count, so an operator can see what was
+   *   left behind.
+   *
+   * The comparison is `!==` against zero rather than `> 0`: a `NaN` that reached here — it
+   * cannot through `parseConsumerReading`'s `typeof` guard, but the guard is one edit away —
+   * fails `NaN > 0` and would delete, while `NaN !== 0` declines. Fail closed on the arithmetic
+   * too.
+   */
+  private async deleteConsumerIfIdle(reading: ConsumerReading): Promise<void> {
+    if (reading.kind === CONSUMER_READING.UNREADABLE) {
+      this.logger.warn(
+        {
+          streamName: this.streamName,
+          groupName: this.groupName,
+          consumerName: this.consumerName
+        },
+        "Skipped stream consumer deregistration: unreadable consumer registry reply"
+      );
+
+      return;
+    }
+
+    if (reading.kind === CONSUMER_READING.ABSENT) {
+      this.logger.info(
+        {
+          streamName: this.streamName,
+          groupName: this.groupName,
+          consumerName: this.consumerName
+        },
+        "Skipped stream consumer deregistration: this consumer is not registered"
+      );
+
+      return;
+    }
+
+    if (reading.pending !== WORKER_SHUTDOWN.NO_PENDING_ENTRIES) {
+      this.logger.warn(
+        {
+          streamName: this.streamName,
+          groupName: this.groupName,
+          consumerName: this.consumerName,
+          pending: reading.pending
+        },
+        "Skipped stream consumer deregistration: this consumer still holds pending entries"
+      );
+
+      return;
+    }
+
+    try {
+      await this.redis.xgroup(
+        WORKER_SHUTDOWN.SUBCOMMAND_DELCONSUMER,
+        this.streamName,
+        this.groupName,
+        this.consumerName
+      );
+      this.logger.info(
+        {
+          streamName: this.streamName,
+          groupName: this.groupName,
+          consumerName: this.consumerName
+        },
+        "Deregistered stream consumer"
+      );
+    } catch (error) {
+      this.logDeregistrationFailure(error, "Failed to deregister stream consumer");
+    }
+  }
+
+  /**
+   * Logs a deregistration failure at the level its classification deserves.
+   *
+   * `info` for the three replies that mean the group or the key is already gone, `error` for
+   * everything else. The split exists for the reason `U35`'s `RECOVERY_INTERRUPTED` does: a
+   * deploy that destroyed the stream before the worker stopped is a normal shape, and an ERROR
+   * line for it is a false alarm on every such deploy.
+   *
+   * Matched with `startsWith`, not `includes`, for the reason
+   * `WORKER_CONSUMER_GROUP_BOOTSTRAP.ALREADY_EXISTS_ERROR_PREFIX` records: the group and key
+   * names appear *inside* the reply text, so a group named after another reply's prefix would
+   * satisfy `includes`.
+   */
+  private logDeregistrationFailure(error: unknown, unexpectedMessage: string): void {
+    const fields = {
+      streamName: this.streamName,
+      groupName: this.groupName,
+      consumerName: this.consumerName,
+      error: describeError(error)
+    };
+
+    const gone =
+      error instanceof Error &&
+      WORKER_SHUTDOWN.GROUP_GONE_ERROR_PREFIXES.some((prefix) =>
+        error.message.startsWith(prefix)
+      );
+    if (gone) {
+      this.logger.info(
+        fields,
+        "Stream consumer group or key is already gone; nothing to deregister"
+      );
+
+      return;
+    }
+
+    this.logger.error(fields, unexpectedMessage);
   }
 
   /** True once either the process is shutting down or this consumer was told to stop. */

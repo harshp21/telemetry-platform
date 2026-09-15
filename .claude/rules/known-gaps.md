@@ -758,7 +758,36 @@ only `apps/worker-service/tests/stream.consumer.integration.test.ts` and its
 
 ---
 
-## S-26 · worker-service's shutdown teardown log lines usually do not reach a deployed worker — **LOW, open**
+## S-26 · worker-service's shutdown teardown log lines raced `process.exit` — **LOW, largely closed by T-043**
+
+> **T-043 (`fc66bd3`+) closed the main path and this entry is kept for the residue.** `stop()` now
+> awaits the loop under a bounded `DRAIN_TIMEOUT_MS` before the handler returns, so on a clean
+> signalled shutdown both teardown lines are emitted.
+>
+> Measured by capturing the logger *inside* the `process.exit` spy — "inside", because
+> `process.exit` does not return, so "afterwards" is not a moment a real process has. Three bodies
+> of `stop()`, three arrays, **each labelled with the mutation that produces it** (re-measured at
+> the Gate-4 rework; an earlier revision of this paragraph attached the three-element array to the
+> wrong mutation, which was graded HIGH-1):
+>
+> | `stop()` body | log at the instant of exit |
+> |---|---|
+> | shipped | 7 entries; `"Stream read interrupted by shutdown"` **and** `"Stream consumer loop stopped"` both present |
+> | drain gate deleted, `deregisterConsumer()` kept | **4**: `["Created stream consumer group","Shutting down gracefully","Deregistered stream consumer","Shutdown complete"]` |
+> | reverted to its pre-T-043 body | **3**: `["Created stream consumer group","Shutting down gracefully","Shutdown complete"]` |
+>
+> Neither teardown line appears under **either** mutation, so the claim holds under both; only the
+> attribution was wrong. Asserted on every run by `U86`, not merely observed.
+>
+> **What remains open, and why the entry is not deleted:** any exit that skips the signal handler
+> (an uncaught throw, `SIGKILL`, a container OOM) still races as described below, and so does a
+> drain that hits its timeout — that path logs the truncation and exits without the teardown
+> lines, by design. The block-length table below therefore still describes the *undrained* path.
+> **It was not re-derived at T-043** and needs nine real `SIGTERM` process runs to re-establish
+> against the drained code; treat it as inherited-and-unverified for the current tree.
+>
+> The three scope comments on `U14`, `U24` and `U26` were narrowed in the same change, as this
+> entry's fix direction required.
 
 `apps/worker-service/src/index.ts` calls `process.exit(0)` at the end of its shutdown handler.
 The stream consumer loop is started with `void streamConsumer.run()` — deliberately discarded, so
@@ -816,11 +845,15 @@ length.
 `process.exit(0)`, so teardown either completes or is reported as having been cut short. Do **not**
 simply drop the `void`: `await streamConsumer.run()` never returns while the loop is running, so
 `listen` is never reached — mutating `index.ts` that way was measured at the Gate-6 review as
-`Tests 10 failed | 2 passed (12)`. (An earlier revision of this entry said that mutation would
+`Tests 10 failed | 2 passed (12)` — note that **`(12)` is the suite size as it then stood**;
+`tests/index.graceful-shutdown.unit.test.ts` held **14** cases at `fc66bd3` and more after T-043,
+so the shape of the failure is the durable part, not the total. (An instance of S-33, inside the
+entry that cites it.) (An earlier revision of this entry said that mutation would
 "break `U25`, which asserts the loop starts *after* the listener binds". `U25` asserts the
 opposite — `claimOrder < listenOrder`, the loop starting *before* the listener binds — and the
 failure is far wider than that one case.) When it is fixed, narrow or remove the three scope
-comments in the same change.
+comments in the same change. **Discharged by T-043**, which took the bounded-timeout route and
+narrowed all three comments.
 
 **One process note, because it is the reason this is filed rather than left in a plan.** The race
 was **disclosed by the implementer at Gate 3**, passed through two review rounds without being
@@ -1056,7 +1089,7 @@ reliable manifest.
 
 ---
 
-## S-33 · Counts in comments go stale inside the commit that changes them — **LOW, open**
+## S-33 · Measured claims in comments go wrong inside the commit that changes them — stale counts, and measurements attached to the wrong mutation — **LOW, open**
 
 A comment states a count about the codebase, and the same change that makes it wrong ships it.
 Every instance below was caught by a human or agent reading carefully; **none was caught by a
@@ -1073,9 +1106,22 @@ bottom. A count you cannot re-run is not evidence.
 | `constants.ts`: "the workspace's **single** production `xadd` call site" | `grep -rn "\.xadd(" apps packages --include=*.ts` excluding `dist/` and `tests/` | **two** call sites — T-041's own `dead-letter.service.ts` refuted it. The grep returns **three** lines: the third is the comment carrying the pattern, matching itself |
 | `constants.ts` + S-27: the `RESERVED_STREAM_FIELDS` grep "returns **four** lines" | `grep -rn "RESERVED_STREAM_FIELDS" apps packages --include=*.ts` | **five** — same self-match |
 | S-19: "exactly one real subclass … **latent, not live**" | `grep -rn "extends TenantScopedRepository" apps/*/src` | **two** since T-040 added worker's `EventRepository`, making a live data path over a base copy without the `TimeZone` pin |
+| T-043 `stream.consumer.unit.test.ts`: the `dispatch`-guard mutation "reddens **nine** cases", with the nine listed | apply `if (this.shouldStop()) return;` at the top of `dispatch`'s per-entry loop, then `pnpm --filter @telemetry/worker-service exec vitest run tests/stream.consumer.unit.test.ts` | **eleven** — `Tests 11 failed \| 43 passed (54)`; the list omitted `U37` and `U70`. Caught at T-043's Gate 4 as LOW-2, inside a comment written in this entry's own style |
+
+**A second shape, and it is not a count: a measurement attached to the wrong mutation.** S-26's
+T-043 note quoted a three-element log array as what "the drain removed" produces. Re-measured by
+capturing the logger inside the `process.exit` spy under each mutation in turn: the drain-removed
+body yields **four** entries (the deregistration still runs), and the three-element array is what
+the **pre-T-043** `stop()` yields. The load-bearing conclusion — neither teardown line reaches the
+exit without the drain — is true under both, so nothing downstream was wrong; only the label was.
+Graded HIGH at T-043's Gate 4 precisely because `.claude/rules/` is designated authoritative.
+The remedy generalises: **a quoted output must name the exact mutation that produced it**, and if
+two mutations are in play, run both and quote both. Note this one is *not* catchable by the
+mechanical checker below — there is no command in the text to re-run, only a claim about which
+edit was in place.
 
 **The sub-pattern worth naming: a comment carrying its own verification command matches itself.**
-That is two of the four rows, and it is how a count and its grep disagree by exactly one while
+That is two of the five rows, and it is how a count and its grep disagree by exactly one while
 both look right.
 
 **Why LOW.** No instance caused wrong behaviour. The cost is reviewer time and the erosion of
@@ -1096,10 +1142,169 @@ draft 3 keeps only the latter.
 
 **Fix direction — mechanical, not cultural.** These state the command that establishes them. A
 check that extracts `grep -c …` / `grep -rn …` from comments, re-runs them, and compares against
-the adjacent numeral would catch all four rows with no judgement — **provided it accounts for the
+the adjacent numeral would catch all five command-backed rows with no judgement — **provided it accounts for the
 self-match**, or it reproduces the off-by-one it exists to catch. Scope it to `apps/*/src/**`
 comments carrying a backticked command plus a numeral; run it in CI alongside lint.
+
+**Scope note, added after T-043's Gate 6 measured the checker's reach.** As scoped above it would
+have caught **none** of that round's findings, and that is not a small miss: the round's two
+MEDIUMs were a *fabricated set of finding-id citations* (S-36 named three `CASE_BUDGET_MS`
+precedents, all three real findings about something else, while the correct list sat in
+`apps/worker-service/tests/integration.constants.ts:23-25`) and a superseded measurement claim.
+Neither carries a re-runnable command, so neither is reachable by a grep-and-compare checker.
+
+**The harder and more valuable target is cross-document citation of finding ids** — `T-0xx`,
+`S-xx`, review round labels, and `U`/`I` case ids quoted between `.claude/rules/`, `docs/plans/`,
+`docs/reviews/` and source comments. Those *are* mechanically checkable: the id either exists in
+the named artifact and says what the citing text claims, or it does not. Whoever builds this should
+scope it there as well as at the counts, or it will pass a file that cites three findings and gets
+all three wrong.
 
 Do **not** address this by deleting the counts. They are load-bearing: the `xadd` and subclass
 counts are evidence for security-relevant claims, and a vaguer comment would be worse than a
 stale precise one. The number should stay and become checkable.
+
+
+---
+
+## S-34 · The consumer-registry leak became unbounded when consumer names became instance-unique — **LOW, open**
+
+A consequence of T-043's decision **D1/B**, not a defect in it, and recorded here so the trade is
+visible rather than discovered.
+
+`WORKER_STREAM_CONSTANTS.DEFAULT_CONSUMER_NAME` (`apps/worker-service/src/constants.ts`) is now
+`` `${hostname()}-${process.pid}` `` where it was the fixed literal `"worker-1"`. A **clean**
+shutdown deletes its own `XINFO CONSUMERS` row. An **unclean** exit — `SIGKILL`, a container OOM,
+an uncaught throw that skips the signal handler, or a drain that hits
+`WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS` (which suppresses the deregistration deliberately) — leaves the
+row behind, and the next start uses a new pid, so nothing ever collects it.
+
+**Measured on Redis 7.0.15, db 14, at T-043's Gate-4 rework.** Three "restarts", each reading and
+acknowledging one entry under a distinct `host-<pid>` name, then exiting without deregistering:
+
+```
+XINFO CONSUMERS -> name host-111 pending 0 idle 34
+                   name host-222 pending 0 idle 23
+                   name host-333 pending 0 idle 10
+XPENDING        -> 0                      (nothing is stranded; the entries were acked)
+XAUTOCLAIM … reaper 0 0-0   -> rows still present: 3   (a reclaim pass does not reap a row)
+sleep 2; XINFO CONSUMERS    -> name host-111 … idle 2067   (idle grows; nothing expires)
+XGROUP DELCONSUMER host-111 -> 0          (returns 0 at pending 0 — destroys nothing)
+                            -> rows after: 2
+```
+
+The same sequence under the **shared** `worker-1` name leaves exactly **one** row after three
+restarts, measured on the same fixture. So the leak was bounded at one row for the lifetime of a
+deployment and is now one row per unclean exit. **Redis has no TTL on a consumer row**, and the
+only thing observed to remove one is an explicit `XGROUP DELCONSUMER`.
+
+**Consequence, stated no stronger than measured.** Nothing is lost and nothing is wrong: every row
+above reports `pending 0`, so no entry is stranded, and `XGROUP DELCONSUMER` at `pending 0`
+destroys nothing. The costs are that `XINFO CONSUMERS` replies grow, and
+`StreamConsumer`'s `parseConsumerReading` walks every row on every shutdown.
+
+**Both have now been measured, and neither is a performance problem.** At **10 000** registry rows
+on db 14, `XINFO CONSUMERS` replied in **26 ms** and the parse walk took **2.6 ms** (T-043 Gate-5
+QA; re-derived at Gate 6 as 20–28 ms including CLI startup). An earlier revision of this entry said
+they had "never been measured at a scale where it matters" — that was true when written and is no
+longer. **The entry stays open on the unboundedness, not on a cost**: the growth rate is "one per
+unclean exit", zero on a healthy deployment and unbounded only in a crash loop, and **no test
+drives a large registry**. The first guaranteed instance is an upgrade — a deployment's existing
+`worker-1` row persists at `pending 0` permanently once the instance-unique default lands.
+
+**Why this is the right trade anyway, and not an argument for reverting D1.** The shared name made
+the registry bounded *and* made T-043's pending-zero guard unsound: two instances under one name
+share one row, so the guard reads one instance's zero while the other holds work, and the delete
+then destroys it (probe P11, reproduced at Gate 3 and again at Gate 4). A bounded registry is
+cosmetic; that is unrecoverable loss of billing events.
+
+**Fix direction:** a reaper — a periodic or startup sweep of `XINFO CONSUMERS` deleting rows with
+`pending 0` and an `idle` above some threshold. That is new production behaviour with its own
+failure modes (the threshold must exceed any legitimate idle period, or it deletes a live peer's
+row), so it belongs in its own task rather than inside a shutdown change. Note the guard it needs
+is the same one T-043 already implements: never delete a row whose `pending` is non-zero.
+
+---
+
+## S-35 · `docs/epics/epic-7-worker-service.md`'s T-043 section diverges from the shipped code in five ways — **LOW, open**
+
+The third sibling of S-29 (T-040 section) and S-32 (T-041 section) in the same file. A **new id**
+rather than an extension of either: both of those titles are scoped to their own section, so
+folding this in would make one of them false — which is the exact objection S-32 records for not
+having been folded into S-29.
+
+All five re-derived against `docs/epics/epic-7-worker-service.md:262-278` (the snippet at :262-274 plus the acceptance criteria) and
+`apps/worker-service/src/index.ts`'s shutdown handler:
+
+1. The snippet logs **before** setting the shutdown flag; the code sets first, then logs.
+2. `"Worker shutting down"` vs the shipped `"Shutting down gracefully"`.
+3. `"Worker shutdown complete"` vs the shipped `"Shutdown complete"`.
+4. `await bullWorker.close()` — **no such dependency exists anywhere in the workspace.**
+   `grep -rn "bullmq" --include=package.json .` and
+   `grep -rn "bullWorker\|bullmq" apps packages --include=*.ts` both return nothing, so the line as
+   written would `await undefined.close()`. See the forward obligation below.
+5. No `try`/`catch` and no `exit(1)` path; the shipped handler has both.
+
+Plus two structural objections. The snippet omits `streamConsumer.stop()` and `app.close()`
+entirely — the two calls that do the actual work — and its **File:** line names only
+`src/index.ts`, while T-043 landed almost entirely in `src/events/stream.consumer.ts`. It also
+closes over a module-scope `logger`, `prisma` and `redis`, where every collaborator in this
+service is constructor-injected or reached through `container`; that is S-32's objection,
+recurring.
+
+**Unlike the T-041 section, which self-corrects in place (S-32), the T-043 section had no forward
+pointer at all** — a reader landing on the snippet never learned it was wrong. T-043 added a
+"What T-043 actually shipped" block immediately after it, so the source is now signposted; this
+entry remains open because the snippet itself is still wrong.
+
+**Three sibling entries for one file is itself the finding.** S-29, S-32 and this one all say the
+same thing about different sections. The economical fix is one consolidated entry plus one pass
+over the epic, but that retires two live ids, which this file's stability rule forbids, and it is a
+docs task with its own review. Recorded rather than done.
+
+### Forward obligation on T-042 — `bullWorker.close()`
+
+T-043 deliberately did **not** implement the snippet's `await bullWorker.close()`, because there is
+no BullMQ dependency to close. **T-042, which introduces the scheduler, must re-open
+`src/index.ts`'s shutdown handler and add it**, ordered before `streamConsumer.stop()` so the
+scheduler stops producing work before the consumer drains what it has.
+
+Recorded here **and** in the epic's T-042 section because it previously lived only in
+`docs/plans/t-043-worker-graceful-shutdown.md`, and `CLAUDE.md` is explicit that nothing may read
+`docs/plans/` as a record. S-15 says the same of the epic files, which is why it is in both.
+
+
+---
+
+## S-36 · The drain's timeout path has no live-Redis regression guard — **LOW, open**
+
+`StreamConsumer.stop()` races the retained loop promise against `WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS`
+(3 000 ms). When the timeout wins, the drain is reported as cut short and **deregistration is
+suppressed** — which is the safe direction, because a consumer whose loop is still running may
+still hold pending entries, and `XGROUP DELCONSUMER` on a consumer holding pending entries
+destroys them (S-34's sibling hazard, measured as probe P1 of T-043).
+
+**The behaviour is correct and was verified live**, at Gate 5 of T-043, against a real worker
+under a real `SIGTERM`: the drain timed out at **3001 ms** under real timers and the consumer row
+was retained. **What is missing is a test that would catch it regressing.** `U79` covers the
+`TIMED_OUT` branch with fake timers, so it pins the *decision* — timed-out ⇒ do not deregister —
+but not that a real slow handler actually reaches that branch rather than, say, being cut off by
+a connection-level timeout first.
+
+**Why it was not simply written.** A live case needs a handler wedged past 3 000 ms, which adds
+~3 s of real wall-clock to the integration suite and pushes against `CASE_BUDGET_MS` — the
+per-case budget this package has already tripped over three times: `RUN_DEADLINE_MS` at 10 000
+(T-041 Gate-4 Round 2), `BLOCK_MS_LONG` at 5 000 (T-041 Gate-5 QA F-3), and the pair of them
+summing to 6 000 in `I12`, which neither per-constant fix looked at (T-043 S1). The canonical
+list is `apps/worker-service/tests/integration.constants.ts:23-25` — cite that rather than
+re-deriving it. (An earlier revision of this entry named three *different* findings, each real
+but about something else entirely; corrected at T-043's Gate-6 review, MEDIUM-1.) Recorded rather than forced, on the S-21 precedent: a guard that exists for a verified
+behaviour is worth having, and is worth *knowing you do not have*.
+
+**What would make it worth writing.** Any change to the drain's timing semantics — moving the
+timeout, making it configurable, or adding work after the race — because the fake-timer case
+cannot tell you whether the real path still reaches the branch. If `CASE_BUDGET_MS` is ever
+raised for other reasons, this is the first case to add.
+
+**Do not close this by loosening `U79`.** It asserts the right thing; it simply asserts it
+against fake timers. The gap is the absence of a live sibling, not a defect in the unit case.

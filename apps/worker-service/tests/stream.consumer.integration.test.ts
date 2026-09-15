@@ -25,6 +25,9 @@ import {
   INTEGRATION_REDIS,
   INTEGRATION_REDIS_COMMANDS,
   INTEGRATION_REDIS_URL_FALLBACK,
+  INTEGRATION_SHUTDOWN,
+  INTEGRATION_SHUTDOWN_FIXTURE,
+  INTEGRATION_SHUTDOWN_REDIS,
   INTEGRATION_XINFO_FIELDS,
   INTEGRATION_XPENDING_DELIVERY_COUNT_INDEX
 } from "./integration.constants";
@@ -495,6 +498,14 @@ interface LoopConsumerOptions {
   readonly handler: StreamMessageHandler;
   readonly blockMs?: number;
   readonly batchSize?: number;
+  /**
+   * The identity the consumer reads and deregisters under (T-043).
+   *
+   * Optional with the T-039 default, so no existing case changes. The shutdown cases set it
+   * explicitly, because T-043 makes the *production* default `<hostname>-<pid>` — which differs
+   * per host and per run, and which two cases in one process would share.
+   */
+  readonly consumerName?: string;
 }
 
 /**
@@ -511,7 +522,7 @@ const buildLoopConsumer = (options: LoopConsumerOptions): StreamConsumer =>
     {
       REDIS_STREAM_NAME: options.streamName,
       REDIS_CONSUMER_GROUP: options.groupName,
-      REDIS_CONSUMER_NAME: INTEGRATION_LOOP_REDIS.CONSUMER_NAME,
+      REDIS_CONSUMER_NAME: options.consumerName ?? INTEGRATION_LOOP_REDIS.CONSUMER_NAME,
       STREAM_BLOCK_MS: options.blockMs ?? INTEGRATION_LOOP.BLOCK_MS_SHORT,
       STREAM_BATCH_SIZE: options.batchSize ?? WORKER_STREAM_CONSTANTS.DEFAULT_BATCH_SIZE
     } as ServiceEnv,
@@ -962,5 +973,346 @@ describe("StreamConsumer.run (live Redis)", () => {
       entryId
     ]);
     expect(await redis.xlen(streamName)).toBe(INTEGRATION_COUNTS.SINGLE);
+  });
+});
+
+/** A stream key and group name unique to one T-043 case. Shares the counter with the others. */
+const nextShutdownFixtureNames = (): { streamName: string; groupName: string } => {
+  caseIndex += INTEGRATION_COUNTS.SINGLE;
+
+  return {
+    streamName: `${INTEGRATION_SHUTDOWN_REDIS.STREAM_NAME_PREFIX}${RUN_ID}-${caseIndex}`,
+    groupName: `${INTEGRATION_SHUTDOWN_REDIS.CONSUMER_GROUP_PREFIX}${RUN_ID}-${caseIndex}`
+  };
+};
+
+/**
+ * `XINFO CONSUMERS`, reshaped to `name -> pending`.
+ *
+ * Issued through the harness's own `INTEGRATION_LOOP_COMMANDS.XINFO_CONSUMERS` spelling rather
+ * than through `WORKER_SHUTDOWN.SUBCOMMAND_CONSUMERS`, for the reason that constant's docblock
+ * gives: the claim is what the *server* holds after `stop()` ran.
+ *
+ * Throws on any reply it does not recognise rather than returning an empty map. `I28`'s
+ * assertion is that a name is **absent**, so a parse failure that yielded `{}` would pass it
+ * vacuously — the exact shape `readPendingIds`' docstring warns about.
+ */
+const readConsumerPending = async (
+  streamName: string,
+  groupName: string
+): Promise<Map<string, number>> => {
+  const reply: unknown = await redis.xinfo(
+    INTEGRATION_LOOP_COMMANDS.XINFO_CONSUMERS,
+    streamName,
+    groupName
+  );
+  if (!isUnknownArray(reply)) {
+    throw new Error(`XINFO CONSUMERS returned a non-array reply for ${streamName}`);
+  }
+
+  const pendingByName = new Map<string, number>();
+  for (const rawRow of reply) {
+    if (!isUnknownArray(rawRow)) {
+      throw new Error(`XINFO CONSUMERS row was not an array for ${streamName}`);
+    }
+
+    let name: unknown;
+    let pending: unknown;
+    for (
+      let index = INTEGRATION_COUNTS.NONE;
+      index + INTEGRATION_COUNTS.SINGLE < rawRow.length;
+      index += INTEGRATION_FIELD_PAIR_STRIDE
+    ) {
+      const key = rawRow[index + INTEGRATION_SHUTDOWN.CONSUMER_INFO_KEY_OFFSET];
+      const value = rawRow[index + INTEGRATION_SHUTDOWN.CONSUMER_INFO_VALUE_OFFSET];
+      if (key === INTEGRATION_XINFO_FIELDS.NAME) {
+        name = value;
+      } else if (key === INTEGRATION_XINFO_FIELDS.PENDING) {
+        pending = value;
+      }
+    }
+
+    if (typeof name !== "string" || typeof pending !== "number") {
+      throw new Error(`XINFO CONSUMERS row carried no name/pending pair for ${streamName}`);
+    }
+
+    pendingByName.set(name, pending);
+  }
+
+  return pendingByName;
+};
+
+/**
+ * Entry ids still reachable through the group, via `XAUTOCLAIM` from the beginning at min-idle 0.
+ *
+ * **This is the probe that makes `I29` about data rather than about a command.** The P1 loss is
+ * invisible to `XPENDING` — it reports 0 either way, because the entries were removed from the
+ * pending list — so a case that only checked `XPENDING` would be satisfied by the very
+ * destruction it exists to prevent. `XAUTOCLAIM ... 0 0-0` returning the entries is what says
+ * they are still *reachable*; after a `DELCONSUMER` on a consumer holding them it returns empty
+ * while `XLEN` still counts them (measured, probe P1).
+ *
+ * Claims the entries to `claimantName`, which is a side effect and is why the caller must use a
+ * throwaway identity.
+ */
+const readReachableEntryIds = async (
+  streamName: string,
+  groupName: string,
+  claimantName: string,
+  count: number
+): Promise<string[]> => {
+  const reply: unknown = await redis.xautoclaim(
+    streamName,
+    groupName,
+    claimantName,
+    INTEGRATION_SHUTDOWN.CLAIM_ANY_IDLE_MS,
+    WORKER_STREAM_READ.PENDING_START_ID,
+    INTEGRATION_LOOP_COMMANDS.XAUTOCLAIM_COUNT,
+    count
+  );
+  if (!isUnknownArray(reply)) {
+    throw new Error(`XAUTOCLAIM returned a non-array reply for ${streamName}`);
+  }
+
+  const entries = reply[WORKER_STREAM_READ.CLAIM_REPLY_ENTRIES_INDEX];
+  if (!isUnknownArray(entries)) {
+    throw new Error(`XAUTOCLAIM reply carried no entry list for ${streamName}`);
+  }
+
+  return entries.map((entry) => {
+    const id = isUnknownArray(entry) ? entry[INTEGRATION_COUNTS.NONE] : undefined;
+    if (typeof id !== "string") {
+      throw new Error(`XAUTOCLAIM entry was not [id, fields] for ${streamName}`);
+    }
+
+    return id;
+  });
+};
+
+describe("StreamConsumer.stop (live Redis)", () => {
+  it("I28 - a clean shutdown at pending 0 removes this consumer's registry row", async () => {
+    const { streamName, groupName } = nextShutdownFixtureNames();
+    const handled: string[] = [];
+    const deadline = Date.now() + INTEGRATION_LOOP.RUN_DEADLINE_MS;
+    const consumer = buildLoopConsumer({
+      streamName,
+      groupName,
+      consumerName: INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME,
+      // Acknowledges, which the other suites' harnesses deliberately do not: this case's premise
+      // is a consumer that holds *nothing*, and that is only reachable by acking.
+      handler: async (id: string): Promise<void> => {
+        await redis.xack(streamName, groupName, id);
+        handled.push(id);
+      },
+      isShuttingDown: (): boolean =>
+        handled.length >= INTEGRATION_COUNTS.SINGLE || Date.now() >= deadline
+    });
+    await consumer.ensureConsumerGroup();
+    const entryId = await addLoopEntry(streamName, INTEGRATION_SHUTDOWN_FIXTURE.VALUE_ACKED);
+
+    await consumer.run();
+
+    // Anti-vacuity, and it is not decoration: the row must exist *before* `stop()` for its
+    // absence afterwards to mean anything. Measured on 7.0.15 — the row **persists at
+    // `pending 0`**, it does not disappear when the last entry is acknowledged, which is the
+    // whole reason a deregistration is worth issuing.
+    expect(handled).toEqual([entryId]);
+    const before = await readConsumerPending(streamName, groupName);
+    expect(before.get(INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME)).toBe(INTEGRATION_COUNTS.NONE);
+
+    await consumer.stop();
+
+    const after = await readConsumerPending(streamName, groupName);
+    expect(after.has(INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME)).toBe(false);
+    // The group itself is untouched — this deregisters a consumer, not the group. A
+    // `XGROUP DESTROY` would also have emptied the registry and would pass the line above.
+    expect(await readGroups(streamName)).toHaveLength(INTEGRATION_COUNTS.SINGLE);
+    expect(await redis.xlen(streamName)).toBe(INTEGRATION_COUNTS.SINGLE);
+  });
+
+  it("I29 - a shutdown with entries still pending leaves the row, the PEL, and the entries reachable", async () => {
+    const { streamName, groupName } = nextShutdownFixtureNames();
+    const harness = buildLoopHarness(INTEGRATION_COUNTS.SINGLE);
+    const consumer = buildLoopConsumer({
+      streamName,
+      groupName,
+      consumerName: INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME,
+      ...harness
+    });
+    await consumer.ensureConsumerGroup();
+    const entryId = await addLoopEntry(
+      streamName,
+      INTEGRATION_SHUTDOWN_FIXTURE.VALUE_LEFT_PENDING
+    );
+
+    // The harness handler acknowledges nothing, so this is the state a worker is in when it is
+    // stopped between delivery and commit — or when a transaction rolled back.
+    await consumer.run();
+
+    expect(harness.handled).toEqual([entryId]);
+    const before = await readConsumerPending(streamName, groupName);
+    expect(before.get(INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME)).toBe(
+      INTEGRATION_COUNTS.SINGLE
+    );
+
+    await consumer.stop();
+
+    // **The case this task exists for, and the one whose red is data rather than a call count.**
+    // With the `pending` guard removed, `XGROUP DELCONSUMER` runs here and (measured, probe P1,
+    // re-run at Gate 3) returns the count of destroyed entries, `XPENDING` drops to 0, and the
+    // entries become unreachable to `XAUTOCLAIM` and `XREADGROUP` alike while `XLEN` still counts
+    // them. This is AC2: nothing lost, the entry stays in the PEL.
+    // **Every read is taken before any assertion, and the assertions are then ordered weakest
+    // last.** Two reasons, both measured. `readReachableEntryIds` issues `XAUTOCLAIM`, which
+    // *moves* the pending row to its claimant — so it has to run after the other two reads or it
+    // invalidates them. And assertions short-circuit, so whichever runs first is the one that
+    // names the failure: with the registry-row assertion first, removing the `pending` guard
+    // reported `expected undefined to be 1`, which says a row went missing and says nothing
+    // about the entry.
+    const after = await readConsumerPending(streamName, groupName);
+    const pendingAfter = await readPendingIds(streamName, groupName, INTEGRATION_COUNTS.PAIR);
+    const streamLength = await redis.xlen(streamName);
+    const reachableAfter = await readReachableEntryIds(
+      streamName,
+      groupName,
+      INTEGRATION_SHUTDOWN_REDIS.PREVIOUS_CONSUMER_NAME,
+      INTEGRATION_COUNTS.PAIR
+    );
+
+    // Strongest first: the assertion `XPENDING` alone cannot make. A destroyed entry leaves
+    // `XPENDING` at 0 — which is *also* what a correctly-acknowledged entry leaves — so only
+    // reachability separates the loss from the success.
+    expect(reachableAfter).toEqual([entryId]);
+    expect(pendingAfter).toEqual([entryId]);
+    expect(streamLength).toBe(INTEGRATION_COUNTS.SINGLE);
+    // Weakest last: the registration row surviving is the *symptom*, not the property.
+    expect(after.get(INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME)).toBe(INTEGRATION_COUNTS.SINGLE);
+  });
+
+  it("I30 - stop() waits out an in-flight handler, which then acks, and only then deregisters", async () => {
+    const { streamName, groupName } = nextShutdownFixtureNames();
+    const handled: string[] = [];
+    let entered = false;
+    const consumer = buildLoopConsumer({
+      streamName,
+      groupName,
+      consumerName: INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME,
+      blockMs: INTEGRATION_LOOP.BLOCK_MS_LONG,
+      handler: async (id: string): Promise<void> => {
+        entered = true;
+        // Real work, in the shape T-040's processor does it: a delay, then the acknowledgement.
+        // `stop()` lands in the middle of this, and probe P16 is why that is survivable —
+        // disconnecting the *read* connection does not abort work in flight on the container's.
+        await settle(INTEGRATION_SHUTDOWN.HANDLER_WORK_MS);
+        await redis.xack(streamName, groupName, id);
+        handled.push(id);
+      },
+      // Never true: the drain must be what ends this, not a predicate the loop would notice.
+      isShuttingDown: (): boolean => false
+    });
+    await consumer.ensureConsumerGroup();
+    const entryId = await addLoopEntry(streamName, INTEGRATION_SHUTDOWN_FIXTURE.VALUE_IN_FLIGHT);
+
+    const runPromise = consumer.run();
+    // Waits for the handler to be *entered* rather than sleeping and hoping, so the signal
+    // genuinely lands mid-flight. Without this the case could stop before delivery and prove
+    // nothing about draining.
+    await vi.waitFor(
+      () => {
+        expect(entered).toBe(true);
+      },
+      {
+        timeout: INTEGRATION_SHUTDOWN.ENTER_DEADLINE_MS,
+        interval: INTEGRATION_LOOP.POLL_INTERVAL_MS
+      }
+    );
+    expect(handled).toEqual([]);
+
+    await consumer.stop();
+    // **Snapshotted between `stop()` and `run()`, and the position is the claim.** Reading
+    // `handled` after `await runPromise` would pass against the pre-T-043 `stop()` too: the
+    // handler finishes either way, just not before `stop()` resolves. Measured — with the drain
+    // removed and the assertion below the `await`, this case failed on the registry row instead
+    // and said nothing about draining.
+    const handledWhenStopResolved = [...handled];
+    await runPromise;
+
+    // The drain's whole claim: by the time `stop()` resolved, the handler had finished and its
+    // acknowledgement had landed. Before T-043 `stop()` resolved with `handled` still empty.
+    expect(handledWhenStopResolved).toEqual([entryId]);
+    expect(handled).toEqual([entryId]);
+    expect(await readPendingIds(streamName, groupName, INTEGRATION_COUNTS.PAIR)).toEqual([]);
+    // And because the drain completed and the reading was then zero, the row went too — the
+    // clean-shutdown end state, reached from a consumer that was busy when it was told to stop.
+    const after = await readConsumerPending(streamName, groupName);
+    expect(after.has(INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME)).toBe(false);
+  });
+
+  it("I31 - entries orphaned under a previous pid are reclaimed by the new identity", async () => {
+    const { streamName, groupName } = nextShutdownFixtureNames();
+    const harness = buildLoopHarness(INTEGRATION_SHUTDOWN.ORPHANED_ENTRY_COUNT);
+    const consumer = buildLoopConsumer({
+      streamName,
+      groupName,
+      // A *different* name from the one the entries were delivered to — which is exactly what a
+      // restart produces now that the default carries `process.pid`.
+      consumerName: INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME,
+      ...harness
+    });
+    await consumer.ensureConsumerGroup();
+
+    const orphanedIds: string[] = [];
+    for (
+      let index = INTEGRATION_COUNTS.NONE;
+      index < INTEGRATION_SHUTDOWN.ORPHANED_ENTRY_COUNT;
+      index += INTEGRATION_COUNTS.SINGLE
+    ) {
+      orphanedIds.push(
+        await addLoopEntry(streamName, INTEGRATION_SHUTDOWN_FIXTURE.VALUE_ORPHANED)
+      );
+    }
+    // Delivered to the previous identity and never acknowledged: the state a worker that died
+    // uncleanly leaves behind, under a name no live process will ever use again.
+    expect(
+      await readNewEntryIds(
+        streamName,
+        groupName,
+        INTEGRATION_SHUTDOWN.ORPHANED_ENTRY_COUNT,
+        INTEGRATION_SHUTDOWN_REDIS.PREVIOUS_CONSUMER_NAME
+      )
+    ).toEqual(orphanedIds);
+    // `>` provably will not return them — measured on 7.0.15, and asserted rather than assumed,
+    // because if it did this case would pass without the reclaim path existing at all.
+    expect(
+      await readNewEntryIds(
+        streamName,
+        groupName,
+        INTEGRATION_SHUTDOWN.ORPHANED_ENTRY_COUNT,
+        INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME
+      )
+    ).toEqual([]);
+    // Age them past `BLOCK_MS_SHORT x RECOVERY_IDLE_MULTIPLIER`, or `XAUTOCLAIM` correctly
+    // declines to steal work a live peer may still be doing.
+    await settle(INTEGRATION_LOOP.IDLE_SETTLE_MS);
+
+    await consumer.run();
+
+    // **This is what makes D1/B's accepted trade latency rather than loss.** The pid changes
+    // across a restart, so a worker no longer reclaims its own abandoned work *under the same
+    // name*; the recovery pass reclaims it under the new one instead. Without this case, a
+    // future change to the recovery cadence would silently strand every restarted worker's
+    // in-flight entries and nothing would notice.
+    expect(harness.handled.slice(0, INTEGRATION_SHUTDOWN.ORPHANED_ENTRY_COUNT)).toEqual(
+      orphanedIds
+    );
+    // Ownership moved to the new identity; the entries did not leave the PEL, because this
+    // harness acknowledges nothing.
+    const pendingByName = await readConsumerPending(streamName, groupName);
+    expect(pendingByName.get(INTEGRATION_SHUTDOWN_REDIS.CONSUMER_NAME)).toBe(
+      INTEGRATION_SHUTDOWN.ORPHANED_ENTRY_COUNT
+    );
+    expect(pendingByName.get(INTEGRATION_SHUTDOWN_REDIS.PREVIOUS_CONSUMER_NAME)).toBe(
+      INTEGRATION_COUNTS.NONE
+    );
   });
 });

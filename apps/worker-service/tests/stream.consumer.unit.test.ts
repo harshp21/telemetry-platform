@@ -4,6 +4,7 @@ import type { Logger } from "pino";
 import type { ServiceEnv } from "../src/config/env";
 import {
   WORKER_CONSUMER_GROUP_BOOTSTRAP,
+  WORKER_SHUTDOWN,
   WORKER_STREAM_CONSTANTS,
   WORKER_STREAM_READ
 } from "../src/constants";
@@ -168,7 +169,33 @@ const LOG_MESSAGE = {
   /** `run`'s `finally`. */
   LOOP_STOPPED: "Stream consumer loop stopped",
   /** `buildDefaultMessageHandler` — the handler a four-argument construction gets (D2-A). */
-  DEFAULT_HANDLER_RECEIVED: "Received stream entry; no processor is wired yet"
+  DEFAULT_HANDLER_RECEIVED: "Received stream entry; no processor is wired yet",
+  /** `stop()`'s drain, the bound expiring before the loop settled (T-043). */
+  DRAIN_TIMED_OUT: "Timed out draining in-flight stream work on shutdown",
+  /** `deregisterConsumer`, the success branch. */
+  DEREGISTERED: "Deregistered stream consumer",
+  /** `deregisterConsumer`, our row absent — nothing was ever registered under this name. */
+  DEREGISTER_NOT_REGISTERED: "Skipped stream consumer deregistration: this consumer is not registered",
+  /** `deregisterConsumer`, the guard that keeps P1 from happening. */
+  DEREGISTER_SKIPPED_PENDING:
+    "Skipped stream consumer deregistration: this consumer still holds pending entries",
+  /** `deregisterConsumer`, the `XINFO CONSUMERS` round trip itself failing. */
+  DEREGISTER_SKIPPED_UNREADABLE:
+    "Skipped stream consumer deregistration: could not read the consumer registry",
+  /**
+   * `deleteConsumerIfIdle`, a reply that arrived but was not a shape the parser recognises.
+   *
+   * Separate wording from `DEREGISTER_SKIPPED_UNREADABLE` above, deliberately: they are
+   * different facts at different levels (a failed round trip is an ERROR, an unexpected reply
+   * shape is a WARN), and one message text appearing at two levels is unreadable in a log.
+   */
+  DEREGISTER_SKIPPED_UNPARSEABLE:
+    "Skipped stream consumer deregistration: unreadable consumer registry reply",
+  /** `deregisterConsumer`, the classified "group or key already gone" replies (P5/P6/P6b). */
+  DEREGISTER_GROUP_GONE:
+    "Stream consumer group or key is already gone; nothing to deregister",
+  /** `deregisterConsumer`, anything else. */
+  DEREGISTER_FAILED: "Failed to deregister stream consumer"
 } as const;
 
 describe("StreamConsumer.ensureConsumerGroup", () => {
@@ -652,6 +679,121 @@ const SLOW_BLOCK_MS = 500;
 const READS_INSIDE_ONE_WINDOW = 5;
 
 /**
+ * `XINFO CONSUMERS` replies, in the flat `[key, value, key, value, ...]` shape ioredis 5.11.1
+ * returned on Redis 7.0.15 — one array per consumer, and `pending` as a **number**, not a
+ * string.
+ *
+ * The field names are written out rather than sourced from
+ * `WORKER_SHUTDOWN.CONSUMER_INFO_FIELD_*`, for the reason the reply texts above are literal:
+ * this is the *server's* reply, and a fixture that echoed the parser's own constants back at it
+ * would keep agreeing with the parser after either changed. Measured at Gate 3 over three states
+ * of one group:
+ *
+ *   nobody has read yet       -> `[]`
+ *   c1 holding two entries    -> `[["name","c1","pending",2,"idle",0]]`
+ *   c1 after acking both      -> `[["name","c1","pending",0,"idle",1]]`
+ */
+const consumerInfoRow = (name: string, pending: number): unknown[] => [
+  "name",
+  name,
+  "pending",
+  pending,
+  "idle",
+  OBSERVED_CONSUMER_IDLE_MS
+];
+
+/** The `idle` a fixture row carries. Read by nothing in `src/`; present so the row is real. */
+const OBSERVED_CONSUMER_IDLE_MS = 13;
+
+/**
+ * Pending counts a row may report. Named so no bare numeral decides whether entries are
+ * destroyed — `SOME` is the value that must suppress the deregistration (P1).
+ */
+const CONSUMER_PENDING = {
+  NONE: 0,
+  SOME: 2
+} as const;
+
+/**
+ * A *different* consumer's name, present in the registry alongside ours.
+ *
+ * The anti-vacuity fixture for `U77`: its row reports `CONSUMER_PENDING.SOME`, so a guard that
+ * read "the first row", "any row", or a group-wide total rather than **our own row** would
+ * decline to deregister and fail that case — and a guard that deleted by position rather than by
+ * name would delete a live peer's registration, which is P11 with the roles reversed.
+ */
+const OTHER_CONSUMER_NAME = "worker-t043-unit-peer";
+
+/**
+ * Reply observed from `XGROUP DELCONSUMER` against a group that does not exist (P5).
+ *
+ * Note the group name appears *inside* the text, which is why the classifier uses `startsWith`
+ * and not `includes`.
+ */
+const NOGROUP_DELCONSUMER_REPLY = `NOGROUP No such consumer group '${OVERRIDE.CONSUMER_GROUP}' for key name '${OVERRIDE.STREAM_NAME}'`;
+
+/**
+ * Reply observed from `XGROUP DELCONSUMER` against a stream key that does not exist (P6).
+ *
+ * **This is the case that fails if the classifier reuses
+ * `WORKER_STREAM_READ.MISSING_GROUP_ERROR_PREFIX` alone** — it shares no prefix with the
+ * `NOGROUP` reply above. Plan finding F2.
+ */
+const MISSING_KEY_DELCONSUMER_REPLY =
+  "ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.";
+
+/**
+ * Reply observed from `XINFO CONSUMERS` against a stream key that does not exist.
+ *
+ * A **third** shape for the same condition as `MISSING_KEY_DELCONSUMER_REPLY`, reached through a
+ * different command, sharing no prefix with either of the other two. Measured at Gate 3; the
+ * plan's F2 table listed only the two `XGROUP` shapes. `U87` is the case for it.
+ */
+const NO_SUCH_KEY_XINFO_REPLY = "ERR no such key";
+
+/**
+ * A transient `XINFO CONSUMERS` failure that is none of the classified shapes, for `U82`.
+ *
+ * Distinct from `TRANSIENT_READ_FAILURE` only in that it is the same text: reused deliberately,
+ * because it is the same ioredis failure reaching a different command.
+ */
+const TRANSIENT_XINFO_FAILURE = TRANSIENT_READ_FAILURE;
+
+/**
+ * Invocation-order tokens for `U73` and `U84`.
+ *
+ * Two independent `toHaveBeenCalled()` checks pass in either order, and order is the entire
+ * safety property here: deregistering *before* the drain is exactly P1, because this consumer's
+ * own in-flight entries are still pending at that moment. `U7`/`U25`/`U31` use the same shape in
+ * this repository for the same reason.
+ */
+const INVOCATION = {
+  HANDLER: "handler",
+  STOP: "stop",
+  XINFO: "xinfo",
+  DELCONSUMER: "delconsumer"
+} as const;
+
+/**
+ * `0` **milliseconds** for a *real*-timer yield, distinct from `ADVANCE_NO_TIME_MS`.
+ *
+ * `setTimeout(..., 0)` is a macrotask, so awaiting it drains every pending microtask —  which
+ * `await Promise.resolve()` at any repetition count does not (the
+ * `waitForStartupToSettle` docblock in `tests/index.graceful-shutdown.unit.test.ts` measures
+ * that at 2, 5, 10 and 20 turns). Named separately from `ADVANCE_NO_TIME_MS`, which is a
+ * fake-timer *advance*, for the reason `INDEX` is named separately from `CALLS`: the numeral is
+ * the same and the meaning is not.
+ */
+const NEXT_MACROTASK_MS = 0;
+
+/**
+ * One millisecond either side of `DRAIN_TIMEOUT_MS`, so `U74` can show the bound is the bound
+ * rather than merely an upper limit: the drain is unsettled at `bound - 1` and settled at
+ * `bound`.
+ */
+const TIMER_EPSILON_MS = 1;
+
+/**
  * Position of `min-idle` in the `XAUTOCLAIM` argument vector
  * `[stream, group, consumer, minIdle, cursor, COUNT, batch]`.
  *
@@ -664,6 +806,7 @@ const CLAIM_ARG_MIN_IDLE_INDEX = 3;
 describe("StreamConsumer.run", () => {
   let mockRedis: {
     xgroup: ReturnType<typeof vi.fn>;
+    xinfo: ReturnType<typeof vi.fn>;
     xreadgroup: ReturnType<typeof vi.fn>;
     xautoclaim: ReturnType<typeof vi.fn>;
     xack: ReturnType<typeof vi.fn>;
@@ -679,6 +822,14 @@ describe("StreamConsumer.run", () => {
   let mockLogger: Partial<Record<keyof Logger, ReturnType<typeof vi.fn>>>;
   let handled: Array<{ id: string; fields: readonly string[] }>;
   let handler: StreamMessageHandler;
+  /**
+   * Rejecters for calls a case has parked on the read connection, so the shared `disconnect`
+   * mock can end them the way a real `disconnect()` was measured ending an in-flight read.
+   *
+   * A list rather than one slot: `U35` parks an `XAUTOCLAIM` and `U26` parks an `XREADGROUP`,
+   * and `runLoop`'s `finally` disconnects a second time after the loop has broken.
+   */
+  let parkedRejections: Array<(reason: unknown) => void>;
 
   /** Every field the read command carries, each differing from its `WORKER_STREAM_CONSTANTS` default. */
   const loopEnv: Partial<ServiceEnv> = {
@@ -818,6 +969,88 @@ describe("StreamConsumer.run", () => {
     );
 
   /**
+   * `XINFO CONSUMERS`' argument vector. Throws rather than returning undefined, so a case that
+   * asserts on it cannot pass against a subject that never read the registry.
+   */
+  const xinfoArgs = (): unknown[] => {
+    const call = mockRedis.xinfo.mock.calls[INDEX.FIRST];
+    if (!call) {
+      throw new Error("xinfo was never called");
+    }
+
+    return call;
+  };
+
+  /**
+   * Every `XGROUP` call whose subcommand is `DELCONSUMER`.
+   *
+   * A filter rather than a throwing locator, deliberately and against this repository's usual
+   * rule: **zero is the assertion** in `U78`, `U79`, `U82` and `U87`, so a helper that threw on
+   * "not found" could not express the case that matters most. `delconsumerArgs` below is the
+   * throwing form, for the cases that assert the vector.
+   *
+   * Filtered by subcommand rather than counting `xgroup` calls, because `ensureConsumerGroup`
+   * issues `XGROUP CREATE` on the same spy.
+   */
+  const delconsumerCalls = (): unknown[][] =>
+    mockRedis.xgroup.mock.calls.filter(
+      (call) => call[INDEX.FIRST] === WORKER_SHUTDOWN.SUBCOMMAND_DELCONSUMER
+    );
+
+  /** The single `DELCONSUMER` vector, or a throw. */
+  const delconsumerArgs = (): unknown[] => {
+    const call = delconsumerCalls()[INDEX.FIRST];
+    if (!call) {
+      throw new Error("XGROUP DELCONSUMER was never issued");
+    }
+
+    return call;
+  };
+
+  /**
+   * A handler that blocks until released, and an order log shared with the Redis spies.
+   *
+   * The order log is what makes `U73` and `U84` non-tautological: two independent
+   * `toHaveBeenCalled()` checks pass in either order, and "deregistered **after** the drain" is
+   * the whole safety property — the other order is P1 against this consumer's own in-flight
+   * entries.
+   */
+  const buildGatedHandler = (): {
+    handler: StreamMessageHandler;
+    order: string[];
+    entered: () => boolean;
+    settled: () => boolean;
+    release: () => void;
+  } => {
+    const order: string[] = [];
+    let entered = false;
+    let settled = false;
+    let release: (() => void) | undefined;
+
+    return {
+      order,
+      entered: () => entered,
+      settled: () => settled,
+      release: () => release?.(),
+      handler: async (id: string, fields: string[]): Promise<void> => {
+        entered = true;
+        handled.push({ id, fields });
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        settled = true;
+        order.push(INVOCATION.HANDLER);
+      }
+    };
+  };
+
+  /** Yields to the macrotask queue, draining every pending microtask. Real timers only. */
+  const nextMacrotask = (): Promise<void> =>
+    new Promise((resolve) => {
+      setTimeout(resolve, NEXT_MACROTASK_MS);
+    });
+
+  /**
    * Every argument list passed to every logger method, for the redaction negatives.
    *
    * Throws rather than yielding `[]` in both directions a vacuous pass could come from: a
@@ -843,6 +1076,7 @@ describe("StreamConsumer.run", () => {
   };
 
   beforeEach(() => {
+    parkedRejections = [];
     readConnection = {
       xreadgroup: vi.fn().mockResolvedValue(null),
       xautoclaim: vi.fn().mockResolvedValue(autoclaimReply(WORKER_STREAM_READ.PENDING_START_ID, [])),
@@ -851,10 +1085,32 @@ describe("StreamConsumer.run", () => {
       // T-039 worker runs. Without the spy, an implementation that acknowledged would fail
       // with "xack is not a function" instead of naming the contract it broke.
       xack: vi.fn(),
-      disconnect: vi.fn()
+      // Models what `disconnect()` was measured doing rather than doing nothing (T-043).
+      //
+      // **This is a fixture correction the drain forced, and it is a strengthening.** Re-measured
+      // at Gate 3 on ioredis 5.11.1 / Redis 7.0.15: `disconnect()` issued 200 ms into a
+      // `BLOCK 5000` read rejected that read at **t = 204 ms measured from the read**, i.e.
+      // ~4 ms after the disconnect -- not 204 ms after it. Gate 5 measured the post-`disconnect`
+      // interval directly at **0-2 ms**, which is what makes a *synchronous* fake faithful
+      // (QA-2). Do not "correct" this fixture by adding a 204 ms delay: that would model an
+      // interval nothing measured. A
+      // `vi.fn()` that did nothing let `U26` and `U35` reject the parked call *after* `stop()`
+      // had already returned — an ordering production cannot produce, and one that deadlocks the
+      // moment `stop()` waits for the loop. Each case still supplies its own rejection value; a
+      // call that has already settled ignores it.
+      disconnect: vi.fn(() => {
+        for (const reject of parkedRejections) {
+          reject(new Error(CONNECTION_CLOSED_REJECTION));
+        }
+      })
     };
     mockRedis = {
       xgroup: vi.fn().mockResolvedValue("OK"),
+      // The shutdown registry read (T-043). Defaults to an **empty** registry, which is the
+      // `XINFO CONSUMERS` reply for a group nobody has read from — so the cases that were
+      // written before T-043 and call `stop()` (`U26`, `U35`) find no row of their own and issue
+      // no `DELCONSUMER`, which is what a consumer that never registered should do.
+      xinfo: vi.fn().mockResolvedValue([]),
       xreadgroup: vi.fn(() => {
         throw new Error(MAIN_CONNECTION_READ);
       }),
@@ -953,14 +1209,46 @@ describe("StreamConsumer.run", () => {
   });
 
   it("U14 - does not read, recover, or even open a connection when the predicate is already true", async () => {
-    // Scope (Gate 5 F-1, corrected at Gate 6 H-2/H-3): this asserts what `StreamConsumer`
-    // does -- the class in isolation -- and that is all it asserts. It is **not** evidence
-    // that this line reaches a deployed worker's output. `index.ts` discards `run()` and then
-    // calls `process.exit(0)`; the whole shutdown handler completes in 3-6 ms while
-    // `disconnect()` takes ~205 ms to reject the parked read, so the teardown lines are in a
-    // race with the exit. Measured over nine real SIGTERM runs: emitted in 4 of 5 runs at
-    // `STREAM_BLOCK_MS=20`, in 0 of 3 at 500 and 0 of 1 at the 5000 default. Approved design
-    // -- draining is T-043's, and nothing is lost because nothing is acknowledged. See S-26.
+    // Scope (Gate 5 F-1, corrected at Gate 6 H-2/H-3; **narrowed at T-043**): this asserts what
+    // `StreamConsumer` does -- the class in isolation. S-26 recorded that it was therefore *not*
+    // evidence the line reaches a shutting-down worker's output, because `index.ts` discarded
+    // `run()` and called `process.exit(0)` while `disconnect()` was still ~205 ms from rejecting
+    // the parked read.
+    //
+    // **That clause is now false for the `stop()` path, and measured to be.** `stop()` awaits the
+    // retained loop promise, and the loop writes both teardown lines in `runLoop`'s `finally`
+    // before resolving, so `src/index.ts`'s existing `await streamConsumer?.stop()` cannot reach
+    // `process.exit(0)` first.
+    //
+    // Measured by snapshotting the logger *inside* the `process.exit` spy (`U86`,
+    // `tests/index.graceful-shutdown.unit.test.ts`) -- "inside", because `process.exit` does not
+    // return, so "afterwards" is not a moment a real process has. Three bodies of `stop()`, three
+    // arrays, **each labelled with the mutation that actually produces it**:
+    //
+    //   shipped                -> 7 entries; `"Stream read interrupted by shutdown"` and
+    //                             `"Stream consumer loop stopped"` both present
+    //   drain gate deleted,    -> 4: `["Created stream consumer group","Shutting down gracefully",
+    //   deregistration kept        "Deregistered stream consumer","Shutdown complete"]`
+    //   `stop()` reverted to   -> 3: `["Created stream consumer group","Shutting down gracefully",
+    //   its pre-T-043 body         "Shutdown complete"]`
+    //
+    // Neither teardown line appears under **either** mutation, which is the load-bearing claim and
+    // it survives both. An earlier revision of this comment quoted the three-element array against
+    // "with the drain removed": that array is the *pre-T-043* one, and the drain-removed mutation
+    // yields four entries because the deregistration still runs. The measurement was right and the
+    // attribution was wrong -- caught at Gate 4 as HIGH-1, which is exactly the S-33 failure mode
+    // this block is written in the style of.
+    //
+    // **What is still open, and why S-26 is narrowed rather than closed:** any exit that does not
+    // run the `SIGTERM`/`SIGINT` handler -- `SIGKILL`, an orchestrator's grace period expiring
+    // mid-drain, a `process.exit` from elsewhere -- still loses the lines, and a drain that hits
+    // `WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS` reports the timeout instead of the teardown. Nothing is
+    // lost in any of those: nothing is acknowledged, so entries stay reclaimable.
+    //
+    // S-26's block-length table (4 of 5 runs at `STREAM_BLOCK_MS=20`, 0 of 3 at 500, 0 of 1 at
+    // 5000) and its "3-6 ms whole handler" figure are **inherited and were not re-derived here**
+    // -- they need nine real SIGTERM process runs, and none of them is load-bearing for the claim
+    // above.
     await buildLoopConsumer(() => true).run();
 
     expect(readConnection.xreadgroup).not.toHaveBeenCalled();
@@ -1155,14 +1443,46 @@ describe("StreamConsumer.run", () => {
   });
 
   it("U24 - reads on the duplicated connection and never on the container's", async () => {
-    // Scope (Gate 5 F-1, corrected at Gate 6 H-2/H-3): this asserts what `StreamConsumer`
-    // does -- the class in isolation -- and that is all it asserts. It is **not** evidence
-    // that this line reaches a deployed worker's output. `index.ts` discards `run()` and then
-    // calls `process.exit(0)`; the whole shutdown handler completes in 3-6 ms while
-    // `disconnect()` takes ~205 ms to reject the parked read, so the teardown lines are in a
-    // race with the exit. Measured over nine real SIGTERM runs: emitted in 4 of 5 runs at
-    // `STREAM_BLOCK_MS=20`, in 0 of 3 at 500 and 0 of 1 at the 5000 default. Approved design
-    // -- draining is T-043's, and nothing is lost because nothing is acknowledged. See S-26.
+    // Scope (Gate 5 F-1, corrected at Gate 6 H-2/H-3; **narrowed at T-043**): this asserts what
+    // `StreamConsumer` does -- the class in isolation. S-26 recorded that it was therefore *not*
+    // evidence the line reaches a shutting-down worker's output, because `index.ts` discarded
+    // `run()` and called `process.exit(0)` while `disconnect()` was still ~205 ms from rejecting
+    // the parked read.
+    //
+    // **That clause is now false for the `stop()` path, and measured to be.** `stop()` awaits the
+    // retained loop promise, and the loop writes both teardown lines in `runLoop`'s `finally`
+    // before resolving, so `src/index.ts`'s existing `await streamConsumer?.stop()` cannot reach
+    // `process.exit(0)` first.
+    //
+    // Measured by snapshotting the logger *inside* the `process.exit` spy (`U86`,
+    // `tests/index.graceful-shutdown.unit.test.ts`) -- "inside", because `process.exit` does not
+    // return, so "afterwards" is not a moment a real process has. Three bodies of `stop()`, three
+    // arrays, **each labelled with the mutation that actually produces it**:
+    //
+    //   shipped                -> 7 entries; `"Stream read interrupted by shutdown"` and
+    //                             `"Stream consumer loop stopped"` both present
+    //   drain gate deleted,    -> 4: `["Created stream consumer group","Shutting down gracefully",
+    //   deregistration kept        "Deregistered stream consumer","Shutdown complete"]`
+    //   `stop()` reverted to   -> 3: `["Created stream consumer group","Shutting down gracefully",
+    //   its pre-T-043 body         "Shutdown complete"]`
+    //
+    // Neither teardown line appears under **either** mutation, which is the load-bearing claim and
+    // it survives both. An earlier revision of this comment quoted the three-element array against
+    // "with the drain removed": that array is the *pre-T-043* one, and the drain-removed mutation
+    // yields four entries because the deregistration still runs. The measurement was right and the
+    // attribution was wrong -- caught at Gate 4 as HIGH-1, which is exactly the S-33 failure mode
+    // this block is written in the style of.
+    //
+    // **What is still open, and why S-26 is narrowed rather than closed:** any exit that does not
+    // run the `SIGTERM`/`SIGINT` handler -- `SIGKILL`, an orchestrator's grace period expiring
+    // mid-drain, a `process.exit` from elsewhere -- still loses the lines, and a drain that hits
+    // `WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS` reports the timeout instead of the teardown. Nothing is
+    // lost in any of those: nothing is acknowledged, so entries stay reclaimable.
+    //
+    // S-26's block-length table (4 of 5 runs at `STREAM_BLOCK_MS=20`, 0 of 3 at 500, 0 of 1 at
+    // 5000) and its "3-6 ms whole handler" figure are **inherited and were not re-derived here**
+    // -- they need nine real SIGTERM process runs, and none of them is load-bearing for the claim
+    // above.
     readConnection.xreadgroup.mockResolvedValueOnce(streamReply([ENTRY.FIRST]));
 
     await buildLoopConsumer(stopAfter(CALLS.ONCE)).run();
@@ -1186,19 +1506,58 @@ describe("StreamConsumer.run", () => {
   });
 
   it("U26 - stop() ends an in-flight read quietly: no error log, loop terminates", async () => {
-    // Scope (Gate 5 F-1, corrected at Gate 6 H-2/H-3): this asserts what `StreamConsumer`
-    // does -- the class in isolation -- and that is all it asserts. It is **not** evidence
-    // that this line reaches a deployed worker's output. `index.ts` discards `run()` and then
-    // calls `process.exit(0)`; the whole shutdown handler completes in 3-6 ms while
-    // `disconnect()` takes ~205 ms to reject the parked read, so the teardown lines are in a
-    // race with the exit. Measured over nine real SIGTERM runs: emitted in 4 of 5 runs at
-    // `STREAM_BLOCK_MS=20`, in 0 of 3 at 500 and 0 of 1 at the 5000 default. Approved design
-    // -- draining is T-043's, and nothing is lost because nothing is acknowledged. See S-26.
-    let rejectRead: ((reason: unknown) => void) | undefined;
+    // Scope (Gate 5 F-1, corrected at Gate 6 H-2/H-3; **narrowed at T-043**): this asserts what
+    // `StreamConsumer` does -- the class in isolation. S-26 recorded that it was therefore *not*
+    // evidence the line reaches a shutting-down worker's output, because `index.ts` discarded
+    // `run()` and called `process.exit(0)` while `disconnect()` was still ~205 ms from rejecting
+    // the parked read.
+    //
+    // **That clause is now false for the `stop()` path, and measured to be.** `stop()` awaits the
+    // retained loop promise, and the loop writes both teardown lines in `runLoop`'s `finally`
+    // before resolving, so `src/index.ts`'s existing `await streamConsumer?.stop()` cannot reach
+    // `process.exit(0)` first.
+    //
+    // Measured by snapshotting the logger *inside* the `process.exit` spy (`U86`,
+    // `tests/index.graceful-shutdown.unit.test.ts`) -- "inside", because `process.exit` does not
+    // return, so "afterwards" is not a moment a real process has. Three bodies of `stop()`, three
+    // arrays, **each labelled with the mutation that actually produces it**:
+    //
+    //   shipped                -> 7 entries; `"Stream read interrupted by shutdown"` and
+    //                             `"Stream consumer loop stopped"` both present
+    //   drain gate deleted,    -> 4: `["Created stream consumer group","Shutting down gracefully",
+    //   deregistration kept        "Deregistered stream consumer","Shutdown complete"]`
+    //   `stop()` reverted to   -> 3: `["Created stream consumer group","Shutting down gracefully",
+    //   its pre-T-043 body         "Shutdown complete"]`
+    //
+    // Neither teardown line appears under **either** mutation, which is the load-bearing claim and
+    // it survives both. An earlier revision of this comment quoted the three-element array against
+    // "with the drain removed": that array is the *pre-T-043* one, and the drain-removed mutation
+    // yields four entries because the deregistration still runs. The measurement was right and the
+    // attribution was wrong -- caught at Gate 4 as HIGH-1, which is exactly the S-33 failure mode
+    // this block is written in the style of.
+    //
+    // **What is still open, and why S-26 is narrowed rather than closed:** any exit that does not
+    // run the `SIGTERM`/`SIGINT` handler -- `SIGKILL`, an orchestrator's grace period expiring
+    // mid-drain, a `process.exit` from elsewhere -- still loses the lines, and a drain that hits
+    // `WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS` reports the timeout instead of the teardown. Nothing is
+    // lost in any of those: nothing is acknowledged, so entries stay reclaimable.
+    //
+    // S-26's block-length table (4 of 5 runs at `STREAM_BLOCK_MS=20`, 0 of 3 at 500, 0 of 1 at
+    // 5000) and its "3-6 ms whole handler" figure are **inherited and were not re-derived here**
+    // -- they need nine real SIGTERM process runs, and none of them is load-bearing for the claim
+    // above.
+    let readIssued = false;
     readConnection.xreadgroup.mockImplementationOnce(
       () =>
         new Promise((_resolve, reject) => {
-          rejectRead = reject;
+          readIssued = true;
+          // What `disconnect()` does to a read parked on the connection, measured: the in-flight
+          // call rejects with `Error: Connection is closed.` — re-derived at Gate 3 at 204 ms
+          // against a `BLOCK 5000`. Handing the rejecter to the shared `disconnect` mock rather
+          // than firing it from the case body is the T-043 correction: `stop()` now awaits the
+          // loop, so a rejection issued *after* `stop()` returned is an ordering the real client
+          // cannot produce.
+          parkedRejections.push(reject);
         })
     );
     // The predicate never flips. Termination therefore has to come from `stop()` alone, which
@@ -1206,18 +1565,20 @@ describe("StreamConsumer.run", () => {
     const consumer = buildLoopConsumer(() => false);
     const runPromise = consumer.run();
     await vi.waitFor(() => {
-      if (!rejectRead) {
+      if (!readIssued) {
         throw new Error("the read was never issued");
       }
     });
 
     await consumer.stop();
-    // What `disconnect()` does to a read parked on the connection, measured: the in-flight
-    // call rejected after 205 ms with `Error: Connection is closed.`
-    rejectRead?.(new Error(CONNECTION_CLOSED_REJECTION));
-    await expect(runPromise).resolves.toBeUndefined();
-
+    // **Before `await runPromise`, and the position is the point** (Gate-4 LOW-1). The corrected
+    // `disconnect` fake ends the parked read, so with `this.readConnection?.disconnect()` deleted
+    // from `stop()` the read never rejects and `runPromise` never settles — awaiting it first
+    // turned that mutation's failure into a bare `Test timed out in 5000ms`, which names nothing
+    // and is the defect `U50`/`CASE_BUDGET_MS` exist to prevent. Asserted here, `stop()` has
+    // already returned at the drain's 3 000 ms bound and the mutation reports by name.
     expect(readConnection.disconnect).toHaveBeenCalled();
+    await expect(runPromise).resolves.toBeUndefined();
 
     expect(mockLogger.error).not.toHaveBeenCalled();
     // AC8's own line, pinned by text *and* fields (M-8). Until the Gate-6 review this case
@@ -1414,11 +1775,13 @@ describe("StreamConsumer.run", () => {
   });
 
   it("U35 - stop() during startup recovery ends quietly: info, not error", async () => {
-    let rejectClaim: ((reason: unknown) => void) | undefined;
+    let claimIssued = false;
     readConnection.xautoclaim.mockImplementationOnce(
       () =>
         new Promise((_resolve, reject) => {
-          rejectClaim = reject;
+          claimIssued = true;
+          // Ended by the shared `disconnect` mock rather than from the case body — see `U26`.
+          parkedRejections.push(reject);
         })
     );
     // The predicate never flips, so the quiet exit has to come from `stop()` alone — the same
@@ -1426,13 +1789,16 @@ describe("StreamConsumer.run", () => {
     const consumer = buildLoopConsumer(() => false);
     const runPromise = consumer.run();
     await vi.waitFor(() => {
-      if (!rejectClaim) {
+      if (!claimIssued) {
         throw new Error("the reclaim was never issued");
       }
     });
 
     await consumer.stop();
-    rejectClaim?.(new Error(CONNECTION_CLOSED_REJECTION));
+    // Before `await runPromise`, for the reason `U26` records at the same point (Gate-4 LOW-1):
+    // without it, deleting `stop()`'s `disconnect()` fails this case as `Test timed out in
+    // 5000ms` instead of naming the call that did not happen.
+    expect(readConnection.disconnect).toHaveBeenCalled();
     await expect(runPromise).resolves.toBeUndefined();
 
     // AC8 is "a read interrupted by shutdown ends quietly: no error-level log". Before this
@@ -1643,6 +2009,633 @@ describe("StreamConsumer.run", () => {
     expect(readConnection.xautoclaim).toHaveBeenCalledTimes(CALLS.ONCE);
   });
 
+  // ---------------------------------------------------------------------------------------
+  // T-043 — graceful shutdown: the bounded drain (slice 1) and the guarded deregistration
+  // (slice 2).
+  //
+  // `stop()` was `{ this.stopRequested = true; this.readConnection?.disconnect(); }` before this
+  // block. Against that body, **thirteen of the sixteen cases here go red** — re-measured at the
+  // Gate-4 rework, after `U90` was added and the block was reordered:
+  //
+  //   red      U73 U74 U76 U77 U78 U80 U81 U82 U84 U87 U88 U89 U90
+  //   not red  U75 U79 U83
+  //
+  // Headline failures, verbatim from that run: `U73` -> `expected [ 'stop' ] to deeply equal []`
+  // (the pre-release check, i.e. `stop()` resolved while the handler was still in flight), and
+  // `U77` -> `xinfo was never called`.
+  //
+  // **The three that do not go red are named rather than glossed**, because a block claiming
+  // "every case was confirmed red" would be false and this comment said exactly that until the
+  // Gate-4 rework. `U83` pins AC1, which was already satisfied before this task; `U75` and `U79`
+  // guard behaviour the unfixed code cannot exhibit because it deregisters at all. Each carries
+  // its own substitute mutation in its own comment: `U75` -> `drain()` returns `COMPLETED` for a
+  // null `loopPromise`; `U79` -> `stop()` deregisters regardless of drain outcome; `U83` -> a
+  // `shouldStop()` guard inside `dispatch`'s per-entry loop.
+  // ---------------------------------------------------------------------------------------
+
+  it("U73 - stop() does not resolve until an in-flight handler settles", async () => {
+    const gate = buildGatedHandler();
+    readConnection.xreadgroup.mockResolvedValueOnce(streamReply([ENTRY.FIRST]));
+    // The predicate never flips: the drain has to be what ends this, not a stop condition the
+    // loop was going to notice anyway.
+    const consumer = buildLoopConsumer(() => false, gate.handler);
+    const runPromise = consumer.run();
+    await vi.waitFor(() => {
+      if (!gate.entered()) {
+        throw new Error("the handler was never entered");
+      }
+    });
+
+    const stopPromise = consumer.stop().then(() => {
+      gate.order.push(INVOCATION.STOP);
+    });
+    // A full macrotask turn, so every microtask the subject could schedule has run. Nothing here
+    // can settle the handler, so a `stop()` that resolved would do so on its own account.
+    await nextMacrotask();
+    expect(gate.settled()).toBe(false);
+    expect(gate.order).toEqual([]);
+
+    gate.release();
+    await stopPromise;
+    await runPromise;
+
+    // Order, not two independent "was called" checks: `['stop','handler']` is precisely the
+    // pre-T-043 behaviour, and it is what this reported before the drain landed.
+    expect(gate.order).toEqual([INVOCATION.HANDLER, INVOCATION.STOP]);
+    expect(handled).toEqual([{ id: ENTRY.FIRST.id, fields: [...ENTRY.FIRST.fields] }]);
+  });
+
+  it("U74 - stop() resolves at the bound when the handler never settles, and logs the timeout", async () => {
+    vi.useFakeTimers();
+    const gate = buildGatedHandler();
+    readConnection.xreadgroup.mockResolvedValueOnce(streamReply([ENTRY.FIRST]));
+    const consumer = buildLoopConsumer(() => false, gate.handler);
+    const runPromise = consumer.run();
+    await vi.advanceTimersByTimeAsync(ADVANCE_NO_TIME_MS);
+    expect(gate.entered()).toBe(true);
+
+    let stopSettled = false;
+    const stopPromise = consumer.stop().then(() => {
+      stopSettled = true;
+    });
+
+    // One millisecond short of the bound: still waiting. Without this half the case would pass
+    // against an implementation with no bound at all *and* against one that never waited.
+    await vi.advanceTimersByTimeAsync(WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS - TIMER_EPSILON_MS);
+    expect(stopSettled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(TIMER_EPSILON_MS);
+    await stopPromise;
+
+    expect(stopSettled).toBe(true);
+    // The handler is *still* hanging. "Bounded" means `stop()` gave up on it, not that it ended.
+    expect(gate.settled()).toBe(false);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME,
+        drainTimeoutMs: WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS
+      },
+      LOG_MESSAGE.DRAIN_TIMED_OUT
+    );
+
+    // The floor `DRAIN_TIMEOUT_MS`'s docblock argues for, asserted rather than left to prose: a
+    // bound **below** `ERROR_BACKOFF_MS` makes a shutdown that lands during a failing loop's
+    // pause liable to time out, and a timed-out drain suppresses the deregistration (`U79`) —
+    // so the guard would stop deregistering exactly when a worker is unhealthy.
+    //
+    // Not "every time": measured false in both directions at Gate 5 (QA-1). At a bound equal to
+    // `ERROR_BACKOFF_MS` it essentially never times out; at 500 ms it timed out at 3 of 4
+    // offsets sampled across the pause. Common enough to reject the bound, not universal.
+    expect(WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS).toBeGreaterThan(
+      WORKER_STREAM_READ.ERROR_BACKOFF_MS
+    );
+
+    gate.release();
+    await vi.advanceTimersByTimeAsync(ADVANCE_NO_TIME_MS);
+    await runPromise;
+  });
+
+  it("U75 - stop() before run() resolves and issues no Redis command", async () => {
+    const consumer = buildLoopConsumer(() => false);
+
+    await expect(consumer.stop()).resolves.toBeUndefined();
+
+    // Nothing was ever registered, so there is nothing to read and nothing to delete. The
+    // negative on `xgroup` is the one that matters: `DELCONSUMER` against a name this process
+    // never used is harmless today (measured: returns `0`, no error) but it is a round trip
+    // issued on a guess, and under an operator-set shared name (plan R4) the name is not ours.
+    expect(mockRedis.xinfo).not.toHaveBeenCalled();
+    expect(mockRedis.xgroup).not.toHaveBeenCalled();
+    expect(mockRedis.duplicate).not.toHaveBeenCalled();
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
+  it("U76 - stop() twice deregisters at most once", async () => {
+    mockRedis.xinfo.mockResolvedValue([
+      consumerInfoRow(OVERRIDE.CONSUMER_NAME, CONSUMER_PENDING.NONE)
+    ]);
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    await consumer.stop();
+    await consumer.stop();
+
+    // `index.ts` calls `stop()` once, but nothing stops a second caller — and the second
+    // `DELCONSUMER` is not a harmless repeat: between the two calls a *restarted* instance could
+    // have taken the same name (an operator-pinned one), and the repeat would then delete a live
+    // consumer's registration. At most once, keyed on the attempt rather than on its outcome.
+    expect(delconsumerCalls()).toHaveLength(CALLS.ONCE);
+    expect(mockRedis.xinfo).toHaveBeenCalledTimes(CALLS.ONCE);
+  });
+
+  it("U77 - deregisters this consumer when its own row reports pending 0", async () => {
+    mockRedis.xinfo.mockResolvedValue([
+      // A live peer, holding work. Present so that a guard reading "the first row", "any row" or
+      // a group-wide total fails here rather than shipping.
+      consumerInfoRow(OTHER_CONSUMER_NAME, CONSUMER_PENDING.SOME),
+      consumerInfoRow(OVERRIDE.CONSUMER_NAME, CONSUMER_PENDING.NONE)
+    ]);
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    await consumer.stop();
+
+    expect(xinfoArgs()).toEqual([
+      WORKER_SHUTDOWN.SUBCOMMAND_CONSUMERS,
+      OVERRIDE.STREAM_NAME,
+      OVERRIDE.CONSUMER_GROUP
+    ]);
+    expect(delconsumerArgs()).toEqual([
+      WORKER_SHUTDOWN.SUBCOMMAND_DELCONSUMER,
+      OVERRIDE.STREAM_NAME,
+      OVERRIDE.CONSUMER_GROUP,
+      OVERRIDE.CONSUMER_NAME
+    ]);
+    // The negative that the vector assertion above does not make on its own: the peer's name
+    // appears nowhere in what was deleted.
+    expect(delconsumerArgs()).not.toContain(OTHER_CONSUMER_NAME);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME
+      },
+      LOG_MESSAGE.DEREGISTERED
+    );
+  });
+
+  it("U78 - does not deregister while its own row still reports pending entries", async () => {
+    mockRedis.xinfo.mockResolvedValue([
+      consumerInfoRow(OVERRIDE.CONSUMER_NAME, CONSUMER_PENDING.SOME)
+    ]);
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    await consumer.stop();
+
+    // **The case this whole task exists for.** Measured on Redis 7.0.15 (probe P1, re-run at
+    // Gate 3): `XGROUP DELCONSUMER` against a consumer holding two pending entries returned `2`,
+    // `XPENDING` dropped to 0, and `XAUTOCLAIM ... 0 0-0` and `XREADGROUP ... >` both came back
+    // empty while `XLEN` still reported 2 — the entries unreachable through the group, forever,
+    // with no error raised. A lingering registration row is cosmetic; this is unrecoverable.
+    expect(delconsumerCalls()).toHaveLength(CALLS.NONE);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME,
+        pending: CONSUMER_PENDING.SOME
+      },
+      LOG_MESSAGE.DEREGISTER_SKIPPED_PENDING
+    );
+  });
+
+  it("U79 - does not deregister when the drain timed out", async () => {
+    vi.useFakeTimers();
+    mockRedis.xinfo.mockResolvedValue([
+      // Reports zero — i.e. the reading that *would* permit the delete. The suppression must come
+      // from the timeout, not from the count, which is why this row says what it says.
+      consumerInfoRow(OVERRIDE.CONSUMER_NAME, CONSUMER_PENDING.NONE)
+    ]);
+    const gate = buildGatedHandler();
+    readConnection.xreadgroup.mockResolvedValueOnce(streamReply([ENTRY.FIRST]));
+    const consumer = buildLoopConsumer(() => false, gate.handler);
+    const runPromise = consumer.run();
+    await vi.advanceTimersByTimeAsync(ADVANCE_NO_TIME_MS);
+
+    const stopPromise = consumer.stop();
+    await vi.advanceTimersByTimeAsync(WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS);
+    await stopPromise;
+
+    // Fail closed. On a timeout we cannot show what this consumer still holds — the handler is
+    // mid-flight and its entry is still pending by construction — so the registry reading is not
+    // even taken. The lingering row is the *point*: it leaves the abandoned work visible to an
+    // operator instead of hiding a hung handler behind a clean-looking shutdown (plan R2).
+    expect(mockRedis.xinfo).not.toHaveBeenCalled();
+    expect(delconsumerCalls()).toHaveLength(CALLS.NONE);
+
+    gate.release();
+    await vi.advanceTimersByTimeAsync(ADVANCE_NO_TIME_MS);
+    await runPromise;
+  });
+
+  it("U80 - a NOGROUP reply to the deregistration is logged and does not throw out of stop()", async () => {
+    mockRedis.xinfo.mockResolvedValue([
+      consumerInfoRow(OVERRIDE.CONSUMER_NAME, CONSUMER_PENDING.NONE)
+    ]);
+    mockRedis.xgroup.mockRejectedValue(new Error(NOGROUP_DELCONSUMER_REPLY));
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    await expect(consumer.stop()).resolves.toBeUndefined();
+
+    // `info`, not `error`. A group destroyed before the worker stopped is a normal deploy shape,
+    // and paging someone for it is the false alarm `U35`'s `RECOVERY_INTERRUPTED` was written to
+    // stop.
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME,
+        error: NOGROUP_DELCONSUMER_REPLY
+      },
+      LOG_MESSAGE.DEREGISTER_GROUP_GONE
+    );
+    expect(mockLogger.error).not.toHaveBeenCalled();
+  });
+
+  it("U81 - the missing-key XGROUP reply is classified the same way, and it shares no prefix with NOGROUP", async () => {
+    mockRedis.xinfo.mockResolvedValue([
+      consumerInfoRow(OVERRIDE.CONSUMER_NAME, CONSUMER_PENDING.NONE)
+    ]);
+    mockRedis.xgroup.mockRejectedValue(new Error(MISSING_KEY_DELCONSUMER_REPLY));
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    await expect(consumer.stop()).resolves.toBeUndefined();
+
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME,
+        error: MISSING_KEY_DELCONSUMER_REPLY
+      },
+      LOG_MESSAGE.DEREGISTER_GROUP_GONE
+    );
+    expect(mockLogger.error).not.toHaveBeenCalled();
+    // Plan finding F2, asserted rather than described. `WORKER_STREAM_READ`'s constant is named
+    // `MISSING_GROUP_ERROR_PREFIX` and classifies `NOGROUP` only; this reply describes the same
+    // condition and shares no prefix with it, so a classifier that reused that one constant
+    // reports this shutdown as an unexpected error. Sourcing both sides from `src/` would be
+    // tautological, so the *reply* is the literal above and only the constant comes from `src/`.
+    expect(MISSING_KEY_DELCONSUMER_REPLY.startsWith(WORKER_STREAM_READ.MISSING_GROUP_ERROR_PREFIX)).toBe(
+      false
+    );
+  });
+
+  it("U82 - an XINFO CONSUMERS failure suppresses the delete and does not throw", async () => {
+    mockRedis.xinfo.mockRejectedValue(new Error(TRANSIENT_XINFO_FAILURE));
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    await expect(consumer.stop()).resolves.toBeUndefined();
+
+    // No reading, no delete. This is the branch where the asymmetry decides: a lingering
+    // registration row costs nothing recoverable, and deleting on a reading we could not take is
+    // P1 with the guard removed.
+    expect(delconsumerCalls()).toHaveLength(CALLS.NONE);
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME,
+        error: TRANSIENT_XINFO_FAILURE
+      },
+      LOG_MESSAGE.DEREGISTER_SKIPPED_UNREADABLE
+    );
+  });
+
+  it("U83 - a predicate flipping mid-batch still lets every entry in the batch reach the handler", async () => {
+    // **AC1, which was already satisfied before this task — so this case pins behaviour rather
+    // than driving it, and it did not go red before the implementation.** Stated plainly because
+    // a case that never failed proves nothing on its own. The mutation that establishes it, run
+    // at Gate 3: add a `if (this.shouldStop()) return;` to the top of `dispatch`'s per-entry
+    // loop. This case reports
+    // `expected [ '1789101023800-0' ] to deeply equal [ '1789101023800-0', ...(2) ]`.
+    //
+    // Stated as measured: that mutation is **not** surgical — it reddens **eleven** cases, because
+    // `stopAfter(n)` counts predicate *checks* and an extra check per entry shifts every case
+    // that uses it. The full set, re-counted at the Gate-4 rework by reading the runner's own
+    // failure list rather than by eye: `U13`, `U15`, `U19`, `U20`, `U21`, `U29`, `U34`, `U36`,
+    // `U37`, `U70`, `U83` — `Tests 11 failed | 43 passed (54)`. An earlier revision of this
+    // comment said nine and omitted `U37` and `U70`; caught at Gate 4 as LOW-2, which is S-33's
+    // pattern occurring inside a comment written in S-33's style.
+    //
+    // What makes this case the one that *names* the defect is that its assertion is the batch's
+    // contents rather than a call count.
+    readConnection.xreadgroup.mockResolvedValueOnce(
+      streamReply([ENTRY.FIRST, ENTRY.SECOND, ENTRY.RECLAIMED])
+    );
+    let shuttingDown = false;
+    const flipOnFirstEntry: StreamMessageHandler = (id: string, fields: string[]) => {
+      handled.push({ id, fields });
+      // Flips while the batch is still being walked — the condition a mid-batch check would act
+      // on. Entries already delivered to this consumer are not *lost* if it did (nothing is
+      // acknowledged), but they would sit out an idle timeout for no reason.
+      shuttingDown = true;
+
+      return Promise.resolve();
+    };
+
+    await buildLoopConsumer(() => shuttingDown, flipOnFirstEntry).run();
+
+    expect(handled.map((entry) => entry.id)).toEqual([
+      ENTRY.FIRST.id,
+      ENTRY.SECOND.id,
+      ENTRY.RECLAIMED.id
+    ]);
+    // And the loop still exits at the next iteration boundary rather than reading again.
+    expect(readConnection.xreadgroup).toHaveBeenCalledTimes(CALLS.ONCE);
+  });
+
+  it("U84 - the deregistration is issued after the drain, by invocation order", async () => {
+    const gate = buildGatedHandler();
+    mockRedis.xinfo.mockImplementation(() => {
+      gate.order.push(INVOCATION.XINFO);
+
+      return Promise.resolve([consumerInfoRow(OVERRIDE.CONSUMER_NAME, CONSUMER_PENDING.NONE)]);
+    });
+    mockRedis.xgroup.mockImplementation((subcommand: unknown) => {
+      if (subcommand === WORKER_SHUTDOWN.SUBCOMMAND_DELCONSUMER) {
+        gate.order.push(INVOCATION.DELCONSUMER);
+      }
+
+      return Promise.resolve(CALLS.ONCE);
+    });
+    readConnection.xreadgroup.mockResolvedValueOnce(streamReply([ENTRY.FIRST]));
+    const consumer = buildLoopConsumer(() => false, gate.handler);
+    const runPromise = consumer.run();
+    await vi.waitFor(() => {
+      if (!gate.entered()) {
+        throw new Error("the handler was never entered");
+      }
+    });
+
+    const stopPromise = consumer.stop();
+    await nextMacrotask();
+    // Nothing may be read or deleted while our own entry is still in flight: at this instant it
+    // is pending, so a registry read here would report `pending 1` at best and a delete would be
+    // P1 against our own work at worst.
+    expect(gate.order).toEqual([]);
+
+    gate.release();
+    await stopPromise;
+    await runPromise;
+
+    // Order, not three independent "was called" checks — those pass in any order, and the order
+    // is the safety property.
+    expect(gate.order).toEqual([
+      INVOCATION.HANDLER,
+      INVOCATION.XINFO,
+      INVOCATION.DELCONSUMER
+    ]);
+  });
+
+  it("U87 - the ERR no such key reply to XINFO CONSUMERS is classified as gone, not as a fault", async () => {
+    mockRedis.xinfo.mockRejectedValue(new Error(NO_SUCH_KEY_XINFO_REPLY));
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    await expect(consumer.stop()).resolves.toBeUndefined();
+
+    // A **third** reply shape for "the group or key is gone", measured at Gate 3 and absent from
+    // the plan's F2 table, which listed only the two `XGROUP` shapes. `XINFO CONSUMERS` against a
+    // deleted stream key replies `ERR no such key` — sharing a prefix with neither `NOGROUP` nor
+    // `ERR The XGROUP subcommand requires the key to exist...`. Without this classification every
+    // shutdown after a stream deletion logs at ERROR.
+    expect(delconsumerCalls()).toHaveLength(CALLS.NONE);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME,
+        error: NO_SUCH_KEY_XINFO_REPLY
+      },
+      LOG_MESSAGE.DEREGISTER_GROUP_GONE
+    );
+    expect(mockLogger.error).not.toHaveBeenCalled();
+    expect(
+      NO_SUCH_KEY_XINFO_REPLY.startsWith(WORKER_STREAM_READ.MISSING_GROUP_ERROR_PREFIX)
+    ).toBe(false);
+  });
+
+  it("U88 - does not issue a delete when no registry row carries this consumer's name", async () => {
+    // `XINFO CONSUMERS` for a group nobody has read from — measured at Gate 3 as `[]`, and the
+    // state a worker is in when its loop opened, reclaimed nothing and read nothing.
+    mockRedis.xinfo.mockResolvedValue([]);
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    await consumer.stop();
+
+    // **Skipping here is a deliberate departure from the plan**, which said to delete on an
+    // absent name on the grounds that it is idempotent (measured: `DELCONSUMER` against a name
+    // that never existed returns `0` and does not error). It is idempotent, and it is still the
+    // wrong default: under an operator-pinned shared `REDIS_CONSUMER_NAME` (plan R4) "absent
+    // when I looked" is exactly the P11 race — a peer can create the row and take an entry
+    // between the read and the delete, and the delete then destroys it. Identical end state, one
+    // fewer round trip, strictly less risk.
+    //
+    // The mutation that establishes it, run at Gate 3 — and it has to be the mutation that
+    // expresses the *plan's* alternative, not merely one that deletes a branch. Make
+    // `parseConsumerReading` return `{ kind: FOUND, pending: NO_PENDING_ENTRIES }` where it
+    // returns `ABSENT`, i.e. read "no row" as "no pending entries": this case then reports
+    // `expected [ [ 'DELCONSUMER', ...(3) ] ] to have a length of +0 but got 1`.
+    //
+    // Recorded because the first mutation tried was weaker and its write-up was wrong.
+    // Commenting out the `ABSENT` branch alone leaves `reading.pending` `undefined` at runtime,
+    // `undefined !== 0` takes the pending-entries branch, and **no delete is issued** — so the
+    // case failed on the log assertion below rather than on the one above, and "this line is what
+    // stops the delete" would have been asserted by a run that did not show it.
+    expect(delconsumerCalls()).toHaveLength(CALLS.NONE);
+    expect(mockRedis.xinfo).toHaveBeenCalledTimes(CALLS.ONCE);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME
+      },
+      LOG_MESSAGE.DEREGISTER_NOT_REGISTERED
+    );
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+    expect(mockLogger.error).not.toHaveBeenCalled();
+  });
+
+  it("U89 - an XINFO CONSUMERS reply the parser does not recognise is not read as pending 0", async () => {
+    // The reply arrives, so the `catch` in `deregisterConsumer` never runs — this is the *parse*
+    // branch, and it is the one that decides what "unknown" means. **Unknown is not zero.** A
+    // parser that fell back to a zero reading on a shape it did not understand would issue the
+    // delete against a consumer whose pending count it had never actually seen, which is P1 with
+    // an extra step.
+    //
+    // The shape is deliberately close to a real row rather than obviously junk: the field names
+    // are right and only `pending`'s *type* is wrong, which is what a protocol change (RESP3, a
+    // future encoding) would most plausibly produce. Measured at Gate 3 on this Redis through
+    // ioredis 5.11.1, `pending` came back a JavaScript `number`; the string here is the shape
+    // that is *not* what was measured.
+    mockRedis.xinfo.mockResolvedValue([
+      [
+        "name",
+        OVERRIDE.CONSUMER_NAME,
+        "pending",
+        String(CONSUMER_PENDING.NONE),
+        "idle",
+        OBSERVED_CONSUMER_IDLE_MS
+      ]
+    ]);
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    await expect(consumer.stop()).resolves.toBeUndefined();
+
+    expect(delconsumerCalls()).toHaveLength(CALLS.NONE);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME
+      },
+      LOG_MESSAGE.DEREGISTER_SKIPPED_UNPARSEABLE
+    );
+  });
+
+  it("U90 - an unclassified DELCONSUMER rejection is logged at ERROR and still does not throw", async () => {
+    // The branch `U80`/`U81`/`U87` do **not** reach: those three assert the *classified* replies,
+    // which are logged at `info` because a group or key that is already gone is a normal deploy
+    // shape. This is the other side of that split — a Redis fault during the delete — and it is
+    // the one case that decides whether a real failure surfaces at ERROR or is quietly downgraded
+    // to the same `info` line as a benign one.
+    //
+    // Until Gate 4 this branch had no case at all, and `LOG_MESSAGE.DEREGISTER_FAILED` was
+    // declared and never asserted — a constant naming a branch nothing reached, which is evidence
+    // the case was planned and dropped (Gate-4 MEDIUM-1). `src/events/**` is outside this
+    // package's coverage collection (S-25), so no percentage would ever have flagged it.
+    //
+    // **Two mutations, both run at the Gate-4 rework, because the branch has two halves.**
+    //
+    //   delete the `catch` around `XGROUP DELCONSUMER` in `deleteConsumerIfIdle`
+    //     -> this case reports `promise rejected "Error: Reached the max retries per request
+    //        limit (which is 2)..." instead of resolving` — the failure escapes `stop()` and
+    //        would take `index.ts`'s shutdown handler into its `catch` and `process.exit(1)`.
+    //        Collateral, stated rather than omitted: `U80` and `U81` go red too, with the same
+    //        shape, because they share the `catch`. Three red, not one.
+    //   `const gone = error instanceof Error` in `logDeregistrationFailure`, i.e. classify
+    //   every failure as benign
+    //     -> `U90` and `U82` red, on the ERROR assertions; `U80`, `U81`, `U87` stay green,
+    //        because downgrading everything to `info` is invisible to the cases that expect
+    //        `info`. This is the half that pins the *level*, and it is the mutation the
+    //        surrounding `U80`/`U81`/`U87` cannot catch.
+    mockRedis.xinfo.mockResolvedValue([
+      consumerInfoRow(OVERRIDE.CONSUMER_NAME, CONSUMER_PENDING.NONE)
+    ]);
+    mockRedis.xgroup.mockRejectedValue(new Error(TRANSIENT_READ_FAILURE));
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+    await consumer.run();
+
+    // Does not throw: a shutdown path that rejects is a worker that exits non-zero because it
+    // could not tidy a registry row.
+    await expect(consumer.stop()).resolves.toBeUndefined();
+
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME,
+        error: TRANSIENT_READ_FAILURE
+      },
+      LOG_MESSAGE.DEREGISTER_FAILED
+    );
+    // ERROR, *not* the benign classification. Without this negative, a classifier that matched
+    // everything would pass the assertion above only if it also still logged at error — which it
+    // would not, and this is the line that says so.
+    expect(mockLogger.info).not.toHaveBeenCalledWith(
+      expect.anything(),
+      LOG_MESSAGE.DEREGISTER_GROUP_GONE
+    );
+    // The delete really was attempted — otherwise this case would pass against an implementation
+    // that never issued the command at all.
+    expect(delconsumerCalls()).toHaveLength(CALLS.ONCE);
+  });
+
+  it("U91 - a loop that rejected is a loop that finished: the drain still deregisters", async () => {
+    // **The third arm of the drain, and the only one nothing reached.** `drain()` maps the loop
+    // promise through `.then(onFulfilled, onRejected)` and both arms return `COMPLETED`; mutating
+    // the **rejected** arm to `TIMED_OUT` left the package 179/179 green (Gate-6 finding).
+    //
+    // Reaching it needs a `runLoop()` that *rejects*, and `duplicate()` is the cheap way in: it is
+    // called **outside** `runLoop`'s `try`, so a throw there rejects the loop promise rather than
+    // being swallowed — the same seam `U32` uses, and the reason `U32` exists at all. No wedged
+    // handler, no fake timers, no wall-clock cost: `Promise.race` settles on the already-rejected
+    // arm in a microtask and the losing timer is cleared.
+    //
+    // **What this pins is the consequence, not the branch.** A rejected drain classified as
+    // `TIMED_OUT` would suppress the deregistration (`U79`'s contract) and emit the abandoned-work
+    // WARN — so every worker whose loop died on a bad connection would leak a registry row and
+    // report abandoned work it does not have. That is the fail-closed direction, which is why the
+    // gap was LOW and not higher: the mutation loses a row, it does not destroy an entry.
+    //
+    // **The mutation that establishes it**, re-derived at this round against the current tree
+    // rather than cited by line: in `drain()`'s `loopPromise.then(onFulfilled, onRejected)`,
+    // change the **second** callback (`onRejected`) from `() => DRAIN_OUTCOME.COMPLETED` to
+    // `() => DRAIN_OUTCOME.TIMED_OUT`. Changing the **first** callback instead leaves this case
+    // green — which is the check that it isolates the arm it names rather than passing on the
+    // fulfilment path. Both runs are recorded in the Gate-6 report.
+    mockRedis.xinfo.mockResolvedValue([
+      consumerInfoRow(OVERRIDE.CONSUMER_NAME, CONSUMER_PENDING.NONE)
+    ]);
+    mockRedis.duplicate.mockImplementationOnce(() => {
+      throw new Error(OPEN_READ_CONNECTION_FAILURE);
+    });
+    const consumer = buildLoopConsumer(stopAfter(CALLS.ONCE));
+
+    await expect(consumer.run()).resolves.toBeUndefined();
+    await expect(consumer.stop()).resolves.toBeUndefined();
+
+    // **Anti-vacuity first: the loop really did reject.** Without these two, the case would pass
+    // against a `duplicate()` that never threw — i.e. against the ordinary *fulfilment* path — and
+    // the mutation above would be invisible to it. `LOOP_FAILED` is written only by `run()`'s
+    // `catch`, so it is evidence of a rejection rather than of a tidy exit.
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      {
+        streamName: OVERRIDE.STREAM_NAME,
+        groupName: OVERRIDE.CONSUMER_GROUP,
+        consumerName: OVERRIDE.CONSUMER_NAME,
+        error: OPEN_READ_CONNECTION_FAILURE
+      },
+      LOG_MESSAGE.LOOP_FAILED
+    );
+    expect(readConnection.xreadgroup).not.toHaveBeenCalled();
+
+    // The behaviour under test: a finished-by-rejecting loop is still finished, so the registry is
+    // read and this consumer's row is removed. A `TIMED_OUT` classification returns from `stop()`
+    // before either round trip.
+    expect(delconsumerArgs()).toEqual([
+      WORKER_SHUTDOWN.SUBCOMMAND_DELCONSUMER,
+      OVERRIDE.STREAM_NAME,
+      OVERRIDE.CONSUMER_GROUP,
+      OVERRIDE.CONSUMER_NAME
+    ]);
+    // And it is **not** reported as abandoned work. This half matters on its own: an operator
+    // paging on the drain-timeout WARN would be paged by every connection failure.
+    expect(mockLogger.warn).not.toHaveBeenCalledWith(
+      expect.anything(),
+      LOG_MESSAGE.DRAIN_TIMED_OUT
+    );
+  });
+
   it("U50 - every test deadline, and the one case that spends two of them, sits below the runner budget", async () => {
     // `CASE_BUDGET_MS` is only the truth if the runner actually enforces it, so this reads the
     // effective config rather than trusting the constant to describe it. The specifier is a
@@ -1677,5 +2670,22 @@ describe("StreamConsumer.run", () => {
       STOP_DEADLINE_MS
     );
     expect(STOP_DEADLINE_MS).toBeLessThan(CASE_BUDGET_MS);
+
+    // T-043's window, added here because this list is the only thing that collects them. A
+    // `stop()` whose drain wedges waits `DRAIN_TIMEOUT_MS`, and the live-Redis cases call
+    // `stop()`; at or above the budget that regression reports `Test timed out in 5000ms`,
+    // naming nothing — the exact defect three prior per-constant fixes each addressed one
+    // instance of. `U74` pins the *floor* on the same constant, so it is bounded from both sides.
+    expect(WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS).toBeLessThan(CASE_BUDGET_MS);
+    // `I30` is T-043's two-window case: it waits up to `INTEGRATION_SHUTDOWN.ENTER_DEADLINE_MS`
+    // (1 000) for the handler to be entered and then up to `DRAIN_TIMEOUT_MS` for the drain, which
+    // is the `I12` shape this list learned from. The sum asserted below uses `RUN_DEADLINE_MS`
+    // (1 500) rather than `ENTER_DEADLINE_MS`, i.e. the **stronger** bound: it covers `I30`'s real
+    // budget and would still cover it if `I30` were re-pointed at the larger deadline. An earlier
+    // revision of this comment named `RUN_DEADLINE_MS` as the deadline `I30` uses, which it does
+    // not (Gate-4 LOW-3).
+    expect(INTEGRATION_LOOP.RUN_DEADLINE_MS + WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS).toBeLessThan(
+      CASE_BUDGET_MS
+    );
   });
 });

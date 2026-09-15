@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hostname } from "node:os";
 import { EVENT_STREAM_CONSTANTS, INTERNAL_AUTH_CONSTANTS } from "@telemetry/shared-types";
 import { buildWorkerServiceApp } from "../src/app";
 import { InternalApiSecretMissingError } from "../src/errors";
@@ -11,6 +12,28 @@ import {
   WORKER_STREAM_CONSTANTS
 } from "../src/constants";
 import { WORKER_SERVICE_STARTUP } from "../src/startup.constants";
+
+/**
+ * The instance-unique consumer name T-043 makes the default (D1/B), derived here from
+ * `node:os` and `process.pid` **directly** rather than by calling the subject's builder.
+ *
+ * Calling the implementation would keep agreeing with the implementation after the
+ * implementation changed -- the objection `index.graceful-shutdown.unit.test.ts`'s
+ * `XAUTOCLAIM_EMPTY_REPLY` docblock already states for a fake echoing a production constant.
+ * The separator is written out as a literal for the same reason the `'telemetry:events'`
+ * default above is: the exact shape of the name is the thing under test, so sourcing it from the
+ * subject would make the assertion hold whatever the subject said. In this case the point is
+ * moot as well as sound — the separator is a **module-local** `CONSUMER_NAME_SEGMENT_SEPARATOR`
+ * in `src/constants.ts` with no `export`, so this file could not have imported it. An earlier
+ * revision of this docblock named it `WORKER_STREAM_CONSTANTS.CONSUMER_NAME_SEGMENT_SEPARATOR`,
+ * which is not a member that exists (Gate-4 LOW-5).
+ *
+ * Scope of what this establishes, stated as measured rather than as a rule: the name is unique
+ * **per process on one host**, because `process.pid` is. It says nothing about two hosts whose
+ * `hostname()` collides -- see the `.env.example` note, which still asks an operator to make the
+ * name unique per instance.
+ */
+const EXPECTED_DEFAULT_CONSUMER_NAME = `${hostname()}-${process.pid}`;
 
 const VALID_INTERNAL_API_SECRET = "t-037-worker-internal-secret-at-least-32-chars";
 const OTHER_VALID_INTERNAL_API_SECRET = "t-037-worker-other-secret-at-least-32-chars";
@@ -121,20 +144,26 @@ describe("worker-service env schema", () => {
       }
     });
 
-    // AC3
-    it("defaults REDIS_CONSUMER_NAME to the worker consumer name", () => {
+    // AC3, rewritten at T-043 (slice 3, decision D1/B).
+    //
+    // **Deliberately not a weakened assertion, and not a re-pointing of an existing one.** It
+    // read `toBe(WORKER_STREAM_CONSTANTS.DEFAULT_CONSUMER_NAME)`, which is the constant the
+    // schema's `.default(...)` is sourced from -- so it held no matter what that constant said,
+    // including the shared `"worker-1"` that made the P11 race possible. This asserts the
+    // *shape* instead, derived independently of `src/`.
+    it("defaults REDIS_CONSUMER_NAME to <hostname>-<pid>, unique per process on this host", () => {
       const parsed = EnvSchema.safeParse(buildBaseEnv());
 
       expect(parsed.success).toBe(true);
 
       if (parsed.success) {
-        expect(parsed.data.REDIS_CONSUMER_NAME).toBe(
-          WORKER_STREAM_CONSTANTS.DEFAULT_CONSUMER_NAME
-        );
+        expect(parsed.data.REDIS_CONSUMER_NAME).toBe(EXPECTED_DEFAULT_CONSUMER_NAME);
       }
     });
 
-    // AC3
+    // AC3 / AC8. The override still wins, and is provably a different value from the default --
+    // without the second assertion a schema that ignored the override entirely would pass here
+    // on any host whose derived name happened to be the fixture.
     it("honours a REDIS_CONSUMER_NAME override", () => {
       const parsed = EnvSchema.safeParse({
         ...buildBaseEnv(),
@@ -145,6 +174,51 @@ describe("worker-service env schema", () => {
 
       if (parsed.success) {
         expect(parsed.data.REDIS_CONSUMER_NAME).toBe("worker-7");
+        expect(parsed.data.REDIS_CONSUMER_NAME).not.toBe(EXPECTED_DEFAULT_CONSUMER_NAME);
+      }
+    });
+
+    // AC8 (T-043, D1/B). The consumer-identity invariant, stated as three separate claims so
+    // that the one that broke is the one that reports.
+    //
+    // **Why this is not covered by the default case above.** That case compares the parsed
+    // default with one computed expression. If the *shape* of the name changed -- the pid
+    // segment dropped, say -- and this file's expression were changed to match, the case would
+    // stay green while the platform lost the property. This one names the property: the pid is
+    // in there, the hostname is in there, and the shared `"worker-1"` that made P11 possible is
+    // not.
+    //
+    // **The mutations that establish each claim, with the assertion that actually reported.**
+    // Both were run at Gate 3, and the ordering below is what they forced. Assertions in a case
+    // short-circuit, so only the first failing one names anything:
+    //
+    //   `DEFAULT_CONSUMER_NAME: "worker-1"` -> `expected 'worker-1' not to be 'worker-1'`
+    //   `DEFAULT_CONSUMER_NAME: hostname()`  -> `expected 'linuxconfig' to contain '<pid>'`
+    //
+    // The `not.toBe("worker-1")` line was written **third** and was dead weight there: a name
+    // that already contained this pid and this hostname cannot also equal `"worker-1"`, so it
+    // could never be the reporting assertion. Measured -- under the `"worker-1"` mutation the
+    // case failed at `toContain(String(process.pid))` and that line never executed. Moved first,
+    // which is the discipline `U72` states in this same file.
+    //
+    // What neither mutation establishes is uniqueness across hosts: two hosts reporting the same
+    // `hostname()` derive the same name, which is why `.env.example` still asks an operator to
+    // make the name unique per instance.
+    it("U85 - the default consumer name carries this process's pid and this host's name", () => {
+      const parsed = EnvSchema.safeParse(buildBaseEnv());
+
+      expect(parsed.success).toBe(true);
+
+      if (parsed.success) {
+        // First, so that a revert to the shared name reports *that* rather than a missing pid.
+        // Written as a literal rather than as a retired constant, because the claim is that
+        // *this specific shared name* is gone: two replicas under one name share one
+        // `XINFO CONSUMERS` row, and a shutdown guard reading it cannot tell its own pending
+        // entries from a live peer's (probe P11 -- the guard read `pending 0`, the peer read an
+        // entry a moment later, and the delete destroyed it).
+        expect(parsed.data.REDIS_CONSUMER_NAME).not.toBe("worker-1");
+        expect(parsed.data.REDIS_CONSUMER_NAME).toContain(String(process.pid));
+        expect(parsed.data.REDIS_CONSUMER_NAME).toContain(hostname());
       }
     });
 

@@ -61,9 +61,48 @@ const start = async (): Promise<void> => {
 		try {
 			// Before `app.close()`, and the order is measured, not stylistic. `app.close()`
 			// fires the `onClose` hook at `app.ts:32-36`, which calls `quit()`; `quit()` waits
-			// for an in-flight blocking read to return on its own -- 4 813 ms against a
-			// BLOCK 5000 -- while the `disconnect()` `stop()` issues ended the same read in
-			// 205 ms. Closing first would add up to `STREAM_BLOCK_MS` to every deploy.
+			// for an in-flight blocking read to return on its own, while the `disconnect()`
+			// `stop()` issues ends the same read at once. Re-derived at T-043 on ioredis 5.11.1
+			// / Redis 7.0.15, against a BLOCK 5000 interrupted 200 ms in: `disconnect()` rejected
+			// the read after **204 ms** with `Connection is closed.`, and `quit()` waited
+			// **4 883 ms** after it was issued (5 084 ms total) before the read returned
+			// normally. The tree's earlier figures were ~205 ms and 4 813 ms; both hold.
+			// Closing first would add up to `STREAM_BLOCK_MS` to every deploy.
+			//
+			// **Since T-043 this line also drains**, so it is no longer the ~205 ms step the
+			// paragraph above describes. `stop()` sets the shutdown flag, disconnects the read
+			// connection, then awaits the loop -- which means awaiting whatever the message
+			// handler has in hand -- bounded by `WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS`, and only then
+			// deregisters this consumer from the group. The ordering rationale is unchanged:
+			// `quit()` first would add the block interval *on top of* the drain.
+			//
+			// **Bounded by `DRAIN_TIMEOUT_MS` plus two unbounded round trips, not by
+			// `DRAIN_TIMEOUT_MS` alone.** The drain is bounded; the `XINFO CONSUMERS` and
+			// `XGROUP DELCONSUMER` that follow it carry no timeout of their own. What bounds those
+			// is the container client's `maxRetriesPerRequest: 2` (`src/config/container.ts`),
+			// which covers the *unreachable* server — measured against a port nothing listens on,
+			// rejections at 153 ms then 603 ms — and no `commandTimeout` is set, so a
+			// reachable-but-slow server is not bounded at all. An earlier revision of this comment
+			// said "shutdown duration is bounded by that constant"; that was false and is corrected
+			// here (Gate-4 LOW-4). Adding a `commandTimeout` is a container change and was not made
+			// in this task.
+			//
+			// A drain that times out logs at WARN and **skips** the deregistration, deliberately:
+			// `XGROUP DELCONSUMER` destroys any entries the named consumer still holds, so a
+			// consumer that cannot account for its work must not be deregistered. Nothing is lost
+			// either way -- the handler acknowledges only after it has committed, so abandoned
+			// entries stay in the pending list and are reclaimed by the next worker's
+			// `XAUTOCLAIM` pass.
+			//
+			// This file's `void streamConsumer.run()` is deliberately **unchanged** by that.
+			// S-26's fix direction reads as an instruction to drop the `void`; doing so was
+			// measured at the Gate-6 review as a wide failure of
+			// `tests/index.graceful-shutdown.unit.test.ts`, because `run()` does not return while
+			// the loop is running and `listen` is then never reached. Holding the loop promise
+			// inside `StreamConsumer` instead puts the drain behind a call this line already
+			// awaits. (S-26 cites that failure as `Tests 10 failed | 2 passed (12)`; the file held
+			// **14** tests at `fc66bd3` and holds 15 now, so the parenthesised total is stale --
+			// the direction of the finding is not.)
 			await streamConsumer?.stop();
 			await app.close();
 			await container.prisma.$disconnect();

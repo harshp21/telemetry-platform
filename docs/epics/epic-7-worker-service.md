@@ -231,6 +231,22 @@ async function invoiceGenerationJob(job: Job): Promise<void> {
 
 **Error handling**: BullMQ handles retries with exponential backoff. Log each tenant result separately — one failure should not block other tenants.
 
+> ### Obligation inherited from T-043 — `bullWorker.close()`
+>
+> **T-042 must re-open `apps/worker-service/src/index.ts`'s shutdown handler and add
+> `await bullWorker.close()`**, ordered **before** `streamConsumer.stop()` so the scheduler stops
+> producing work before the consumer drains what it already has.
+>
+> T-043's snippet below contains that line and T-043 deliberately did not implement it: there is
+> no BullMQ dependency in the workspace yet, so the line as written would `await undefined.close()`.
+> Verified at T-043 — `grep -rn "bullmq" --include=package.json .` and
+> `grep -rn "bullWorker\|bullmq" apps packages --include=*.ts` both return nothing. The line was
+> **reassigned, not dropped**.
+>
+> Recorded here rather than only in `docs/plans/`, because `CLAUDE.md` forbids reading
+> `docs/plans/` as a record of anything. Also recorded in `.claude/rules/known-gaps.md` **S-35**;
+> S-15 is why it is in both rather than either.
+
 ---
 
 ## T-043 · Worker graceful shutdown
@@ -238,6 +254,10 @@ async function invoiceGenerationJob(job: Job): Promise<void> {
 **File**: `apps/worker-service/src/index.ts`
 
 **Story**: Worker has no HTTP server to drain — shutdown is purely about the stream consumer loop and BullMQ workers.
+
+> **The snippet below is wrong in five ways and `bullWorker` does not exist.** What shipped is
+> tabulated after the acceptance criteria; read that before writing anything against this code.
+> Filed as **S-35**.
 
 ```ts
 let shuttingDown = false;
@@ -256,3 +276,41 @@ const shutdown = async (signal: string): Promise<void> => {
 **Acceptance**:
 - Current message batch completes before shutdown
 - No messages are lost — if processing is mid-transaction, the transaction rolls back and the message remains in PEL for another worker to claim
+
+> ### What T-043 actually shipped — the snippet above is wrong in five ways
+>
+> The snippet carries a pointer to this block, because a reader who stops at the code never gets
+> here. Filed as **S-35** in `.claude/rules/known-gaps.md`,
+> alongside S-29 (this file's T-040 section) and S-32 (its T-041 section) — three sibling entries
+> for one file, which is itself the finding.
+>
+> | Snippet | Shipped |
+> |---|---|
+> | logs, then sets the shutdown flag | sets the flag, **then** logs |
+> | `"Worker shutting down"` | `"Shutting down gracefully"` |
+> | `"Worker shutdown complete"` | `"Shutdown complete"` |
+> | `await bullWorker.close()` | **not implemented** — no BullMQ dependency exists; reassigned to T-042, see the block under that task |
+> | no `try`/`catch`, no `exit(1)` | both present |
+>
+> It also omits the two calls that do the work — `streamConsumer.stop()` and `app.close()` — and
+> its **File:** line names only `src/index.ts`, while T-043 landed almost entirely in
+> `src/events/stream.consumer.ts`.
+>
+> **Where the acceptance criteria are actually satisfied**, since neither is where the snippet
+> implies:
+>
+> - *Current message batch completes* — already true before T-043, and now pinned by `U83`. The
+>   shutdown predicate is the `do`/`while` condition in `runLoop`, read once per **read
+>   iteration** after `dispatch` has walked the whole batch, so a predicate that flips mid-batch
+>   cannot truncate it.
+> - *No messages are lost* — `stream.consumer.ts` acknowledges nothing (T-039 decision D2-A), so a
+>   rolled-back transaction leaves the entry in the PEL by construction. Pinned by `I18` and, for
+>   the half T-043 put at risk, by `I29`.
+>
+> **What T-043 added that the snippet does not mention at all**: a bounded drain of in-flight
+> handler work inside `StreamConsumer.stop()`, and an `XGROUP DELCONSUMER` guarded on this
+> consumer's own pending count being zero. That guard is not optional tidiness —
+> `XGROUP DELCONSUMER` on a consumer holding pending entries **destroys them permanently**
+> (measured on Redis 7.0.15; see `WORKER_SHUTDOWN.SUBCOMMAND_DELCONSUMER`'s docblock). The
+> instance-unique `REDIS_CONSUMER_NAME` default is the other half of that guard and **not** a
+> naming preference; see **S-34** for the registry-growth trade it accepts.

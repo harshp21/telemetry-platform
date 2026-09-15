@@ -85,7 +85,14 @@ export const INTEGRATION_REDIS_COMMANDS = {
   XADD_AUTO_ID: "*"
 } as const;
 
-/** `XINFO GROUPS` reply field names (Redis 7.0.15 flat array encoding). */
+/**
+ * `XINFO` reply field names (Redis 7.0.15 flat array encoding).
+ *
+ * Shared by `XINFO GROUPS` and, since T-043, `XINFO CONSUMERS`: both reply as a flat
+ * `[key, value, ...]` array per row and both spell these fields the same way. Measured on the
+ * consumer form at Gate 3 — `[["name","c1","pending",2,"idle",0]]`. `LAST_DELIVERED_ID` is a
+ * group-only field and is read only by the `t038` cases.
+ */
 export const INTEGRATION_XINFO_FIELDS = {
   NAME: "name",
   PENDING: "pending",
@@ -260,6 +267,81 @@ export const INTEGRATION_LOOP = {
   POLL_INTERVAL_MS: 10
 } as const;
 
+/**
+ * Fixture vocabulary for T-043's graceful-shutdown cases (`I28`-`I31`).
+ *
+ * Its own prefixes, for the reason `INTEGRATION_LOOP_REDIS` gives: these cases share logical
+ * database 14 and one `FLUSHDB` with the `t038`, `t039`, `t040` and `t041` sets, and a key that
+ * says which task created it is the difference between reading a leftover and guessing at one.
+ *
+ * The consumer names are **explicit** rather than defaulted. T-043 changes the default to
+ * `<hostname>-<pid>`, and a case that let the default through would assert against a name that
+ * differs per host and per run — and would stop testing the *deregistration* the moment two
+ * cases in one process shared it. `PREVIOUS_CONSUMER_NAME` exists for `I31`: it is the identity
+ * a worker had before a restart changed its pid, which is the trade decision D1/B accepts.
+ */
+export const INTEGRATION_SHUTDOWN_REDIS = {
+  STREAM_NAME_PREFIX: "telemetry:events:t043:",
+  CONSUMER_GROUP_PREFIX: "worker-group-t043-",
+  /** The identity the subject shuts down under. */
+  CONSUMER_NAME: "t043-worker",
+  /** The identity a *previous* process had, whose work `I31` makes the subject reclaim. */
+  PREVIOUS_CONSUMER_NAME: "t043-worker-previous-pid"
+} as const;
+
+/**
+ * Timings, counts and reply-shape positions for the shutdown cases.
+ *
+ * Every value here is asserted against server state — `XINFO CONSUMERS`, `XPENDING`,
+ * `XAUTOCLAIM` — rather than against the clock, except `HANDLER_WORK_MS`, which exists precisely
+ * so there *is* in-flight work for `I30`'s drain to wait for.
+ */
+export const INTEGRATION_SHUTDOWN = {
+  /**
+   * How long `I30`'s handler takes before it acknowledges.
+   *
+   * Long enough that `stop()` is reached while the handler is still running — the case waits for
+   * the handler to be entered before signalling, so this is not a race — and far inside
+   * `WORKER_SHUTDOWN.DRAIN_TIMEOUT_MS`, so a passing run has three orders of magnitude of
+   * headroom and a *failing* one fails by assertion rather than by the runner's budget.
+   */
+  HANDLER_WORK_MS: 150,
+  /**
+   * Ceiling on waiting for the handler to be entered, mirroring `INTEGRATION_LOOP`'s
+   * `RUN_DEADLINE_MS`: it converts a hang into an assertion that names what did and did not
+   * happen.
+   *
+   * `U50` asserts `INTEGRATION_LOOP.RUN_DEADLINE_MS` plus `DRAIN_TIMEOUT_MS` under
+   * `CASE_BUDGET_MS`, **not** this constant plus `DRAIN_TIMEOUT_MS`. That is the stronger bound,
+   * because `RUN_DEADLINE_MS` (1 500) exceeds this (1 000), so it covers `I30`'s real worst case
+   * of 1 000 + 3 000 with room over. An earlier revision of this sentence claimed `U50` asserted
+   * *this* constant (Gate-4 LOW-3); it does not, and the numbers happened to make the false
+   * sentence harmless.
+   */
+  ENTER_DEADLINE_MS: 1_000,
+  /** `XAUTOCLAIM` min-idle of `0`: "claim it however fresh it is", for the reachability probe. */
+  CLAIM_ANY_IDLE_MS: 0,
+  /** Entries `I31` strands under the previous identity. More than one, so a partial reclaim shows. */
+  ORPHANED_ENTRY_COUNT: 2,
+  /**
+   * Positions inside one flat `XINFO CONSUMERS` row, `[name, <name>, pending, <n>, idle, <ms>]`.
+   *
+   * Named rather than written as bare numerals, and read from a **key** lookup rather than by
+   * position in the helper that uses them — see `readConsumerPending`. These exist only so that
+   * helper can name the stride it walks.
+   */
+  CONSUMER_INFO_KEY_OFFSET: 0,
+  CONSUMER_INFO_VALUE_OFFSET: 1
+} as const;
+
+/** Fixture payload values for the shutdown cases. */
+export const INTEGRATION_SHUTDOWN_FIXTURE = {
+  VALUE_ACKED: "t043-acked",
+  VALUE_LEFT_PENDING: "t043-left-pending",
+  VALUE_IN_FLIGHT: "t043-in-flight",
+  VALUE_ORPHANED: "t043-orphaned"
+} as const;
+
 /** Harness-side Redis tokens for the loop cases. Not production vocabulary. */
 export const INTEGRATION_LOOP_COMMANDS = {
   CLIENT: "CLIENT",
@@ -274,7 +356,19 @@ export const INTEGRATION_LOOP_COMMANDS = {
   CLIENT_DB_FIELD_PREFIX: "db=",
   /** `XPENDING <key> <group> - + <count>` — the extended form, which returns entry ids. */
   XPENDING_MIN_ID: "-",
-  XPENDING_MAX_ID: "+"
+  XPENDING_MAX_ID: "+",
+  /**
+   * `XINFO CONSUMERS` — the harness's own read of the consumer registry (T-043).
+   *
+   * A **second** spelling of the subcommand `WORKER_SHUTDOWN.SUBCOMMAND_CONSUMERS` carries, and
+   * deliberately so, exactly as `XREADGROUP_GROUP` above duplicates
+   * `WORKER_STREAM_READ.SUBCOMMAND_GROUP`. `I28` and `I29`'s claim is what the *server* holds
+   * after `stop()` ran; a harness that issued the command through the subject's own constant
+   * would keep agreeing with the subject after the constant changed.
+   */
+  XINFO_CONSUMERS: "CONSUMERS",
+  /** `XAUTOCLAIM` and its `COUNT` option, for the reachability probe `I29` makes. */
+  XAUTOCLAIM_COUNT: "COUNT"
 } as const;
 
 /** Fixture payload values for the loop cases. */

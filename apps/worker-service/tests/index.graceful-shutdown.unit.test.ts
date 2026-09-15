@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { WORKER_STREAM_CONSTANTS } from "../src/constants";
+import { WORKER_SHUTDOWN, WORKER_STREAM_CONSTANTS } from "../src/constants";
 
 type SignalName = "SIGTERM" | "SIGINT";
 type SignalHandler = () => void;
@@ -10,6 +10,32 @@ type EnvLoadError = Error & { code?: string };
 
 /** Reply `XGROUP CREATE ... MKSTREAM` returns on success (observed on Redis 7.0.15). */
 const XGROUP_OK_REPLY = "OK";
+
+/**
+ * What ioredis rejects an in-flight, or a subsequently issued, command with once its connection
+ * has been disconnected.
+ *
+ * Re-derived at Gate 3 on ioredis 5.11.1 / Redis 7.0.15: `disconnect()` issued 200 ms into a
+ * `BLOCK 5000` read rejected that read 204 ms later with exactly this message. Written out
+ * rather than imported from `WORKER_STREAM_READ.CONNECTION_CLOSED_ERROR_MESSAGE`, for the reason
+ * `XAUTOCLAIM_EMPTY_REPLY`'s docblock gives: this is the *client's* message, and a fake that
+ * echoed the subject's own constant back at it would keep agreeing with the subject after either
+ * changed. `U26` in `tests/stream.consumer.unit.test.ts` holds the same literal.
+ */
+const CONNECTION_CLOSED_REPLY = "Connection is closed.";
+
+/**
+ * The `XINFO CONSUMERS` row the fake container connection reports for this worker.
+ *
+ * `pending 0` is the state a clean shutdown leaves, and it is what permits the deregistration
+ * `U86` asserts. Values named rather than written inline, as `.claude/rules/constants.md`'s
+ * applies-to-tests clause asks; `IDLE_MS` is read by nothing in `src/` and is present only so the
+ * row is the shape Redis was measured returning.
+ */
+const FAKE_CONSUMER_ROW = {
+  PENDING: 0,
+  IDLE_MS: 13
+} as const;
 
 /**
  * `XAUTOCLAIM`'s three-element reply with nothing to reclaim, as observed on Redis 7.0.15:
@@ -47,9 +73,47 @@ const UNREACHABLE_REDIS_ERROR = new Error(
   'Reached the max retries per request limit (which is 2). Refer to "maxRetriesPerRequest" option for details.'
 );
 
+/**
+ * Order tokens for `U86`, whose subject is *when* `process.exit(0)` happens relative to work the
+ * worker still had in hand.
+ *
+ * Two independent `toHaveBeenCalled()` checks pass in either order, and the order is the entire
+ * claim — `['exit','handler']` is precisely the pre-T-043 behaviour. `U31` in this file and
+ * `U73`/`U84` in `tests/stream.consumer.unit.test.ts` take the same shape for the same reason.
+ */
+const SHUTDOWN_STEP = {
+  HANDLER: "handler",
+  EXIT: "exit"
+} as const;
+
+/**
+ * `0` **milliseconds** for a real-timer yield. Named for the reason
+ * `tests/stream.consumer.unit.test.ts` names its own copy: the numeral carries no meaning on
+ * sight, and this package already names three distinct zeroes (`CALLS.NONE`, `INDEX.FIRST`,
+ * `ADVANCE_NO_TIME_MS`) whose values coincide and whose meanings do not.
+ */
+const NEXT_MACROTASK_MS = 0;
+
+/** Yields to the macrotask queue, draining every pending microtask. See `U73`'s `nextMacrotask`. */
+const nextMacrotask = (): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, NEXT_MACROTASK_MS);
+  });
+
 describe("graceful shutdown (worker-service)", () => {
   let signalHandlers: Partial<Record<SignalName, SignalHandler>>;
   let exitCodes: Array<number | undefined>;
+  /** Steps of one shutdown, in the order they actually happened. See `SHUTDOWN_STEP`. */
+  let order: string[];
+  /**
+   * Every log *message* the container's logger had been given at the instant `process.exit` ran.
+   *
+   * Snapshotted inside the exit spy rather than read afterwards, because "afterwards" is not a
+   * moment that exists for a real process: `process.exit` does not return. This is what turns
+   * S-26's race into something a test can settle — the two teardown lines either had been
+   * written by then or they had not.
+   */
+  let logMessagesAtExit: string[];
 
   /**
    * Waits until `start()` has settled — it has either bound the listener or exited.
@@ -113,6 +177,8 @@ describe("graceful shutdown (worker-service)", () => {
     vi.clearAllMocks();
     signalHandlers = {};
     exitCodes = [];
+    order = [];
+    logMessagesAtExit = [];
   });
 
   afterEach(() => {
@@ -125,6 +191,8 @@ describe("graceful shutdown (worker-service)", () => {
     loadEnvFileError?: EnvLoadError;
     xgroupError?: unknown;
     reclaimOneEntry?: boolean;
+    /** Holds the container's message handler open until `releaseMessageHandler()` (T-043). */
+    gateMessageHandler?: boolean;
   }): Promise<{
     moduleUnderTest: WorkerIndexModule;
     logger: { info: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
@@ -133,6 +201,7 @@ describe("graceful shutdown (worker-service)", () => {
     prismaDisconnect: ReturnType<typeof vi.fn>;
     redisDisconnect: ReturnType<typeof vi.fn>;
     redisXgroup: ReturnType<typeof vi.fn>;
+    redisXinfo: ReturnType<typeof vi.fn>;
     redisDuplicate: ReturnType<typeof vi.fn>;
     readXreadgroup: ReturnType<typeof vi.fn>;
     readXautoclaim: ReturnType<typeof vi.fn>;
@@ -141,6 +210,7 @@ describe("graceful shutdown (worker-service)", () => {
     processorHandler: ReturnType<typeof vi.fn>;
     buildHandler: ReturnType<typeof vi.fn>;
     wrappedMessageHandler: ReturnType<typeof vi.fn>;
+    releaseMessageHandler: () => void;
   }> => {
     const logger = {
       info: vi.fn(),
@@ -160,6 +230,28 @@ describe("graceful shutdown (worker-service)", () => {
         ? vi.fn().mockRejectedValue(options.xgroupError)
         : vi.fn().mockResolvedValue(XGROUP_OK_REPLY);
 
+    // T-043: `stop()` reads the consumer registry before it deregisters, on the container's
+    // connection. Without this the fake rejects with `this.redis.xinfo is not a function`, which
+    // the subject correctly fails closed on — so the absence would be *invisible* except as an
+    // error line, which is exactly the shape `U86` asserts against.
+    //
+    // Reports this worker's own row at `pending 0`, i.e. the state a clean shutdown leaves. The
+    // consumer name is sourced from the constant here because it *selects* the row rather than
+    // being the claim — the claim about the name's shape is `U85`'s, in
+    // `tests/env.schema.unit.test.ts`, derived from `node:os` independently of `src/`.
+    const redisXinfo = vi
+      .fn()
+      .mockResolvedValue([
+        [
+          "name",
+          WORKER_STREAM_CONSTANTS.DEFAULT_CONSUMER_NAME,
+          "pending",
+          FAKE_CONSUMER_ROW.PENDING,
+          "idle",
+          FAKE_CONSUMER_ROW.IDLE_MS
+        ]
+      ]);
+
     // T-039: `start()` now also opens a read connection, reclaims, and starts the loop.
     // Extended on the same shared container object the plan's R4 shape put the `xgroup` stub
     // on, so T-040 has one place to extend rather than four call sites.
@@ -178,7 +270,31 @@ describe("graceful shutdown (worker-service)", () => {
     // Round 1, M-2. Measured before deleting it: with the first read changed to resolve
     // immediately (`mockResolvedValueOnce(null)`), the flag still reported `false` and the
     // suite still reported 12 passed, so it did not observe settlement at all.
-    const readXreadgroup = vi.fn(() => new Promise(() => undefined));
+    //
+    // T-043: the parked read is now *rejectable*, and the rejecter is handed to `readDisconnect`
+    // below. Nothing about "a healthy worker is parked on a blocking read" changes; what changes
+    // is that `disconnect()` ends it, which is what the real client was measured doing
+    // (204 ms, `Connection is closed.`, re-derived at Gate 3 against a `BLOCK 5000`). The
+    // do-nothing `vi.fn()` was harmless while `stop()` only set a flag and is not once `stop()`
+    // waits for the loop: five cases in this file died on `vi.waitFor` before
+    // `process.exit` was reached, because the loop could never end.
+    let rejectParkedRead: ((reason: unknown) => void) | undefined;
+    let readConnectionClosed = false;
+    const readXreadgroup = vi.fn(() => {
+      // A read *issued after* the disconnect rejects at once, which is the other half of what a
+      // closed ioredis client does and the half a single rejecter cannot express. `U86` needs
+      // it: its signal arrives during recovery, before the first read exists, so the disconnect
+      // has nothing to reject — and the loop then issues its one post-recovery read (the
+      // behaviour `U35` in `tests/stream.consumer.unit.test.ts` asserts rather than glosses)
+      // against a connection that is already gone.
+      if (readConnectionClosed) {
+        return Promise.reject(new Error(CONNECTION_CLOSED_REPLY));
+      }
+
+      return new Promise((_resolve, reject) => {
+        rejectParkedRead = reject;
+      });
+    });
     const readXautoclaim = vi
       .fn()
       .mockResolvedValue(
@@ -199,8 +315,25 @@ describe("graceful shutdown (worker-service)", () => {
     // container supplied, and `U69` asserts that handler is the wrapped one by asserting the raw
     // processor handler was not called instead. If this spy delegated, reverting `index.ts` to
     // `container.eventProcessor.buildHandler()` would leave both green.
-    const wrappedMessageHandler = vi.fn().mockResolvedValue(undefined);
-    const readDisconnect = vi.fn();
+    //
+    // T-043 adds the gated variant. `U86`'s subject is that `process.exit(0)` waits for whatever
+    // this handler is doing, so the case needs to hold it open across the signal and then
+    // release it. Ungated it resolves immediately, exactly as before.
+    let releaseMessageHandler: (() => void) | undefined;
+    const wrappedMessageHandler = options?.gateMessageHandler
+      ? vi.fn(
+          async (): Promise<void> => {
+            await new Promise<void>((resolve) => {
+              releaseMessageHandler = resolve;
+            });
+            order.push(SHUTDOWN_STEP.HANDLER);
+          }
+        )
+      : vi.fn().mockResolvedValue(undefined);
+    const readDisconnect = vi.fn(() => {
+      readConnectionClosed = true;
+      rejectParkedRead?.(new Error(CONNECTION_CLOSED_REPLY));
+    });
     const redisDuplicate = vi.fn(() => ({
       xreadgroup: readXreadgroup,
       xautoclaim: readXautoclaim,
@@ -221,6 +354,7 @@ describe("graceful shutdown (worker-service)", () => {
         redis: {
           disconnect: redisDisconnect,
           xgroup: redisXgroup,
+          xinfo: redisXinfo,
           duplicate: redisDuplicate
         },
         eventProcessor: { buildHandler },
@@ -250,6 +384,11 @@ describe("graceful shutdown (worker-service)", () => {
 
     vi.spyOn(process, "exit").mockImplementation(
       ((code?: number) => {
+        order.push(SHUTDOWN_STEP.EXIT);
+        // pino's signature is `(obj, msg)` or `(msg)`, so the message is the last argument.
+        logMessagesAtExit = logger.info.mock.calls.map((call) =>
+          String(call[call.length - 1])
+        );
         exitCodes.push(code);
         return undefined as never;
       }) as unknown as typeof process.exit
@@ -276,6 +415,7 @@ describe("graceful shutdown (worker-service)", () => {
       prismaDisconnect,
       redisDisconnect,
       redisXgroup,
+      redisXinfo,
       redisDuplicate,
       readXreadgroup,
       readXautoclaim,
@@ -283,7 +423,8 @@ describe("graceful shutdown (worker-service)", () => {
       buildApp,
       processorHandler,
       buildHandler,
-      wrappedMessageHandler
+      wrappedMessageHandler,
+      releaseMessageHandler: () => releaseMessageHandler?.()
     };
   };
 
@@ -463,6 +604,71 @@ describe("graceful shutdown (worker-service)", () => {
     expect(closeOrder).toBeDefined();
     expect(stopOrder).toBeLessThan(closeOrder as number);
     expect(exitCodes).toContain(0);
+  });
+
+  it("U86 - a SIGTERM arriving mid-handler does not exit until the handler has settled", async () => {
+    // **AC3 at the process level.** `U73` proves `StreamConsumer.stop()` waits for the loop;
+    // this proves the wait reaches the thing that matters — `process.exit(0)` — through
+    // `index.ts`'s existing `await streamConsumer?.stop()`, with **its
+    // `void streamConsumer.run()` unchanged**. That is the whole reason the drain was put behind
+    // `stop()`: S-26's fix direction reads as an instruction to drop that `void`, and doing so
+    // was measured as a wide failure of this file.
+    //
+    // Delivery is via `XAUTOCLAIM`, because the `XREADGROUP` fake is parked on purpose — see
+    // `readXreadgroup`'s docblock. `U46` uses the same route.
+    const context = await setupIndexModule({ reclaimOneEntry: true, gateMessageHandler: true });
+    await vi.waitFor(() => {
+      if (context.wrappedMessageHandler.mock.calls.length === 0) {
+        throw new Error("the reclaimed entry never reached the container's message handler");
+      }
+    });
+
+    signalHandlers.SIGTERM?.();
+    // A full macrotask turn, so every microtask the shutdown path could schedule has run.
+    // Nothing here can settle the handler, so an exit observed now would be an exit that did not
+    // wait. This is the case's red: with `await this.drain()` deleted from `stop()` it reports
+    // `expected [ +0 ] to deeply equal []` — the process had already exited 0 with the handler
+    // still in flight. The `order` assertion below is the corroborating one and never gets to
+    // run, because assertions short-circuit.
+    await nextMacrotask();
+    expect(exitCodes).toEqual([]);
+    expect(order).toEqual([]);
+
+    context.releaseMessageHandler();
+    await waitForProcessExit();
+
+    // The order, not two "was called" checks. `['exit','handler']` is what a worker that hung up
+    // mid-sentence produces, and it is what this reported before `stop()` drained.
+    expect(order).toEqual([SHUTDOWN_STEP.HANDLER, SHUTDOWN_STEP.EXIT]);
+    expect(exitCodes).toEqual([0]);
+    // The drain did not swallow the rest of the sequence: the app still closed, and it still
+    // closed *after* the read connection was disconnected (`U31`'s ordering claim).
+    expect(context.appClose).toHaveBeenCalledTimes(1);
+    expect(context.prismaDisconnect).toHaveBeenCalledTimes(1);
+    expect(context.logger.error).not.toHaveBeenCalled();
+    // And the deregistration really did happen on the container's connection, *after* the
+    // handler and *before* the exit — the whole point of putting it behind the drain. Asserted
+    // by invocation order against `process.exit`, not by two independent call checks.
+    const deregisterCall = context.redisXgroup.mock.calls.find(
+      (call) => call[0] === WORKER_SHUTDOWN.SUBCOMMAND_DELCONSUMER
+    );
+    expect(deregisterCall).toBeDefined();
+    expect(deregisterCall?.[3]).toBe(WORKER_STREAM_CONSTANTS.DEFAULT_CONSUMER_NAME);
+
+    // **S-26, settled for this path.** That entry records the two teardown lines racing
+    // `process.exit(0)` and usually losing — measured over nine real SIGTERM runs, emitted in
+    // 4 of 5 runs at `STREAM_BLOCK_MS=20` and 0 of 4 at 500 and 5000. Both had been written by
+    // the time the exit ran here, because `stop()` now awaits the loop and the loop writes them
+    // in its `finally` before resolving.
+    //
+    // The literals are the S-26 wording, written out rather than imported: the claim is about
+    // *these* lines reaching a shutting-down process's output, and sourcing them from the
+    // subject would make the assertion hold whatever the subject said.
+    expect(logMessagesAtExit).toContain("Stream read interrupted by shutdown");
+    expect(logMessagesAtExit).toContain("Stream consumer loop stopped");
+    // Anti-vacuity: the snapshot is the one taken *at* the exit, not an empty array a missing
+    // spy would leave, and `"Shutdown complete"` is the line written immediately before it.
+    expect(logMessagesAtExit).toContain("Shutdown complete");
   });
 
   it("U46 - hands the container's message handler to the consumer, so a delivered entry reaches the database path", async () => {

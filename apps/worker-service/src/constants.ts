@@ -1,8 +1,21 @@
+import { hostname } from "node:os";
 import {
   EVENT_STREAM_CONSTANTS,
   INTERNAL_AUTH_HEADERS,
   INTERNAL_AUTH_RESPONSES
 } from "@telemetry/shared-types";
+
+/**
+ * Separator between the two segments of the derived consumer name (T-043, D1/B).
+ *
+ * Its own constant rather than an inline `-` because it is the one character that decides
+ * whether `<hostname>-<pid>` is parseable back into its parts by an operator reading
+ * `XINFO CONSUMERS`. Declared at module scope rather than inside `WORKER_STREAM_CONSTANTS`
+ * because the object's own docblock counts its members against
+ * `grep -c 'WORKER_STREAM_CONSTANTS\.' src/config/env.ts`, and a member `env.ts` does not
+ * reference would make that taxonomy wrong in the other direction.
+ */
+const CONSUMER_NAME_SEGMENT_SEPARATOR = "-";
 
 export const WORKER_SERVICE_NAME = "worker-service";
 
@@ -59,7 +72,43 @@ export const WORKER_RUNTIME = {
 export const WORKER_STREAM_CONSTANTS = {
   DEFAULT_STREAM_NAME: EVENT_STREAM_CONSTANTS.USAGE_EVENTS_STREAM,
   DEFAULT_CONSUMER_GROUP: "worker-group",
-  DEFAULT_CONSUMER_NAME: "worker-1",
+  /**
+   * This instance's identity inside the consumer group -- `<hostname>-<pid>` (T-043, D1/B).
+   *
+   * **This was the literal `"worker-1"`, shared by every replica, and replacing it is half of
+   * T-043's data-loss guard rather than a naming preference.** `XGROUP DELCONSUMER` on a
+   * consumer that still holds pending entries **destroys them**: measured on Redis 7.0.15 (probe
+   * P1, re-run at Gate 3) -- two entries delivered, `DELCONSUMER` returned `2`, `XPENDING` went
+   * to 0, `XAUTOCLAIM ... 0 0-0` came back empty and `XREADGROUP ... >` came back empty, while
+   * `XLEN` still reported 2. Unreachable through the group, permanently.
+   *
+   * `StreamConsumer.stop()` therefore deregisters only after reading `pending 0` for its own
+   * name -- and **under a shared name that guard does not work**, because the guard and a live
+   * replica observe the same row. Measured end to end (probe P11, re-run at Gate 3): replica A
+   * acked its entry and read `pending 0`, replica B read a new entry under the same name a
+   * moment later, and A's `DELCONSUMER` returned `1` and destroyed B's entry. No check-then-act
+   * ordering fixes that; Redis offers no conditional delete. Under distinct names the same
+   * sequence is inert -- P12: deleting `worker-aaa` returned `0` and left `worker-bbb`'s pending
+   * entry untouched.
+   *
+   * Evaluated once, at module load. `hostname()` and `process.pid` are both fixed for the
+   * lifetime of a process, so a lazy `.default(() => ...)` would compute the same value on every
+   * parse. Safe to import `node:os` here: `src/index.ts` loads only `startup.constants.ts`
+   * before `initTracing(...)` and reaches this module through its dynamic imports.
+   *
+   * **The trade this accepts, and it is latency rather than loss.** The pid changes across a
+   * restart, so a worker that died uncleanly does not reclaim its own abandoned entries under
+   * the same name. The recovery pass does it instead -- probe P13: a restarted worker under a
+   * new name got an empty reply from `XREADGROUP ... >` and recovered both orphaned entries with
+   * `XAUTOCLAIM`, at the cost of waiting out
+   * `STREAM_BLOCK_MS x WORKER_STREAM_READ.RECOVERY_IDLE_MULTIPLIER` (10 000 ms at the shipped
+   * defaults). That wait already applied to any crashed worker.
+   *
+   * **Not unique across hosts.** Two hosts reporting the same `hostname()` derive the same name.
+   * `.env.example` still asks an operator to set `REDIS_CONSUMER_NAME` per instance; what changed
+   * is that the default now satisfies that instruction instead of contradicting it.
+   */
+  DEFAULT_CONSUMER_NAME: `${hostname()}${CONSUMER_NAME_SEGMENT_SEPARATOR}${process.pid}`,
   DEFAULT_BLOCK_MS: 5_000,
   DEFAULT_BATCH_SIZE: 10,
   BATCH_SIZE_MIN: 1,
@@ -406,6 +455,133 @@ export const WORKER_STREAM_READ = {
    * the same text outside shutdown stays an error.
    */
   CONNECTION_CLOSED_ERROR_MESSAGE: "Connection is closed."
+} as const;
+
+/**
+ * Graceful-shutdown vocabulary for `StreamConsumer.stop()` (T-043).
+ *
+ * A **sibling** of `WORKER_STREAM_READ` for the reason that object is a sibling of
+ * `WORKER_STREAM_CONSTANTS`: nothing here feeds `src/config/env.ts`. That is the whole of
+ * decision D2 -- the drain bound is a constant and not an operator knob, because no operator
+ * need was demonstrated, the repository carries no deployment manifest to tune a grace period
+ * against (`ls docker-compose*.yml k8s/ deploy/` -> nothing), and S-6 is the standing example
+ * of an env var that is declared, validated, and read by no production code. Promoting it to a
+ * field later changes none of the logic that reads it.
+ *
+ * Every Redis reply text below was measured against the host Redis 7.0.15 through ioredis
+ * 5.11.1 on logical database 14, re-run at Gate 3 rather than inherited from the plan; the
+ * transcripts are in `docs/plans/t-043-worker-graceful-shutdown.md` Appendix A.
+ */
+export const WORKER_SHUTDOWN = {
+  /**
+   * How long `stop()` waits for in-flight handler work before giving up on it.
+   *
+   * **Bounded by a floor that is measurable and a cost that is asymmetric**, which is how the
+   * figure was chosen rather than by taste:
+   *
+   * - **Floor.** The loop can be inside `backOff()` when the stop is requested, and that pause
+   *   is `WORKER_STREAM_READ.ERROR_BACKOFF_MS` (1 000 ms) before the stop condition is
+   *   re-checked. A bound **below** that makes a shutdown during a *failing* loop liable to
+   *   time out -- and a timed-out drain suppresses the deregistration, so the guard would stop
+   *   deregistering exactly when a worker is unhealthy. Three times the backoff.
+   *   `U74` asserts the inequality rather than leaving it to this paragraph.
+   *
+   *   **Not "every time" -- that was a false universal and it is measured false in both
+   *   directions** (Gate-5 QA, QA-1). Whether it times out depends on where in the backoff the
+   *   stop lands: at a bound *equal* to `ERROR_BACKOFF_MS` it essentially never times out, and
+   *   at 500 ms it timed out at 3 of 4 offsets sampled across the pause. The floor argument
+   *   survives -- a bound **below** the backoff makes the timeout common rather than impossible,
+   *   which is enough to reject it -- but the claim is probabilistic, not universal. The
+   *   *equality* case is the one that never times out, which is why `U74` asserts a strict
+   *   `toBeGreaterThan` rather than a non-strict bound.
+   * - **Cost asymmetry.** Too short and some work is redone: nothing is acknowledged until the
+   *   handler commits, so a drain cut short leaves the entry pending and the next worker
+   *   reclaims it (this is also why a SIGKILL mid-drain is exactly today's behaviour). Too long
+   *   and a deploy waits. Neither loses data, and the cheap direction is short.
+   *
+   * A consequence worth stating because this package has fixed the same defect three times
+   * (`RUN_DEADLINE_MS`, `BLOCK_MS_LONG`, `STOP_BUDGET_MS`): this sits below
+   * `tests/integration.constants.ts`' `CASE_BUDGET_MS` of 5 000, so a regression that wedges the
+   * drain fails a live-Redis case by *assertion* rather than as `Test timed out in 5000ms`
+   * naming nothing. That is a consequence of the choice, not the reason for it.
+   */
+  DRAIN_TIMEOUT_MS: 3_000,
+  /**
+   * `XINFO CONSUMERS` -- the per-consumer registry read, and the reading the deregistration
+   * guard is made from (decision D3).
+   *
+   * **Chosen over `XPENDING <key> <group>`, and the reason is reply shape rather than
+   * preference.** That command's summary form has two shapes: a zero-pending group replies with
+   * a nil breakdown, while a populated one replies `[total, min, max, [[name, count], ...]]`.
+   * The predicate would then be "absent from a list that is sometimes nil", which is an
+   * inference. `XINFO CONSUMERS` has one shape and reports `pending` per name as a number,
+   * including zero. Measured through ioredis 5.11.1 at Gate 3, three states of one group:
+   *
+   *   no consumer has ever read     -> `[]`
+   *   c1 holding two entries        -> `[["name","c1","pending",2,"idle",0]]`
+   *   c1 after acknowledging both   -> `[["name","c1","pending",0,"idle",1]]`
+   *
+   * Note the row **persists at `pending 0`** -- that is what makes the deregistration worth
+   * issuing at all -- and that `pending` arrives as a JavaScript `number`, not a string.
+   */
+  SUBCOMMAND_CONSUMERS: "CONSUMERS",
+  /**
+   * `XGROUP DELCONSUMER` -- the deregistration itself.
+   *
+   * **Never issue this without first reading `pending 0` for the name.** On a consumer holding
+   * pending entries it destroys them: measured (probe P1, re-run at Gate 3) -- two entries
+   * delivered, the command returned `2`, `XPENDING` dropped to 0, `XAUTOCLAIM ... 0 0-0` and
+   * `XREADGROUP ... >` both came back empty, and `XLEN` still reported 2. The entries are still
+   * on the stream and unreachable through the group, permanently, with no error and no retry.
+   *
+   * Idempotent in the safe direction, which is why the guard may issue it on an absent name:
+   * `DELCONSUMER` against a name that never existed returned `0` and did not error.
+   */
+  SUBCOMMAND_DELCONSUMER: "DELCONSUMER",
+  /** The only pending count at which deregistration is permitted. Never written as a bare 0. */
+  NO_PENDING_ENTRIES: 0,
+  /**
+   * Field names inside one `XINFO CONSUMERS` row, which replies as a flat
+   * `[key, value, key, value, ...]` array per consumer rather than as a map.
+   *
+   * Named rather than written inline for the reason `WORKER_STREAM_READ`'s `*_INDEX` members
+   * are: these are protocol tokens with names. The row is walked by key rather than by position,
+   * so a future Redis adding a field ahead of `pending` does not silently shift the reading.
+   */
+  CONSUMER_INFO_FIELD_NAME: "name",
+  CONSUMER_INFO_FIELD_PENDING: "pending",
+  /** Stride of the flat key/value row above. Mirrors `INTEGRATION_FIELD_PAIR_STRIDE` in tests. */
+  CONSUMER_INFO_FIELD_STRIDE: 2,
+  /**
+   * The replies that mean "the group, or the stream key, is already gone" -- benign at shutdown,
+   * and logged at `info` rather than `error` for the same reason `U35`'s
+   * `RECOVERY_INTERRUPTED` exists: a deploy that destroyed the stream first should not page
+   * someone.
+   *
+   * **Three shapes, not one, and they do not share a prefix.** This is a sibling list rather
+   * than a widening of `WORKER_STREAM_READ.MISSING_GROUP_ERROR_PREFIX`: widening that constant
+   * would change how the *read* loop classifies a failure, which is a different decision from
+   * how shutdown classifies one. Measured at Gate 3, each through ioredis as a `ReplyError`
+   * whose `code` is `undefined`, so the message is the only discriminator available:
+   *
+   *   XGROUP DELCONSUMER, group gone -> `NOGROUP No such consumer group '<g>' for key name '<k>'`
+   *   XGROUP DELCONSUMER, key gone   -> `ERR The XGROUP subcommand requires the key to exist. ...`
+   *   XINFO CONSUMERS,    key gone   -> `ERR no such key`
+   *   XINFO CONSUMERS,    group gone -> `NOGROUP No such consumer group '<g>' for key name '<k>'`
+   *
+   * The third is the one the plan's F2 table did not have: it names the *same* condition as the
+   * second through a different command, with a completely different text. Both `ERR` shapes are
+   * matched with `startsWith` for the reason `ALREADY_EXISTS_ERROR_PREFIX` records -- the group
+   * and key names appear *inside* the reply text, so a group named after another reply's prefix
+   * would satisfy `includes`.
+   *
+   * The first member is the existing constant rather than a fourth copy of `"NOGROUP"`.
+   */
+  GROUP_GONE_ERROR_PREFIXES: [
+    WORKER_STREAM_READ.MISSING_GROUP_ERROR_PREFIX,
+    "ERR The XGROUP subcommand requires the key to exist",
+    "ERR no such key"
+  ]
 } as const;
 
 /**
