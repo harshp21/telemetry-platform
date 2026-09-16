@@ -453,7 +453,15 @@ describe("Postgres RLS enforcement through auth-service's own connection (integr
 			}
 		});
 
-		it("is the only SECURITY DEFINER function in the schema, and none is reachable by PUBLIC or the shared role", async () => {
+		// Title changed at T-042, deliberately. It used to read "is the only SECURITY DEFINER
+		// function in the schema", which was true until `v1_7` added worker-service's
+		// cross-tenant enumerator and is now false. The assertion below is **not** weakened to
+		// accommodate it: it is still an exact-set `toEqual`, and it still fails the moment a
+		// fourth definer function appears. Extending the expected list is the intended cost of
+		// adding one — that is what made `v1_7`'s arrival visible here on purpose rather than in
+		// a full-gate run, and `.claude/rules/tenant-isolation.md` names this suite as the thing
+		// that catches a missing revoke.
+		it("enumerates the exact set of SECURITY DEFINER functions in the schema, none of them reachable by PUBLIC or the shared role", async () => {
 			// This is the durable half of the guard. PostgreSQL grants EXECUTE on every new
 			// function to PUBLIC, and `v1_5` removes that with a database-scoped
 			// `ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` — but only for
@@ -475,10 +483,17 @@ describe("Postgres RLS enforcement through auth-service's own connection (integr
 				ORDER BY signature
 			`;
 
+			// `ORDER BY signature`, so the expected list is in lexical order and the worker
+			// resolver sorts last.
 			expect(definerFunctions.map((row) => row.signature)).toEqual([
 				AUTH_DATABASE.RESOLVE_TENANT_BY_EMAIL_FN,
-				AUTH_DATABASE.RESOLVE_TENANT_BY_REFRESH_TOKEN_HASH_FN
+				AUTH_DATABASE.RESOLVE_TENANT_BY_REFRESH_TOKEN_HASH_FN,
+				AUTH_DATABASE.WORKER_RESOLVE_UNBILLED_TENANTS_FN
 			]);
+			// The loop needed no edit to cover the new function, which is the property that makes
+			// it the durable half: it asserts by mechanism over whatever the catalog holds, so a
+			// definer function added by a later migration without its own REVOKE is caught here
+			// even though nobody thought to name it.
 			for (const row of definerFunctions) {
 				expect(row.public_can_execute, `PUBLIC can execute ${row.signature}`).toBe(false);
 				expect(
@@ -486,6 +501,69 @@ describe("Postgres RLS enforcement through auth-service's own connection (integr
 					`${AUTH_DATABASE.SHARED_APP_ROLE} can execute ${row.signature}`
 				).toBe(false);
 			}
+		});
+
+		it("does not let worker-service's role execute either auth resolver", async () => {
+			// The symmetric negative of `v1_7`'s own guard, which asserts that `telemetry_app`
+			// and `telemetry_auth_app` cannot execute the *worker* resolver. Without this case
+			// nothing on the platform would notice a future `GRANT EXECUTE` on the auth
+			// resolvers made to the wrong one of the four application roles: the loop above
+			// checks PUBLIC and `telemetry_app` only, and `telemetry_worker_app` did not exist
+			// when it was written.
+			//
+			// What is at stake is the same thing `v1_5` created a separate role for: these two
+			// functions are an e-mail -> tenant and a token-hash -> tenant oracle that read
+			// straight past the `"User"` policy. worker-service has no business with either.
+			const rows = await app.$queryRaw<{ signature: string; worker_can_execute: boolean }[]>`
+				SELECT n.nspname || '.' || p.proname AS signature,
+				       has_function_privilege(${AUTH_DATABASE.WORKER_APP_ROLE}, p.oid, ${EXECUTE_PRIVILEGE}) AS worker_can_execute
+				FROM pg_proc p
+				JOIN pg_namespace n ON n.oid = p.pronamespace
+				WHERE n.nspname = 'public'
+				  AND n.nspname || '.' || p.proname IN (
+				    ${AUTH_DATABASE.RESOLVE_TENANT_BY_EMAIL_FN},
+				    ${AUTH_DATABASE.RESOLVE_TENANT_BY_REFRESH_TOKEN_HASH_FN}
+				  )
+				ORDER BY signature
+			`;
+
+			// Locating the rows must fail loudly rather than pass vacuously: a query that
+			// matched nothing would satisfy the `every` below with an empty array
+			// (`.claude/rules/testing.md`).
+			expect(rows.map((row) => row.signature)).toEqual([
+				AUTH_DATABASE.RESOLVE_TENANT_BY_EMAIL_FN,
+				AUTH_DATABASE.RESOLVE_TENANT_BY_REFRESH_TOKEN_HASH_FN
+			]);
+			for (const row of rows) {
+				expect(
+					row.worker_can_execute,
+					`${AUTH_DATABASE.WORKER_APP_ROLE} can execute ${row.signature}`
+				).toBe(false);
+			}
+		});
+
+		it("does not let either auth role assume worker-service's definer role", async () => {
+			// Membership, not privilege, and asserted directly for the reason `v1_5` gives about
+			// its own definer: `usageline_worker_definer_read` is `USING (true)` and a policy
+			// applies through role **membership**, so a member reads every tenant's
+			// `"UsageLine"` rows with no tenant context and without calling the resolver at all.
+			// No EXECUTE check can notice that.
+			const [row] = await app.$queryRaw<{
+				auth_app_is_member: boolean;
+				shared_is_member: boolean;
+			}[]>`
+				SELECT pg_has_role(${AUTH_DATABASE.AUTH_APP_ROLE}, ${AUTH_DATABASE.WORKER_DEFINER_ROLE}, 'USAGE') AS auth_app_is_member,
+				       pg_has_role(${AUTH_DATABASE.SHARED_APP_ROLE}, ${AUTH_DATABASE.WORKER_DEFINER_ROLE}, 'USAGE') AS shared_is_member
+			`;
+
+			expect(
+				row?.auth_app_is_member,
+				`${AUTH_DATABASE.AUTH_APP_ROLE} can assume ${AUTH_DATABASE.WORKER_DEFINER_ROLE}`
+			).toBe(false);
+			expect(
+				row?.shared_is_member,
+				`${AUTH_DATABASE.SHARED_APP_ROLE} can assume ${AUTH_DATABASE.WORKER_DEFINER_ROLE}`
+			).toBe(false);
 		});
 
 		it("resolves a known e-mail to its tenant with no tenant context set", async () => {

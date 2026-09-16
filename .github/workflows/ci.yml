@@ -21,13 +21,27 @@ jobs:
       # the only role granted EXECUTE on the pre-authentication resolvers (v1_5), which read
       # past the "User" tenant policy by design. Created by that migration.
       AUTH_DATABASE_URL: postgresql://telemetry_auth_app:telemetry_auth_app_local_dev@localhost:5432/telemetry
+      # billing-service's base URL, required by worker-service's env schema with no default.
+      BILLING_SERVICE_URL: http://localhost:3004
       #
       # NOTE: turbo runs tasks in strict env mode, so the connection strings declared here do
       # NOT reach `pnpm test`, `pnpm lint`, `pnpm build` or `pnpm typecheck` unless they are
       # also declared under `tasks.<task>.env` in turbo.json. Those suites take their values
-      # from each package's `tests/setup.ts` defaults, which are the same three roles. The
-      # vars above apply to the steps that bypass turbo: the Prisma steps and the auth
-      # coverage step.
+      # from each package's `tests/setup.ts` defaults, which are now four distinct roles --
+      # worker-service's default flipped to telemetry_worker_app at T-042, which is what makes
+      # `pnpm test` exercise the real role rather than the shared one.
+      #
+      # Which of these the non-turbo steps actually read, re-derived with
+      # `grep -n "DATABASE_URL" .github/workflows/ci.yml`: DATABASE_URL and DIRECT_DATABASE_URL
+      # are inherited by every step, and AUTH_DATABASE_URL is referenced exactly once, by the
+      # auth coverage step's `DATABASE_URL: ${{ env.AUTH_DATABASE_URL }}` override. Nothing else
+      # here names a role.
+      #
+      # T-042 first added a WORKER_DATABASE_URL alongside AUTH_DATABASE_URL for parity and
+      # removed it at the Gate-4 review: no step read it, and an unread connection string is the
+      # S-6 shape -- an operator editing it would get no effect and no warning. worker-service's
+      # role IS exercised in CI, through `apps/worker-service/tests/setup.ts`'s default, not
+      # through this block.
       REDIS_URL: redis://localhost:6379
       OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
       JWT_SECRET: test-jwt-secret-value-with-at-least-32-characters

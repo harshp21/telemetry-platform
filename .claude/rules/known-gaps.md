@@ -504,6 +504,20 @@ rotted once: the `invoice.repository.ts` citation was written at `:87`, was `:92
 Gate 4 measured it, and is `:94` on the tree that shipped, because the fix for that review moved
 it. Re-run the grep rather than trusting the column.
 
+**T-042 adds a query that the obvious fix would not reach, and it is in worker-service.**
+`apps/worker-service/src/repositories/billing-enumeration.repository.ts` issues a `$queryRaw`
+**outside** `withTenant` and outside any transaction, carrying two timestamp bounds — the same
+shape this entry already records for auth-service's two pre-authentication resolver calls, now in
+a second service. So "roll the `set_config('TimeZone','UTC',true)` pin into all five `withTenant`
+implementations" would not cover it either, and that is now true of two services rather than one.
+It is **not** a live defect: the bounds cross into SQL as `text` and are cast inside the
+resolver's own body, which is session-independent — measured across `UTC` and `Asia/Kolkata` by
+`I-TZ1` in `apps/worker-service/tests/billing-enumeration.integration.test.ts`, which pins **both**
+arms rather than one. The resolver's parameters being `text` rather than `timestamp(3)` is what
+makes that hold, and `R5` in the same suite asserts the catalog signature so a widening goes red.
+It does not add a subclass: that class deliberately does not extend `TenantScopedRepository`,
+because it binds no tenant.
+
 So three of the four live tenant-scoped data paths run over an unpinned copy, and analytics and
 auth still have no subclass at all. **No query is wrong today**, and both T-040 and T-045 shipped
 on that basis by committing explicitly to the ORM for every date predicate, which is measured
@@ -535,19 +549,42 @@ five `withTenant` implementations would therefore not cover them. They take no t
 argument today, so nothing is wrong now; the point is that "roll the pin to all five" is not by
 itself a complete answer for auth-service.
 
-**The setting name itself is duplicated the same way.** `grep -rn "app\.tenant_id" apps --include=*.ts`
-(excluding `dist/`, comments and test titles) shows `"app.tenant_id"` written as an executable
-string in **six** places: two named constants —
-`apps/usage-service/src/constants.ts:74` (`DATABASE_SESSION_SETTINGS.TENANT_ID`) and
-`apps/auth-service/src/constants.ts:69` (`AUTH_DATABASE.TENANT_CONTEXT_SETTING`) — and four
-hard-coded literals inside `set_config`, at `analytics`/`billing`/`worker`
-`base.repository.ts:98` and `auth` `base.repository.ts:105`. No test passes the bare literal to
-`set_config`/`current_setting` — every test that names the setting to the database imports one
-of the two constants (checked: the remaining test-file occurrences are comments, `it(...)`
-titles, and one assertion-failure message at
-`apps/auth-service/tests/user.repository.unit.test.ts:116`).
-`.claude/rules/constants.md` asks for promotion before the third copy,
-and this is the sixth; the shared-package fix below should carry the constant with it.
+**The setting name itself is duplicated the same way, and T-042 made it seven.**
+`grep -rn '"app\.tenant_id"' apps packages --include=*.ts | grep -v /dist/` plus
+`grep -rn "set_config('app.tenant_id'" apps packages --include=*.ts | grep -v /dist/`, filtered to
+executable lines (no comments, no `it(...)` titles), shows `"app.tenant_id"` written in **seven**
+places:
+
+- **three named constants** — `apps/usage-service/src/constants.ts:75`
+  (`DATABASE_SESSION_SETTINGS.TENANT_ID`), `apps/auth-service/src/constants.ts:69`
+  (`AUTH_DATABASE.TENANT_CONTEXT_SETTING`) and, added by T-042,
+  `apps/worker-service/src/constants.ts:919` (`WORKER_DATABASE.TENANT_CONTEXT_SETTING`);
+- **four hard-coded literals inside `set_config`**, at `analytics`/`billing`/`worker`
+  `base.repository.ts:98` and `auth` `base.repository.ts:105`.
+
+The count was **six** (two named constants) until T-042, whose diff edited this entry without
+re-deriving it — S-33's shape again, corrected at that task's Gate-4 review (MEDIUM-7).
+usage-service's constant is at `:75`, not the `:74` this paragraph carried.
+
+**So worker-service now holds a constant and a literal for the same setting inside one package**,
+which `.claude/rules/constants.md` names explicitly. T-042 decided **not** to point
+`apps/worker-service/src/repositories/base.repository.ts:98` at its own new constant, and the
+reason is this entry: `md5sum apps/*/src/repositories/base.repository.ts` shows `analytics`,
+`billing` and `worker` still byte-identical (`13a533a2e2c2dcc1ff9db28fb5c7a1fd`), and that identity
+is the evidence this entry rests on. Editing one of the three to reference a service-local
+constant would create a fifth distinct variant of a five-copy class whose whole gap is drift, from
+inside a task told not to open S-19. The constant exists because the *tests* and the enumeration
+repository need to name the setting; the literal stays until the shared-package fix moves all
+four. Recorded here rather than resolved, which is the trade T-042 made and the place to overrule
+it.
+
+No test passes the bare literal to `set_config`/`current_setting` against a real database —
+`worker`'s `tests/event.repository.unit.test.ts:46` and `billing`'s
+`tests/{invoice,meter}.repository.unit.test.ts:24` declare it as a file-local constant to assert
+against a **double**, and the remaining test-file occurrences are comments, `it(...)` titles and
+one assertion-failure message at `apps/auth-service/tests/user.repository.unit.test.ts:116`.
+`.claude/rules/constants.md` asks for promotion before the third copy, and this is the seventh;
+the shared-package fix below should carry the constant with it.
 
 Same drift class as S-14 (`.claude/agents/` vs `.github/agents/`): duplication that was harmless
 while the copies matched, and became a correctness question the moment one changed.
@@ -583,8 +620,40 @@ A fully-passing run happens to leak nothing only by accident of ordering: the fi
 `"rejects missing required field with 400"` (`:748`), a negative case that registers no user.
 Append one positive test after it, shard the file, or run a subset with `-t`, and every run leaks.
 
+**Addendum (T-042 Gate 3) — there is a second leak mechanism, and the fix direction below does
+not reach it.** `resetAuthState` (`:123-134`) finds users by e-mail and then derives the tenant
+ids **from those users** (`const tenantIds = users.map((user) => user.tenantId)`). A `"Tenant"`
+row with **no** `"User"` is therefore uncollectable by that reset under *any* filter — widening
+the e-mail predicate to a stable prefix, which is what the fix direction below proposes, does not
+help, because there is no user row to match.
+
+Observed rather than reasoned about: after T-042's first full `pnpm test --force`, the
+development database held a third `"Tenant"` — `name = 'First Tenant'`, `createdAt`
+`2026-09-16 06:28:57Z`, **0 users**. That literal appears in exactly one place on the platform,
+`apps/auth-service/tests/auth.integration.test.ts:623`
+(`grep -rn "First Tenant" apps packages prisma --include=*.ts`, excluding `dist/`).
+
+**The condition is not established, and is stated as not established.** It did **not** reproduce:
+running `tests/auth.integration.test.ts` alone left the count unchanged, and running the whole
+auth package (15 files, 166 cases) left it unchanged again. The one run that produced it was the
+full 13-package gate, where turbo runs every package's suite concurrently — so a cross-suite
+interaction is a *hypothesis*, not a finding. Do not write it up as the mechanism.
+
+What **is** established is the shape: an orphan `"Tenant"` is invisible to this reset by
+construction, and the entry above does not say so — its account is that the residue is "whatever
+the final test created", and the final test creates nothing. Both statements can be true at once;
+this is a second leak, not a correction of the first.
+
+The row was deleted by hand at the end of T-042 (`DELETE 1`) to restore the baseline, which is
+itself the evidence that nothing automatic collects it.
+
 **Fix direction:** call `resetAuthState()` from `afterAll` as well as `beforeEach`, and widen the
-filter to a **stable** prefix so an earlier run's residue is collectable.
+filter to a **stable** prefix so an earlier run's residue is collectable. **And**, for the
+addendum above, give the reset a second pass that collects `"Tenant"` rows by a stable
+*tenant-side* marker — the suite's own `tenantName` values are literals it controls, so a
+`name: { startsWith: <suite prefix> }` sweep would reach an orphan that the user-side filter
+cannot. Changing the fixtures' tenant names to carry such a prefix is part of that fix, not a
+precondition someone can assume.
 
 That second half is a trade-off, not a straight win, and needs deciding rather than reverting:
 the run-unique domain exists so that parallel vitest workers cannot delete each other's rows —
@@ -747,6 +816,14 @@ Twice now it has not been.
 - At T-038's Gate-6 review, in a different session: the injected `known-gaps.md` ended at
   **S-21**, so it could not see the S-22 correction and the S-23 entry that the very diff under
   review had added.
+- At T-042's Gate 3 (implementation, not review — so this is no longer only a reviewer-side
+  sighting): the injected `known-gaps.md` ended at **S-40**'s predecessor, **S-39**, while the
+  file on disk ran to **S-41** (`grep -n "^## S-" .claude/rules/known-gaps.md`, md5
+  `1dc3cede5edcc14683cfc69746733706`). The implementer was about to file a new entry and would
+  have numbered it **S-40**, colliding with the existing S-40 — which is precisely the harm the
+  "How this bites" paragraph below predicts, reached from the *writing* side rather than the
+  reading side. It was avoided only because the working practice below was followed and the file
+  was `cat`-ed first. The entry became S-42.
 
 **What is *not* established:** the mechanism. Neither review investigated whether this is
 snapshot timing, caching, or something else, and nothing here reproduces it on demand — both
@@ -761,7 +838,10 @@ depended on the reviewer being suspicious, which is not a mechanism either.
 **How this bites, concretely:** the reviewer that cannot see S-23 also cannot see that the gap
 it is about to file already exists, so the same finding gets a second id; and an agent working
 from a `known-gaps.md` that stops at S-10 will not know that S-11 through S-21 forbid what it is
-about to write.
+about to write. The third sighting adds a sharper one: an agent that **adds** an entry numbers it
+from the highest id it can see, so a stale snapshot produces a *duplicate id* — and the ids rule
+at the top of this file says ids are never reused, so the duplicate would have to be resolved by
+renumbering something, which every citation of it then points at wrongly.
 
 **Working practice until it is fixed:** an agent that is going to *cite* or *edit* a
 `.claude/rules/` file should `cat` it first and treat the injected copy as a hint, not as the
@@ -781,10 +861,50 @@ guard that exists is assumed to cover a case it was never scoped to.
 
 ### 1 · `src/events/**` is excluded from coverage collection
 
-`apps/worker-service/vitest.config.mjs:18` lists `"src/events/**"` in `coverage.exclude`,
-alongside `src/**/index.ts`, `src/config/container.ts`, `src/jobs/**`, `src/middleware/**`,
-`src/models/**`, `src/telemetry/**` and `src/types/**`. The thresholds it guards are
-`lines/functions/statements: 80` and `branches: 75` (`:25-30`).
+> **The `src/jobs/**` half of this is closed by T-042** (decision D4), which put the first
+> production code in that directory and removed the glob in the same change rather than
+> inheriting the exclusion. Measured after removal, with the new job and queue files in place, by
+> `pnpm --filter @telemetry/worker-service exec vitest run --coverage` on the tree that ships
+> (234 cases, 17 files): **`98.26 / 93.07 / 94.73 / 98.26`** (statements / branches / functions /
+> lines) against thresholds of `80 / 75 / 80 / 80`, with `src/jobs` at **100%** and `src/queues` —
+> added by the same task and deliberately **not** excluded — at **`100 / 94.44 / 100 / 100`**. So
+> no threshold had to move, which is the boundary D4 set for itself. The list below is the
+> pre-T-042 one; `src/jobs/**` is no longer in it.
+>
+> Note the gate does not read any of this: `pnpm test` is `vitest run` with **no** `--coverage`,
+> so the thresholds are enforced by nothing in CI. That is pre-existing and is part of what this
+> entry stays open on.
+>
+> **Two revisions of these figures were wrong, and the second one is the more instructive.** The
+> paragraph first carried `97.38 / 92 / 94.73 / 97.38`, wrong in three of its four numbers. The
+> rework replaced it with `98.13 / 92.91 / 94.73 / 98.13` and `src/queues` at `98.59 / 93.33` —
+> correctly measured, and *immediately* made stale by the same rework's three new queue cases
+> (`Q7`–`Q9`), which took the suite from 230 to 233 and `src/queues` from one uncovered line to
+> none. The figures above are from the final tree. That is S-33's shape twice inside one entry;
+> the lesson is to re-measure **after** the last code change, not when the finding is written.
+> The entry's conclusion — no threshold had to move — held under all three sets, which is why
+> this was HIGH for being a false figure in an authoritative file rather than for its consequence.
+>
+> `src/events/**` is untouched and this entry stays open on it.
+
+`apps/worker-service/vitest.config.mjs:129` lists `"src/events/**"` in `coverage.exclude`,
+alongside `src/**/*.d.ts`, `src/**/index.ts`, `src/startup.constants.ts`, `src/config/container.ts`,
+`src/middleware/**`, `src/models/**`, `src/telemetry/**` and `src/types/**` — plus `src/jobs/**`
+until T-042 removed it. The thresholds it guards are at `:145-150`,
+`lines/functions/statements: 80` and `branches: 75`.
+
+(**Re-run both greps rather than trusting these two numbers — they have now been wrong three
+times, twice inside the commit that wrote them.** They read `:18` and `:25-30` until T-042's Gate-3
+rework; those were already stale at `5cb454a`, so not damage T-042 did, but T-042 rewrote the
+sentence around them and left the numbers. The Gate-3 rework then re-derived them as `:79` and
+`:95-100` — correct when measured — and the *same task's* Gate-5 rework inserted a 50-line
+`test.env.TZ` docblock at `:7-56`, moving both by exactly 50 lines, which is the state Gate 6
+caught. That is S-33's shape for the fourth time in T-042, landing inside the parenthetical whose
+own subject is that failure, and it is the argument for S-33's mechanical checker rather than
+another careful pass. The commands, and what they returned on the tree that ships:
+`grep -n '"src/events/\*\*"' apps/worker-service/vitest.config.mjs` → `129:        "src/events/**",`;
+`grep -n "thresholds" apps/worker-service/vitest.config.mjs` → `145:      thresholds: {`, plus a
+comment match at `:138` that is not the block.)
 
 `src/events/stream.consumer.ts` is **777 lines** after T-039 — measured with
 `find apps/worker-service/src -name '*.ts' | xargs wc -l`, against 1 541 lines of `src/` in
@@ -871,7 +991,9 @@ only `apps/worker-service/tests/stream.consumer.integration.test.ts` and its
 
 > **T-043 (`fc66bd3`+) closed the main path and this entry is kept for the residue.** `stop()` now
 > awaits the loop under a bounded `DRAIN_TIMEOUT_MS` before the handler returns, so on a clean
-> signalled shutdown both teardown lines are emitted.
+> signalled shutdown **with nothing else in the handler ahead of it** both teardown lines are
+> emitted. T-042 put something ahead of it and made that conditional — see the addendum
+> immediately below, which is the correction rather than a second finding.
 >
 > Measured by capturing the logger *inside* the `process.exit` spy — "inside", because
 > `process.exit` does not return, so "afterwards" is not a moment a real process has. Three bodies
@@ -897,6 +1019,58 @@ only `apps/worker-service/tests/stream.consumer.integration.test.ts` and its
 >
 > The three scope comments on `U14`, `U24` and `U26` were narrowed in the same change, as this
 > entry's fix direction required.
+
+> ---
+>
+> **Addendum (T-042, answering Gate-5 finding F-3): the sentence above is conditional, and the
+> condition is a nightly job in flight.** T-042 inserts `await invoiceQueue?.close()` into the
+> shutdown handler **before** `streamConsumer.stop()`. `close()` waits for an in-flight job. While
+> it waits, the parked `XREADGROUP` expires by itself after `STREAM_BLOCK_MS`
+> (`WORKER_STREAM_CONSTANTS.DEFAULT_BLOCK_MS` = 5 000), the loop sees the shutdown flag and exits
+> on its own — so by the time `stop()` runs there is **no read left to interrupt** and
+> `"Stream read interrupted by shutdown"` is never written.
+>
+> Note this is a **different mechanism** from the race the rest of this entry describes: the line
+> is not losing to `process.exit`, it is never produced, because the condition it reports did not
+> occur. Nothing is lost either way; this is observability, which is why the entry stays LOW.
+>
+> Re-measured at T-042's Gate-3 rework — real `node --import tsx src/index.ts` on
+> `telemetry_worker_app` and Redis **db 14**, a real job enqueued through the shipped
+> `InvoiceGenerationQueue`, both tenants' billing calls hanging against a stub that accepts and
+> never replies, then a real `SIGTERM`. Two runs of each case:
+>
+> | case | `Stream read interrupted by shutdown` | `Stream consumer loop stopped` | SIGTERM → exit | exit code |
+> |---|---|---|---|---|
+> | idle queue, run 1 | `grep -c` → **1** | 1 | 39 ms | 0 |
+> | idle queue, run 2 | **1** | 1 | 36 ms | 0 |
+> | job in flight, 2 tenants, run 1 | `grep -c` → **0** | 1 | 19 106 ms | 0 |
+> | job in flight, 2 tenants, run 2 | **0** | 1 | 19 079 ms | 0 |
+> | job in flight, 1 tenant | **0** | 1 | 9 116 ms | 0 |
+>
+> The in-flight timeline, from the shipped log lines (run 1):
+>
+> ```
+> 09:28:59.296  Invoice generation job started
+> 09:29:00.312  Shutting down gracefully              <- SIGTERM
+> 09:29:02.942  Stream consumer loop stopped           (the read expired on its own, +2 630 ms)
+> 09:29:09.367  Invoice generation failed for tenant   (tenant 1, +10 s from enumeration)
+> 09:29:19.370  Invoice generation failed for tenant   (tenant 2, +10 s)
+> 09:29:19.370  Invoice generation job completed
+> 09:29:19.380  Shutdown complete                      exit 0
+> ```
+>
+> **`U86` is unaffected and must not be "fixed" on the strength of this.** It asserts both lines
+> reach `logMessagesAtExit`, and it is green — its `invoiceQueue` double resolves `close()`
+> immediately, so the handler never pauses long enough for the parked read to expire. That is a
+> correctly scoped unit case about `stop()`; what it cannot see is another `await` placed in front
+> of it. The same caveat that already sits on `U14`, `U24` and `U26` now applies to `U86`: a
+> passing case is not evidence that a shut-down worker says so in its logs.
+>
+> **Not fixed, and deliberately.** Making the line appear would mean disconnecting the read before
+> the queue close, which reverses T-042's ordering — the scheduler must stop producing work before
+> the consumer drains what it holds (`apps/worker-service/src/index.ts`, and `U87` asserts it).
+> Trading a correct shutdown order for a log line is not a trade worth making. If the line is ever
+> wanted in this case, the change is in `StreamConsumer`, not in the handler's ordering.
 
 `apps/worker-service/src/index.ts` calls `process.exit(0)` at the end of its shutdown handler.
 The stream consumer loop is started with `void streamConsumer.run()` — deliberately discarded, so
@@ -1672,7 +1846,8 @@ tenant boundary, and costs one transaction opened and rolled back, which is no m
 successful request costs, so it is not a cheap amplification either. What keeps it above a NIT is
 that it is a *reachable* `500` on a customer-facing endpoint — it will read as an outage to
 whoever watches error rates — and that the same unbounded shape is now declared in three places,
-which is how S-19 and S-39 got to six and three copies respectively.
+which is how S-19 and S-39 got to seven and three copies respectively (S-19 was six until T-042
+added a third named constant).
 
 ### Why filed rather than fixed
 
@@ -1797,3 +1972,361 @@ to assert the plan it got, at which point BI16's outcome becomes attributable an
 record what the attribution is. Until then, the durable practice is the one every gate here
 learned the expensive way: record the outcome, and do not write down the mechanism unless the
 refuting case has been run.
+
+---
+
+## S-42 · `docs/epics/epic-7-worker-service.md`'s T-042 section diverges from the shipped code in six ways — **LOW, open**
+
+The **fourth** sibling of S-29 (T-040 section), S-32 (T-041 section) and S-35 (T-043 section) in
+the same file. A new id rather than an extension of any of them, for the reason S-32 records
+about S-29: each of those titles is scoped to its own section, so folding this in would make one
+of them false.
+
+Line numbers below are against the shipped tree, re-derived with `grep -n` at T-042's **Gate-3
+rework** — not at Gate 3, where the same claim was made and was false. The section runs from
+`:206`.
+
+**Why it was false, because it is this entry's own subject.** The first revision cited `:217`,
+`:214-228`, `:226`, `:232` and `:234-248`, which were correct against the epic as it stood
+*before* this task edited it. The same diff then inserted a six-line forward-reference block at
+`:211-215`, pushing every one of them down — `:217`→`:223`, `:214-228`→`:219-236`, `:226`→`:232`,
+`:232`→`:238`, `:234-248`→`:269-283`. The old `:234-248` landed inside the snippet and the
+"What T-042 shipped" list, so the sentence saying the inherited-obligation block "is accurate"
+pointed at text that is not that block. A citation falsified by the commit that writes it: S-33,
+inside the entry family (S-29/S-32/S-35) whose subject is citation accuracy. Caught at Gate 4.
+
+The durable fix is to cite by **anchor text** as well as by line, which is what the numbers below
+now do, since the next insertion above them will move them again. The commands, re-runnable:
+
+```
+grep -n 'invoice-generation.job.ts'        docs/epics/epic-7-worker-service.md   # -> 208
+grep -n 'getTenantsWithUnbilledUsage'      docs/epics/epic-7-worker-service.md   # -> 223 (and 248, the correction block)
+awk 'NR>=206 && NR<=285 && /^```/ {print NR}' docs/epics/epic-7-worker-service.md  # -> 219, 236
+grep -n 'tenantId, \.\.\.yesterday'        docs/epics/epic-7-worker-service.md   # -> 232
+grep -n 'BullMQ handles retries'           docs/epics/epic-7-worker-service.md   # -> 238
+grep -n 'Obligation inherited from T-043'  docs/epics/epic-7-worker-service.md   # -> 269
+grep -n 'S-15 is why it is in both'        docs/epics/epic-7-worker-service.md   # -> 283
+```
+
+1. **`:208` names one file; the task shipped five.** The **File:** line is
+   `apps/worker-service/src/jobs/invoice-generation.job.ts` alone. That file exists and holds the
+   range maths and the loop, but the task also shipped
+   `src/queues/invoice-generation.queue.ts` (the BullMQ topology),
+   `src/services/billing-client.service.ts` (the HTTP call),
+   `src/repositories/billing-enumeration.repository.ts` (the one caller of the resolver) and
+   `prisma/migrations/v1_7_worker_billing_enumerator/migration.sql`. The migration is the largest
+   and highest-blast-radius part of the change and the epic does not mention a database change at
+   all. Same shape as S-32's `:151`, which named a file that did not exist.
+2. **`:223`'s `getTenantsWithUnbilledUsage(yesterday)` cannot be written as the epic implies, and
+   this is the load-bearing one.** Measured as `telemetry_app` — the role worker-service connected
+   as until this task — with no tenant context:
+   `SELECT DISTINCT "tenantId" FROM "UsageLine" WHERE billed = false` returns **0 rows**, and
+   `SELECT count(*) FROM "Tenant"` returns **0**, because `current_setting('app.tenant_id', true)`
+   is `NULL` when unset and `"tenantId" = NULL` is `NULL` for every row. The epic describes a
+   query the platform's own isolation model forbids and mentions no exception. What it actually
+   takes is a `SECURITY DEFINER` resolver, a `NOLOGIN` definer role, a targeted `FOR SELECT`
+   policy, a fourth application role, and a two-step deploy.
+3. **`:219-236`'s snippet is a free function closing over module scope.** `billingServiceUrl` and
+   `env` are captured from nowhere; every collaborator in this service is constructor-injected
+   `(redis, logger, env, …)`. This is S-32's recurring objection, now in a fourth section, and it
+   is the third consecutive section to carry it.
+4. **`:232`'s `{ tenantId, ...yesterday }` is only correct if `getPreviousDayRange()` returns
+   exactly `periodStart` and `periodEnd`** — the names
+   `apps/billing-service/src/validators/generate-invoice.validator.ts` requires. The epic never
+   says what the helper returns. A helper returning `{ from, to }` or `{ start, end }` produces a
+   `400 VALIDATION_ERROR` from a snippet that reads correct.
+5. **`:238`'s "BullMQ handles retries with exponential backoff" is an option, not a default.**
+   Retries and backoff are per-job `attempts`/`backoff` settings; without them a failed job is not
+   retried at all. Stated as a property of the library when it is a property of the caller's
+   configuration.
+6. **No timeout, no error-status handling and no `bodyLimit` are mentioned** for a `fetch` into
+   another service. `fetch` has no default timeout and the loop is sequential, so one hung
+   billing-service would stall every tenant after it indefinitely. T-042 added
+   `AbortSignal.timeout(...)`; the epic's snippet ignores the reply entirely, so a `500` from
+   billing would be counted as a billed tenant.
+
+**What is *not* wrong, recorded so a later reader does not "fix" it:** the inherited-obligation
+block at `:269-283` (`> ### Obligation inherited from T-043`) is accurate, was written by T-043, and T-042 discharged it —
+`await bullWorker.close()` is in `apps/worker-service/src/index.ts`'s shutdown handler, before
+`streamConsumer.stop()`, asserted by `U87` in `tests/index.graceful-shutdown.unit.test.ts`. Its
+claim that `grep -rn "bullmq" --include=package.json .` returned nothing was true when written and
+is now false by design, which is the block doing its job rather than rotting.
+
+**Four sibling entries for one file is the finding.** S-29, S-32, S-35 and this one say the same
+thing about four different sections of `docs/epics/epic-7-worker-service.md` — which is now every
+section from T-040 onward. The economical fix is one consolidated entry plus one pass over the
+epic, but that retires three live ids, which this file's stability rule forbids, and it is a docs
+task with its own review. Recorded rather than done.
+
+**Fix direction:** decide contract-first in each case — correct the epic, or change the code and
+say so. Do **not** "fix" any of them by editing a test: T-042's suites pin the shipped behaviour
+deliberately, with the reasons inline. Pairs with S-15's wider point that the epic files are not a
+reliable manifest.
+
+---
+
+## S-43 · The worker enumeration resolver converts "read a tenant you can name" into "read every tenant" — the precedent to check before the second one — **LOW, open**
+
+Filed by T-042's Gate-4 review (MEDIUM-1) and re-measured at that task's Gate-3 rework. Not a
+defect in anything shipped: the design was reviewed and accepted, and the review could not break
+it. What was missing was an accurate statement of *what it widens*, in a place that is read before
+the next service asks for the same exception.
+
+**What `v1_7` grants, measured as `telemetry_worker_app` against two tenants seeded through
+`DIRECT_DATABASE_URL` and deleted afterwards:**
+
+```
+1) no tenant context: SELECT id,"tenantId" FROM "UsageLine"            -> 0 rows
+2) SELECT * FROM public.worker_resolve_tenants_with_unbilled_usage(    -> both tenant ids
+     '2026-03-01T00:00:00.000Z','2026-04-01T00:00:00.000Z')
+3) BEGIN; SELECT set_config('app.tenant_id','<id from step 2>',true);
+   SELECT id,"tenantId" FROM "UsageLine"  -> that tenant's row
+   SELECT id,"tenantId" FROM "Event"      -> that tenant's row
+   UPDATE "UsageLine" SET billed = true WHERE "tenantId"='<that id>'   -> UPDATE 1
+   ROLLBACK;
+```
+
+**Step 3 is unchanged from `telemetry_app`.** The same three statements as `telemetry_app`, with
+the same id, returned the same rows and the same `UPDATE 1` in the same session — while
+`telemetry_app` calling the resolver got
+`ERROR: permission denied for function worker_resolve_tenants_with_unbilled_usage`. So the
+resolver buys exactly step 2, and step 2 is the whole widening: **the ids no longer have to be
+known.** "Read or write any tenant whose id you hold" becomes "enumerate every tenant with
+unbilled usage, then read or write any of them".
+
+**Why this is worth an id rather than a comment.** The claim that was shipped —
+*"the only cross-tenant read it has is the resolver's `SETOF text`"* — is refuted by step 3, and
+it was written beside the test that measures the *true* and narrower property: no cross-tenant
+read **in a single statement with no tenant context set**. That is `I-E1`, it is a real
+measurement, and it is not the same sentence. The corrected wording now lives in
+`apps/worker-service/src/repositories/billing-enumeration.repository.ts` (§ *What this exception
+widens, and what it does not*), in the release note, and in the `I-E1` comment. This entry exists
+so the **next** resolver is measured against the same question rather than against the same
+sentence.
+
+**What actually bounds it, unchanged and verified at Gate 4 from the live catalog:** `EXECUTE` is
+granted to `telemetry_worker_app` alone and revoked from `PUBLIC`, `telemetry_app` and
+`telemetry_auth_app`; no application role is a member of `telemetry_worker_definer` (a 5×5
+`pg_has_role` matrix returns `f` everywhere); the definer holds `SELECT` on `"UsageLine"` alone;
+the function is `STABLE STRICT` with a pinned `search_path` and returns `SETOF text`.
+
+**Before adding a second cross-tenant resolver, in any service:** say which of the two properties
+you are granting — "can read rows for a tenant it names" (already true of every application role)
+or "can learn which tenants exist" (this) — and grant the second to a role no other service shares.
+Extend `apps/auth-service/tests/rls.integration.test.ts`'s exact-set assertion and the migration's
+own catalog loop, both of which already fail on an unexpected `prosecdef` function.
+
+**Fix direction:** none — this is a recorded precedent, not an open defect. Close it if the
+platform ever gains a general answer (a tenant-registry service, say) that removes the need for
+per-service enumeration exceptions.
+
+---
+
+## S-44 · Two T-042 residuals are recorded only in a release note, which is read once — **LOW, open**
+
+Bundled under one id because they share a cause rather than a subject, on the S-25 precedent:
+each is a known, accepted cost that lives only in `docs/releases/t-042-worker-billing-enumerator.md`
+or in an `.env.example` comment. `CLAUDE.md` is explicit that `docs/plans/` is not a record, and a
+release note is read at deploy time and not again.
+
+### 1 · No index serves the enumeration predicate
+
+The resolver's `WHERE` is `billed = false AND "periodStart" >= $1 AND "periodStart" < $2`, with
+**no** `tenantId`. `"UsageLine"`'s two non-unique indexes are `(tenantId, periodStart, periodEnd)`
+and `(tenantId, billed)`, so neither has a usable leading column for it.
+
+**Not measured, and stated as not measured.** `"UsageLine"` is empty on every environment this has
+run against, so `EXPLAIN` proves nothing about the plan at scale — this is a leading-column
+observation. Do **not** add an index on the strength of it: the right shape depends on selectivity
+nobody has, and a partial index on `billed = false` is the obvious candidate precisely because it
+is the obvious candidate.
+
+**Fix direction:** revisit when `"UsageLine"` holds representative data, measure the nightly call
+with `EXPLAIN (ANALYZE, BUFFERS)`, and decide then. The job runs once a day, so a sequential scan
+may simply be correct.
+
+### 2 · `BILLING_SERVICE_URL` accepts any scheme
+
+`apps/worker-service/src/config/env.ts` validates it with `z.string().url()`, which — measured
+against zod 3.25.76, the version this workspace resolves — delegates to `new URL()` and therefore
+accepts `"billing-service:3004"` and `"javascript:alert(1)"` as readily as
+`"http://localhost:3004"`, rejecting only a relative or malformed value.
+
+This matches `apps/gateway/src/config/env.ts:17` deliberately, and the match is the right call:
+diverging one service's URL strictness from another's is the S-23/S-39 shape this repository has
+now recorded twice. The `.env.example` and `env.ts` comments state the behaviour accurately.
+
+**The residual is the purpose gap.** The field is `required` with no default specifically so that
+a worker with no billing address fails at *module load* rather than at 02:00 on a path nobody
+watches. A scheme that parses but cannot be fetched defers the failure to exactly 02:00, which is
+the outcome the design was chosen to avoid.
+
+**Fix direction:** decide it once for the platform, not per service — a shared URL fragment in
+`@telemetry/shared-types` that both gateway and worker import, restricting the scheme to
+`http:`/`https:`. Pairs with S-23 (one shared schema fragment so a third service cannot introduce
+a third strictness). Do not tighten worker alone.
+
+---
+
+## S-45 · Usage landing in a window whose invoice already exists is never billed **by the job**, and the job reports success — **MEDIUM, open**
+
+Found by Gate-5 QA of T-042 (F-2) by running the nightly job twice, and **re-reproduced
+independently at that task's Gate-3 rework** before being written here. Nothing in the shipped
+code is wrong against its own decisions; what is missing is that one of those decisions was taken
+in one direction only and nothing records the other.
+
+### The measured reproduction
+
+One tenant, one `api.request` meter at `0.010000`, two unbilled `UsageLine` rows inside
+`[2026-09-15, 2026-09-16)` (10 + 2 units). Seeded through `DIRECT_DATABASE_URL`, removed
+afterwards. The **real** `@telemetry/billing-service` on port 3004 (`node --import tsx
+src/index.ts`, `DATABASE_URL` = `telemetry_app`), driven by the **real**
+`runInvoiceGenerationJob` with the real `BillingEnumerationRepository` (as
+`telemetry_worker_app`) and the real `BillingClientService`, at a fixed
+`now = 2026-09-16T02:00:00.000Z`.
+
+```
+run 1   SUMMARY {"periodStart":"2026-09-15T00:00:00.000Z","periodEnd":"2026-09-16T00:00:00.000Z",
+                 "tenants":1,"succeeded":1,"failed":0}         per-tenant log: created:true
+        Invoice  1 row, totalAmount 0.120000        InvoiceLineItem  1 row, 12.000000 / 0.120000
+        UsageLine ...001 billed=t   ...002 billed=t
+
+INSERT INTO "UsageLine" (... '...003', quantity 2, periodStart '2026-09-15 23:59:00', billed false)
+
+run 2   SUMMARY {... "tenants":1,"succeeded":1,"failed":0}      per-tenant log: created:false
+        Invoice  still 1 row, totalAmount still 0.120000        InvoiceLineItem still 1 row
+        UsageLine ...003 billed=f          <- never priced, never marked
+
+run 3   now = 2026-09-17T02:00:00.000Z, i.e. the next night
+        SUMMARY {"periodStart":"2026-09-16T00:00:00.000Z","periodEnd":"2026-09-17T00:00:00.000Z",
+                 "tenants":0,"succeeded":0,"failed":0}          <- never enumerated again
+```
+
+billing-service's own log carries the mechanism, once:
+`grep -c "Invoice already exists for period" billing.log` → **1**, against one
+`"Draft invoice generated"` from run 1.
+
+"Never billed **by the job**" is the exact claim, and it is what was measured: the nightly path
+has no window that will price the row again. A *manual* call with a different period does bill it,
+at the cost recorded under fix direction 2 below. So the row is lost in both directions of the
+scheduled path at once: **run 2 cannot bill it** because
+`BillingService.generateInvoice` returns at step 2 — `findByPeriod` hits
+`Invoice @@unique([tenantId, periodStart, periodEnd])` and returns `{ created: false }` *before*
+`sumUnbilledByMetricKey` ever runs (`apps/billing-service/src/services/billing.service.ts`, the
+ordering comment at `:38-48`, item 2, and the early return at `:75-82`) — and **run 3 never sees it**,
+because the resolver's window has moved past its `periodStart`.
+
+### Why it is reachable, not exotic
+
+`apps/worker-service/src/validators/stream-message.validator.ts:261` sets
+`periodStart: occurredAt`, so a `UsageLine`'s window is fixed by the *event's* timestamp and the
+row is written whenever the consumer gets to it. Any lag between the two produces this: a stream
+backlog, a worker restart, an `XAUTOCLAIM` recovery pass, or a dead-letter replay through
+`POST /v1/internal/worker/replay`. The nightly job fires at 02:00 for a day that ended two hours
+earlier, so the gap that has to be crossed is two hours of processing lag, not a day.
+
+### The loss is silent, which is the part that matters
+
+Run 2 returned `succeeded: 1, failed: 0` and logged `created: false` — the same line a re-run of
+a genuinely complete day produces. Nothing distinguishes them. There is no metric until T-057, so
+the job's `failed` counter is the only operator-facing signal and it is `0` in both cases. The row
+stays `billed = false` in the database forever, where nothing reads it.
+
+### What the plan decided, stated exactly
+
+`docs/plans/t-042-invoice-generation-job.md` §2, decision **D5**, reasons about this endpoint in
+one direction:
+
+> **Re-running a day that is already billed is safe and does not double-invoice.**
+> `BillingService.generateInvoice` checks `invoiceRepository.findByPeriod(periodStart,
+> periodEnd)` and returns the existing invoice with `created: false` → `200` **before any
+> further read**
+
+and closes with
+
+> **BullMQ retries cannot double-invoice** *through this path* […] it rests on billing's early
+> return and its unique constraint, both of which are another service's code.
+
+Both sentences are true, and the word "safe" is attached to "does not double-invoice", which is
+the direction D5 examined. The other direction — a row that becomes billable *after* the invoice
+exists — is not mentioned in D5, in the release note, or in either review. It is the same
+mechanism read the other way round.
+
+One universal in the shipped code was requalified in the same change rather than left standing:
+`apps/worker-service/src/repositories/billing-enumeration.repository.ts`'s
+`listTenantsWithUnbilledUsage` docblock said "an enumeration that is right cannot produce a
+`200 { invoiceId: null }` for lack of usage". Literally true — run 2 returned an existing invoice
+id, not `null` — and the property a reader takes from it ("enumerated ⇒ billed") is false, which
+is the `.claude/rules/review-standards.md` § *Universals Must Cite Their Mutation* shape.
+
+### Severity
+
+**MEDIUM.** It is a revenue-loss path and it is silent, which is precisely the ranking T-045's
+decision D1 already made in the other direction:
+
+> an invoice that silently omits a metric is money quietly missing from a document that looks
+> complete — and nothing downstream is built to notice. A refusal is money visibly missing from a
+> queue, which somebody fixes.
+
+That argument was made about a *metric* omitted from an invoice; this is a *row* omitted from one,
+with the same "nothing downstream is built to notice". Not higher than MEDIUM because it needs a
+second run against an already-invoiced window to occur at all, the data is not destroyed — the row
+sits `billed = false` and can still be priced — and no invoice is ever wrong about what it
+contains; it is only incomplete.
+
+### Why it was not fixed at T-042
+
+The fix is **billing-service's** step-2 early return, or a product decision about supplementary
+invoices. Changing another service's behaviour inside a worker-service feature task is the
+objection S-8 states in its own words — "changing two other services' startup contracts inside a
+usage-service security fix breaks the one-task-per-commit rule" — and which this file cites as
+precedent at S-22 ("the same reason S-8 was not folded into S-4"), S-23, S-39 and S-40. T-042's
+own §3 non-goals already list S-38 (billing's `P2002` re-read) on the same grounds, and note that
+T-042 *increases* how often that path is reached without closing it. This is the same shape.
+
+It is also not obviously a defect rather than a policy: re-opening a finalised invoice may be the
+wrong answer commercially, and a supplementary invoice may be the right one. Nobody has decided,
+and deciding it inside a worker task would be exactly the silent resolution `CLAUDE.md` tells
+agents to refuse.
+
+### Fix direction
+
+**Scheduled, not merely open.** At T-042's Gate-6 decision the user chose option A — a
+billing-service task opened for this immediately after T-042 commits — so the next task is this
+one. That choice sets the *when*, not the *what*: the policy question below is still open and none
+of the three directions is pre-selected by it.
+
+Decide the policy first, then pick one of:
+
+1. **Bill the late rows onto the existing invoice.** In `BillingService.generateInvoice`, move the
+   `findByPeriod` result from an early *return* to a *branch*: still no second `Invoice` row, but
+   run `sumUnbilledByMetricKey` and, if it finds anything, add line items to the existing invoice
+   and mark those `UsageLine` rows billed. Needs a decision about a `DRAFT` invoice's totals
+   changing after it was first produced, and about what happens once its status is not `DRAFT`.
+2. **Supplementary invoice.** Leave the existing invoice alone and create a second one for the
+   same period. `Invoice @@unique([tenantId, periodStart, periodEnd])` forbids that directly, so
+   it needs a schema change — or a different period. **Measured, because it is what an operator
+   would reach for today:** posting the same tenant with a *narrower* window that still contains
+   the row (`2026-09-15T23:00:00.000Z` → `2026-09-16T00:00:00.000Z`) returned `201` with a new
+   invoice id, billed the row (`billed=t`) and left two overlapping invoices — `0.120000` for
+   `[09-15 00:00, 09-16 00:00)` and `0.020000` for `[09-15 23:00, 09-16 00:00)`. So recovery
+   exists, it is manual, and it produces overlapping periods no consumer is built to read.
+3. **Refuse and surface it.** Have billing answer something other than a plain `200` when an
+   invoice exists *and* unbilled rows remain in the period, so the job can count it as a failure
+   rather than a success. Smallest change, no schema movement, and it converts a silent loss into
+   the "money visibly missing from a queue" T-045's D1 preferred — at the cost of a nightly alarm
+   for a condition that may be routine.
+
+**How a test would prove it, and how the obvious one passes vacuously.** The assertion has to be
+on the **row**, not on the response: both the broken and the fixed path answer `200` with the same
+invoice id, and the job's summary is `succeeded: 1, failed: 0` either way — measured above. So a
+case that asserts the status code, the returned `invoiceId`, the summary, or even that the invoice
+count stayed at 1, passes against the defect.
+
+The second vacuous form is the fixture order. Run 1 above billed every row that existed when it
+ran, so a test that seeds the late row *before* the first call does not exercise the ordering at
+all and reports green. The case must be: seed, run, **then** insert, then run again, then assert the
+late row's `billed` and the invoice's `totalAmount` both moved. And it must be confirmed red
+against the current early return first — on this tree that is `billed=f` and `0.120000`, the two
+values measured above.
+

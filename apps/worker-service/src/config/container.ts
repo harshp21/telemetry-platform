@@ -11,6 +11,8 @@ import {
   type EventRepositoryFactory
 } from "../services/event-processor.service";
 import { DeadLetterService } from "../services/dead-letter.service";
+import { BillingClientService } from "../services/billing-client.service";
+import { BillingEnumerationRepository } from "../repositories/billing-enumeration.repository";
 // Type-only, so nothing from `src/events/**` is loaded here. `src/index.ts` dynamically imports
 // `./events/stream.consumer` *after* `initTracing(...)` on purpose; a value import at this depth
 // would pull that module into the graph ahead of it.
@@ -51,6 +53,21 @@ export interface AppContainer {
    * unit case green and the feature connected to nothing.
    */
   readonly messageHandler: StreamMessageHandler;
+  /**
+   * The cross-tenant unbilled-usage enumerator (T-042).
+   *
+   * A **singleton**, and correctly so despite `.claude/rules/tenant-isolation.md`'s factory
+   * rule: that rule exists so a tenant-scoped repository cannot pin one tenant process-wide,
+   * and this one binds no tenant at all -- discovering the tenant set is its whole purpose. Same
+   * reasoning `deadLetterService` above is registered on.
+   */
+  readonly billingEnumerationRepository: BillingEnumerationRepository;
+  /**
+   * The outbound call into billing-service's internal metering endpoint (T-042).
+   *
+   * Holds the parsed environment and a logger; no connection and no tenant, so a singleton.
+   */
+  readonly billingClient: BillingClientService;
 }
 
 export const createContainer = (
@@ -100,6 +117,16 @@ export const createContainer = (
   // one -- which is the point of the decorator shape (decision A).
   const messageHandler = deadLetterService.wrap(eventProcessor.buildHandler());
 
+  // T-042. Both are cheap value objects: the repository holds the shared Prisma client, the
+  // client holds `env` and a logger. **Neither opens a connection here**, which is why they can
+  // live in the container while the BullMQ queue cannot -- a `Worker` begins consuming the
+  // moment it is constructed, so building one inside `createContainer()` would have every unit
+  // test that touches the container start a blocking read against a real Redis. The queue is
+  // therefore constructed in `src/index.ts`, alongside `StreamConsumer`, which is in this file's
+  // entrypoint for the same reason.
+  const billingEnumerationRepository = new BillingEnumerationRepository(prisma);
+  const billingClient = new BillingClientService(env, containerLogger);
+
   return {
     serviceName,
     env,
@@ -109,6 +136,8 @@ export const createContainer = (
     eventRepositoryFactory,
     eventProcessor,
     deadLetterService,
-    messageHandler
+    messageHandler,
+    billingEnumerationRepository,
+    billingClient
   };
 };

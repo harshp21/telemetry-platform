@@ -550,3 +550,105 @@ export const INTEGRATION_REDELIVERY_MIN_COUNT = 2;
 
 /** Position of the delivery count in an `XPENDING <key> <group> - + <n>` row. */
 export const INTEGRATION_XPENDING_DELIVERY_COUNT_INDEX = 3;
+
+/**
+ * Fixture vocabulary for T-042's live enumeration suite
+ * (`billing-enumeration.integration.test.ts`).
+ *
+ * Postgres only -- this suite opens no Redis connection at all, so none of the logical-database
+ * machinery above applies to it.
+ *
+ * **The window and the row placements are the test**, not decoration. Every row sits where it
+ * does so that a specific defect moves a specific tenant in or out of the expected set:
+ *
+ * | Row | Placement | Correct result | Under a +05:30 session shift |
+ * |---|---|---|---|
+ * | A1 | mid-window (02:00Z) | A present | excluded, but A's second row keeps it present |
+ * | A2 | mid-window (09:00Z) | A present (once -- `DISTINCT`) | still included |
+ * | B | exactly `WINDOW_START` | B present (`>=` is inclusive) | **excluded -> B disappears** |
+ * | C | mid-window, `billed = true` | C absent | still absent |
+ * | D | exactly `WINDOW_END` | D absent (`<` is exclusive) | **included -> D appears** |
+ * | E | `WINDOW_END + 3 h` | E absent | **included -> E appears** |
+ *
+ * So the expected set `{A, B}` becomes `{A, D, E}` if the day boundary shifts by the session
+ * offset -- wrong in *both* directions, which is what makes `I-TZ1` a guard rather than a
+ * restatement. Verified by mutation at Gate 3; see the suite's docstring for which mutation
+ * produced which failure.
+ */
+export const INTEGRATION_ENUMERATION = {
+  /**
+   * Stable prefix for every `Tenant.name` this suite writes, so an earlier run's residue is
+   * **collectable** -- S-20's fix direction. The per-run uniqueness lives in the ids, not in the
+   * prefix: a run-unique filter cannot match a previous run's rows by construction, which is the
+   * defect S-20 records.
+   */
+  TENANT_NAME_PREFIX: "t042-billing-enum",
+  /** Separator between the stable prefix and the per-run infix in `Tenant.name`. */
+  TENANT_NAME_SEPARATOR: "-",
+  METRIC_KEY: "t042.enumeration.probe",
+  EVENT_TYPE: "t042.enumeration.probe",
+  EVENT_UNIT: "probe",
+  QUANTITY: "1",
+  /** `[WINDOW_START, WINDOW_END)` -- the day the cases enumerate. */
+  WINDOW_START_ISO: "2026-03-10T00:00:00.000Z",
+  WINDOW_END_ISO: "2026-03-11T00:00:00.000Z",
+  /** Row placements, all UTC instants. See the table above for why each one is where it is. */
+  ROW_A1_ISO: "2026-03-10T02:00:00.000Z",
+  ROW_A2_ISO: "2026-03-10T09:00:00.000Z",
+  ROW_B_ISO: "2026-03-10T00:00:00.000Z",
+  ROW_C_ISO: "2026-03-10T12:00:00.000Z",
+  ROW_D_ISO: "2026-03-11T00:00:00.000Z",
+  ROW_E_ISO: "2026-03-11T03:00:00.000Z",
+  /** A window containing none of the rows above, for the "empty is not an error" case. */
+  EMPTY_WINDOW_START_ISO: "2027-01-01T00:00:00.000Z",
+  EMPTY_WINDOW_END_ISO: "2027-01-02T00:00:00.000Z"
+} as const;
+
+/**
+ * Catalog vocabulary for the migration assertions.
+ *
+ * `SETOF text` and `2` are the *narrowness* of the exception: a resolver that returned a wider
+ * row type, or grew a third parameter, would be a different exception from the one reviewed.
+ */
+export const INTEGRATION_ENUMERATION_CATALOG = {
+  EXPECTED_RESULT_TYPE: "SETOF text",
+  EXPECTED_ARGUMENTS: "p_period_start text, p_period_end text",
+  EXPECTED_ARGUMENT_COUNT: 2,
+  EXECUTE_PRIVILEGE: "EXECUTE",
+  PUBLIC_ROLE: "public",
+  MEMBERSHIP_PRIVILEGE: "USAGE",
+  SELECT_COMMAND: "SELECT"
+} as const;
+
+/**
+ * The two session zones `I-TZ1` compares.
+ *
+ * **Both arms are pinned, neither inherits the server default, and that is the point.** A case
+ * that pinned one connection and left the other on the server's own `TimeZone` asserts a
+ * different thing on every host: on this development machine the default is `Asia/Kolkata`, so
+ * an unpinned arm agrees with the pinned one and the comparison degenerates into a second copy
+ * of `R1`; on CI's `postgres:16-alpine` the default is `UTC`, where a session-dependent defect
+ * and a correct implementation are indistinguishable. Pinning both makes the case assert the
+ * property it is named for -- *the answer does not depend on the session zone* -- on any host.
+ *
+ * Measured at Gate 3 against mutation M4 (the body casting the bound to `::timestamptz` instead
+ * of `::timestamp(3)`, which compares a naive column through the session zone and is the one
+ * wrong form that produces a **silent** answer rather than a `42883`): the `UTC` arm returned
+ * the correct `{A, B}` and the `Asia/Kolkata` arm returned `{A, D, E}`. With only one arm
+ * pinned, on a UTC server, that defect ships green.
+ *
+ * `options=-c timezone=...`, not a bare `?timezone=...`: `CLAUDE.md` records that the bare form
+ * is accepted and **silently ignored**. Each pin is asserted with `SHOW timezone` before it is
+ * relied on, so a suffix that stopped working would fail loudly rather than quietly re-testing
+ * the default twice.
+ *
+ * The non-UTC zone is deliberately a **positive** offset (+05:30), so a window that slid
+ * forward and one that slid backward are distinguishable.
+ */
+export const INTEGRATION_ENUMERATION_SESSION_TIME_ZONE = {
+  NON_UTC: "Asia/Kolkata",
+  NON_UTC_URL_SUFFIX: "?options=-c%20timezone%3DAsia%2FKolkata",
+  UTC: "UTC",
+  UTC_URL_SUFFIX: "?options=-c%20timezone%3DUTC",
+  SHOW_TIMEZONE: "SHOW timezone"
+} as const;

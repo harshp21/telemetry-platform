@@ -886,3 +886,236 @@ export const WORKER_DEAD_LETTER = {
 export const WORKER_ENVELOPE_FIELD_NAMES: ReadonlySet<string> = new Set(
   Object.values(WORKER_EVENT_PROCESSING.ENVELOPE_FIELD)
 );
+
+/**
+ * Database identities and the one cross-tenant resolver worker-service may call (T-042, v1_7).
+ *
+ * **Why worker-service has a role of its own.** Every other tenant-scoped read in this service
+ * goes through `TenantScopedRepository`, which binds one tenant and runs under RLS. The nightly
+ * invoice job cannot: to answer "which tenants had unbilled usage yesterday" it has to read
+ * *across* tenants, and that is exactly what the platform's isolation model forbids. Measured as
+ * `telemetry_app` on this database, with no tenant context:
+ * `SELECT DISTINCT "tenantId" FROM "UsageLine" WHERE billed = false` returns **0 rows**, and so
+ * does `SELECT count(*) FROM "Tenant"` -- the policies evaluate
+ * `"tenantId" = current_setting('app.tenant_id', true)`, which is `NULL` when unset.
+ *
+ * So the exception is *built*, not documented: `v1_7` adds a `SECURITY DEFINER` resolver owned by
+ * `telemetry_worker_definer` (`NOLOGIN NOSUPERUSER NOBYPASSRLS`), which reads past the `UsageLine`
+ * policy through one targeted `FOR SELECT` policy rather than through a role attribute, and
+ * grants `EXECUTE` on it to `telemetry_worker_app` **alone** -- revoked from `PUBLIC` and from
+ * `telemetry_app`, which the other five services share. That separation is the entire reason the
+ * resolver is not simply granted to `telemetry_app`; `v1_5` refused the same thing for the auth
+ * resolvers and said so in its own header.
+ *
+ * The bound is by mechanism and is asserted, not claimed:
+ * `tests/billing-enumeration.integration.test.ts` runs as `telemetry_worker_app` and pins the
+ * return type (`SETOF text` -- tenant ids only), the `EXECUTE` grants in both directions,
+ * non-membership of the definer role via `pg_has_role`, the enumerated table grants, and the
+ * negative that carries the most weight: a direct `SELECT` on `"UsageLine"` as this role with no
+ * tenant context still returns zero rows.
+ */
+export const WORKER_DATABASE = {
+  /** The session setting the RLS policies read. Matches `AUTH_DATABASE.TENANT_CONTEXT_SETTING`. */
+  TENANT_CONTEXT_SETTING: "app.tenant_id",
+  /** worker-service's own runtime role (`DATABASE_URL`). `NOSUPERUSER`, `NOBYPASSRLS`. */
+  WORKER_APP_ROLE: "telemetry_worker_app",
+  /** Owns the resolver. `NOLOGIN`: nothing connects as it. */
+  DEFINER_ROLE: "telemetry_worker_definer",
+  /** The role the other five services share, and which must **not** reach the resolver. */
+  SHARED_APP_ROLE: "telemetry_app",
+  /**
+   * The cross-tenant enumerator.
+   *
+   * Schema-qualified because `regprocedure` drops the schema when it is on the `search_path`,
+   * so a catalog assertion has to build the qualified name explicitly to compare against this.
+   */
+  UNBILLED_TENANTS_FN: "public.worker_resolve_tenants_with_unbilled_usage",
+  /** The targeted `FOR SELECT` policy that lets the definer's body see rows. */
+  DEFINER_USAGE_LINE_READ_POLICY: "usageline_worker_definer_read",
+  /**
+   * The only two tables worker-service writes, and therefore the only two `telemetry_worker_app`
+   * holds DML on. No blanket `ALTER DEFAULT PRIVILEGES ... GRANT`, so a future table has to be
+   * granted deliberately -- the mistake `.claude/rules/tenant-isolation.md` records about
+   * copying `telemetry_app`'s blanket grant, which would have handed auth-service
+   * `"InvoiceLineItem"` where RLS is inert (S-10).
+   *
+   * **No grant on `"Tenant"`**, despite `Event.tenantId`'s foreign key. Measured on PG 16.13
+   * against a throwaway role holding these two tables and nothing else, in a rolled-back
+   * transaction: `SELECT count(*) FROM "Tenant"` raised `permission denied for table Tenant`,
+   * while `INSERT INTO "Event"` referencing a real `"Tenant"` row **succeeded**, and an
+   * `INSERT` naming a tenant id that does not exist -- with `app.tenant_id` set to that same
+   * id, so the RLS check could not be what rejected it -- failed with
+   * `violates foreign key constraint "Event_tenantId_fkey"`. So referential integrity is
+   * enforced without consulting the calling role's privileges, in both directions.
+   */
+  GRANTED_TABLES: ["Event", "UsageLine"]
+} as const;
+
+/**
+ * The call worker-service makes into billing-service's internal metering endpoint (T-042, S6).
+ *
+ * **`GENERATE_PATH` is a second copy of a value billing-service owns, and it is deliberately not
+ * promoted yet.** There are exactly **two** executable copies of `"/v1/internal/billing/generate"`,
+ * and the check is:
+ *
+ * ```
+ * grep -rn '"/v1/internal/billing/generate"' apps packages --include=*.ts \
+ *   | grep -v /dist/ | grep -vE ':[0-9]+: *\*'
+ * ```
+ *
+ * which returns two lines -- this file's `GENERATE_PATH` and
+ * `apps/billing-service/src/constants.ts:15`. The comment filter is load-bearing: without it the
+ * same grep returns **four**, the extra two being this docblock's own prose, one of which is the
+ * line carrying the pattern and so matches itself. An earlier revision of this paragraph claimed
+ * the unfiltered grep "returns only `apps/billing-service/src/constants.ts:15`" with "nine" other
+ * occurrences elsewhere; neither number was derivable from any command, which is S-33 and cost a
+ * review round.
+ *
+ * So this is the **second** copy, and `.claude/rules/constants.md` asks for promotion *before the
+ * third*. That is the same threshold T-046 applied when it promoted `x-tenant-id` to
+ * `@telemetry/shared-types` -- it promoted at the third copy, not the second (S-39).
+ *
+ * Importing billing's constant directly is not the alternative: that would couple this service's
+ * compile to another service's internals, which is the objection S-27 records for
+ * `RESERVED_STREAM_FIELDS`.
+ *
+ * What replaces the import is a **mechanical** check rather than a convention:
+ * `tests/billing-client.service.unit.test.ts` reads `apps/billing-service/src/constants.ts` off
+ * disk and asserts the two values are identical. That is the same shape
+ * `apps/billing-service/tests/env.schema.unit.test.ts` already uses to keep its port in step
+ * with `docker-compose.yml` and `apps/gateway/.env.example`, so it introduces no new pattern. A
+ * one-character edit to either side turns that case red; nothing caught the equivalent drift for
+ * `x-tenant-id`, which is why S-39 exists.
+ */
+export const WORKER_BILLING_CLIENT = {
+  /** Must equal `BILLING_ROUTES.INTERNAL_BILLING_GENERATE`. Asserted against the file on disk. */
+  GENERATE_PATH: "/v1/internal/billing/generate",
+  METHOD_POST: "POST",
+  HEADER_CONTENT_TYPE: "content-type",
+  CONTENT_TYPE_JSON: "application/json",
+  /** The shared internal-auth header, from `@telemetry/shared-types`. Not re-typed. */
+  HEADER_INTERNAL_SECRET: INTERNAL_AUTH_HEADERS.INTERNAL_SECRET,
+  /**
+   * Per-request ceiling on the call to billing-service.
+   *
+   * Without one a hung billing-service wedges the whole nightly loop: the job is sequential, so
+   * one unresponsive tenant call stalls every tenant after it, indefinitely. `fetch` has no
+   * default timeout. 10 s against a `DRAIN_TIMEOUT_MS` of 3 000 is deliberate — the drain is the
+   * budget for *stream* work, and a billing round trip is not stream work; what bounds an
+   * in-flight job at shutdown is `bullWorker.close()`, which is discussed in `WORKER_INVOICE_JOB`.
+   */
+  TIMEOUT_MS: 10_000,
+  /** `201` when billing created a draft invoice. */
+  HTTP_STATUS_CREATED: 201,
+  /**
+   * `200` when billing returned an existing invoice for the period, **or** when the tenant had
+   * nothing billable (`{ data: { invoiceId: null } }`).
+   *
+   * Both are successes for this caller, which is what makes an over-inclusive tenant list
+   * harmless and an under-inclusive one expensive — the asymmetry decision D1 turns on.
+   */
+  HTTP_STATUS_OK: 200,
+  ERROR: {
+    /** Prefix for a non-2xx reply. The status and, if present, billing's `code` are appended. */
+    UNEXPECTED_STATUS: "billing-service rejected the invoice request",
+    /** What a transport failure or an `AbortSignal.timeout` fires becomes. */
+    REQUEST_FAILED: "billing-service request failed",
+    SEPARATOR: ": "
+  }
+} as const;
+
+/**
+ * The nightly invoice-generation job and its BullMQ topology (T-042, S7/S8).
+ *
+ * Every member here is a value that would otherwise be a literal in a queue call or a spec file,
+ * and `.claude/rules/constants.md` applies to tests too — there is no bare `"0 2 * * *"` in this
+ * package.
+ *
+ * ## Why `TIMEZONE` is not optional
+ *
+ * `RepeatOptions.tz` exists in bullmq's published types, and omitted, `cron-parser` evaluates
+ * the pattern in the **process** local zone. On this development host that is UTC+5:30
+ * (`Intl.DateTimeFormat().resolvedOptions().timeZone` -> `Asia/Calcutta`), so `"0 2 * * *"`
+ * would fire at **20:30 UTC** — silently shifting the very day boundary the resolver's `text`
+ * parameters exist to protect, and on CI (UTC) it would look correct. Setting it explicitly is
+ * the cheapest of the two fixes and the only one that does not depend on where the container
+ * runs.
+ *
+ * ## Why the queue gets its own Redis connection, and its own prefix
+ *
+ * BullMQ's `RedisConnection` **throws** on an existing client instance whose
+ * `maxRetriesPerRequest` is truthy when the connection is blocking, and `container.redis` is
+ * built with `maxRetriesPerRequest: 2`. Passing connection *options* instead lets BullMQ set
+ * `maxRetriesPerRequest: null` itself on the branch that expects to. Namespacing likewise goes
+ * through BullMQ's own `prefix`: the same constructor throws
+ * `BullMQ: ioredis does not support ioredis prefixes, use the prefix option instead.` on an
+ * ioredis `keyPrefix`. Both were read out of the published tarball at Gate 1 and **reproduced
+ * against the installed package at Gate 3**; see `tests/invoice-generation.queue.unit.test.ts`.
+ *
+ * `QUEUE_PREFIX` is not BullMQ's `'bull'` default, so the queue's keys are distinguishable from
+ * any other BullMQ user's on the same logical database — production keeps db 0, where
+ * `telemetry:events` lives, and the prefix is what separates them.
+ */
+export const WORKER_INVOICE_JOB = {
+  QUEUE_NAME: "invoice-generation",
+  JOB_NAME: "generate-daily-invoices",
+  /** Stable id for the repeatable scheduler, so an upsert on restart replaces rather than adds. */
+  SCHEDULER_ID: "daily-invoice-generation",
+  /** 02:00, evaluated in `TIMEZONE` and not in the process zone. */
+  CRON_PATTERN: "0 2 * * *",
+  TIMEZONE: "UTC",
+  QUEUE_PREFIX: "telemetry:bull",
+  /**
+   * BullMQ retries are an **option, not a default** — the epic's "BullMQ handles retries with
+   * exponential backoff" describes behaviour that does not exist without these two settings.
+   * Reported as an epic-vs-code divergence rather than assumed.
+   *
+   * Three attempts, because the job only *fails* when the enumeration itself failed (D5): a
+   * per-tenant failure is reported in the summary and left for the next night, since retrying
+   * the whole job would re-call every tenant that already succeeded.
+   */
+  ATTEMPTS: 3,
+  BACKOFF_TYPE: "exponential",
+  BACKOFF_DELAY_MS: 60_000,
+  /** One nightly job; no reason to run two of anything concurrently. */
+  CONCURRENCY: 1,
+  /**
+   * BullMQ's own event name for a job that has exhausted `ATTEMPTS`.
+   *
+   * A constant rather than a literal because `Q9` asserts the registration by *finding* it among
+   * the recorded `worker.on(...)` calls, so the name is written in two places and
+   * `.claude/rules/constants.md` applies to tests as well as to source.
+   */
+  EVENT_FAILED: "failed",
+  /** How many finished jobs BullMQ keeps, so the queue does not grow without bound. */
+  REMOVE_ON_COMPLETE: 30,
+  REMOVE_ON_FAIL: 90,
+  /**
+   * How many UTC days back the billing window starts — consumed as
+   * `Date.UTC(year, month, day - PREVIOUS_DAY_OFFSET)`, so the window is
+   * `[yesterday 00:00Z, today 00:00Z)`.
+   *
+   * `Date.UTC` normalises an out-of-range day, so this is a **day** offset, not a millisecond
+   * one -- `day - 1` on the 1st of a month yields the last day of the previous month without any
+   * arithmetic here. The production path multiplies nothing:
+   * `grep -rn "86400000\|24 \* 60" apps/worker-service/src` returns only this comment (which
+   * matches itself). The one `24 * 60 * 60 * 1000` in the package is
+   * `MILLISECONDS_PER_DAY` at `tests/invoice-generation.job.unit.test.ts:30`, used by `J5` to
+   * assert the window is exactly one day wide -- an independent check of the result rather than
+   * a second copy of the derivation, which is what makes it worth having.
+   *
+   * The docblock that stood here read "number of hours in a day, and the number of milliseconds
+   * in one", describing a shape that was never shipped.
+   */
+  PREVIOUS_DAY_OFFSET: 1,
+  LOG: {
+    STARTED: "Invoice generation job started",
+    ENUMERATED: "Enumerated tenants with unbilled usage",
+    TENANT_SUCCEEDED: "Requested invoice generation for tenant",
+    TENANT_FAILED: "Invoice generation failed for tenant",
+    COMPLETED: "Invoice generation job completed",
+    ENUMERATION_FAILED: "Invoice generation job could not enumerate tenants",
+    SCHEDULED: "Invoice generation scheduler registered",
+    JOB_FAILED: "Invoice generation job failed"
+  }
+} as const;

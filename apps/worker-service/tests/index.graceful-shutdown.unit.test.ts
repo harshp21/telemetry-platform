@@ -210,12 +210,18 @@ describe("graceful shutdown (worker-service)", () => {
     processorHandler: ReturnType<typeof vi.fn>;
     buildHandler: ReturnType<typeof vi.fn>;
     wrappedMessageHandler: ReturnType<typeof vi.fn>;
+    queueConstructor: ReturnType<typeof vi.fn>;
+    queueRegisterSchedule: ReturnType<typeof vi.fn>;
+    queueClose: ReturnType<typeof vi.fn>;
     releaseMessageHandler: () => void;
   }> => {
     const logger = {
       info: vi.fn(),
       error: vi.fn()
     };
+    const queueConstructor = vi.fn();
+    const queueRegisterSchedule = vi.fn().mockResolvedValue(undefined);
+    const queueClose = vi.fn().mockResolvedValue(undefined);
     const prismaDisconnect = vi.fn().mockResolvedValue(undefined);
     const redisDisconnect = vi.fn();
     const appClose = options?.closeError
@@ -358,7 +364,9 @@ describe("graceful shutdown (worker-service)", () => {
           duplicate: redisDuplicate
         },
         eventProcessor: { buildHandler },
-        messageHandler: wrappedMessageHandler
+        messageHandler: wrappedMessageHandler,
+        billingEnumerationRepository: { listTenantsWithUnbilledUsage: vi.fn() },
+        billingClient: { generateInvoice: vi.fn() }
       },
       close: appClose,
       listen: appListen
@@ -371,6 +379,20 @@ describe("graceful shutdown (worker-service)", () => {
     }));
     vi.doMock("../src/app", () => ({
       buildWorkerServiceApp: buildApp
+    }));
+    // T-042: `start()` now constructs a BullMQ queue. Mocked rather than let through, and not as
+    // a convenience: a real `Worker` begins consuming the moment it is constructed, so an
+    // unmocked one would have this *unit* suite open a blocking read against a real Redis --
+    // exactly the escape `tests/setup.ts`'s docblock exists to record. The spies are what `U87`
+    // asserts ordering with.
+    vi.doMock("../src/queues/invoice-generation.queue", () => ({
+      InvoiceGenerationQueue: class {
+        registerSchedule = queueRegisterSchedule;
+        close = queueClose;
+        constructor(...args: unknown[]) {
+          queueConstructor(...args);
+        }
+      }
     }));
 
     vi.spyOn(process, "on").mockImplementation(
@@ -424,6 +446,9 @@ describe("graceful shutdown (worker-service)", () => {
       processorHandler,
       buildHandler,
       wrappedMessageHandler,
+      queueConstructor,
+      queueRegisterSchedule,
+      queueClose,
       releaseMessageHandler: () => releaseMessageHandler?.()
     };
   };
@@ -606,6 +631,46 @@ describe("graceful shutdown (worker-service)", () => {
     expect(exitCodes).toContain(0);
   });
 
+  it("U87 - closes the BullMQ worker before stopping the stream consumer", async () => {
+    // **S-35's inherited obligation, discharged.** `docs/epics/epic-7-worker-service.md`'s
+    // T-043 snippet calls `await bullWorker.close()` in this handler; T-043 deliberately did not
+    // implement it, because there was no BullMQ dependency to close, and recorded the forward
+    // obligation on this task.
+    //
+    // **Before** `streamConsumer.stop()`, so the scheduler stops producing work before the
+    // consumer drains what it already holds. Asserted by *invocation order* rather than by two
+    // independent `toHaveBeenCalled()` checks, which pass in either order and so would not
+    // assert the thing this case is named for -- the same shape `U31` and `U86` use, and the
+    // mutation that establishes it is moving the `close()` call below `stop()` in
+    // `src/index.ts`, which turns this case red and leaves the rest of the file green.
+    const context = await setupIndexModule();
+    await waitForFirstRead(context.readXreadgroup);
+
+    signalHandlers.SIGTERM?.();
+    await waitForProcessExit();
+
+    const queueCloseOrder = context.queueClose.mock.invocationCallOrder[0];
+    const consumerStopOrder = context.readDisconnect.mock.invocationCallOrder[0];
+    expect(queueCloseOrder, "bullWorker.close() was never called").toBeDefined();
+    expect(consumerStopOrder, "streamConsumer.stop() never disconnected the read").toBeDefined();
+    expect(queueCloseOrder).toBeLessThan(consumerStopOrder as number);
+    expect(exitCodes).toContain(0);
+  });
+
+  it("U88 - registers the nightly schedule before binding the HTTP listener", async () => {
+    // Same argument `U7` makes for the consumer group: a worker answering `/health` while its
+    // scheduler does not exist reports healthy and invoices nobody. Failures propagate out of
+    // `start()` into the `.catch` that exits non-zero, so this is fail-closed in the same sense
+    // T-038's D3 chose for the group bootstrap.
+    const context = await setupIndexModule();
+
+    const scheduleOrder = context.queueRegisterSchedule.mock.invocationCallOrder[0];
+    const listenOrder = context.appListen.mock.invocationCallOrder[0];
+    expect(scheduleOrder, "the nightly schedule was never registered").toBeDefined();
+    expect(listenOrder, "the HTTP listener never bound").toBeDefined();
+    expect(scheduleOrder).toBeLessThan(listenOrder as number);
+  });
+
   it("U86 - a SIGTERM arriving mid-handler does not exit until the handler has settled", async () => {
     // **AC3 at the process level.** `U73` proves `StreamConsumer.stop()` waits for the loop;
     // this proves the wait reaches the thing that matters — `process.exit(0)` — through
@@ -660,6 +725,15 @@ describe("graceful shutdown (worker-service)", () => {
     // 4 of 5 runs at `STREAM_BLOCK_MS=20` and 0 of 4 at 500 and 5000. Both had been written by
     // the time the exit ran here, because `stop()` now awaits the loop and the loop writes them
     // in its `finally` before resolving.
+    //
+    // **Scope, and it is narrower than it reads (S-26's T-042 addendum).** `queueClose` is
+    // `vi.fn().mockResolvedValue(undefined)`, so the handler never pauses before `stop()`. In a
+    // real process with a nightly job in flight it pauses for as long as the job takes, the
+    // parked read expires by itself after `STREAM_BLOCK_MS`, and
+    // `"Stream read interrupted by shutdown"` is then **never written** — measured over two real
+    // `SIGTERM` runs at `grep -c` → `0`, against `1` on an idle queue. This case is correct about
+    // what `stop()` does; do not read a green `U86` as evidence that a shutting-down worker
+    // always says both of these lines. The same caveat already sits on `U14`, `U24` and `U26`.
     //
     // The literals are the S-26 wording, written out rather than imported: the claim is about
     // *these* lines reaching a shutting-down process's output, and sourcing them from the

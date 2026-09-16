@@ -145,8 +145,21 @@ services:
         SERVICE_NAME: worker-service
     environment:
       <<: *common-app-env
+      # worker-service has its own least-privilege role rather than the shared telemetry_app:
+      # it is the only role granted EXECUTE on the cross-tenant unbilled-usage resolver, which
+      # reads past the "UsageLine" tenant policy by design (T-042). Created by
+      # docker/postgres/init/01-app-role.sql on first container start.
+      #
+      # The resolver itself is NOT created in this stack -- nothing here runs migrations, and
+      # the tables do not exist either -- so worker's database paths, including the nightly
+      # invoice job, are non-functional in compose. /health, the only thing test:smoke:compose
+      # exercises, does not touch the database.
+      DATABASE_URL: postgresql://telemetry_worker_app:telemetry_worker_app_local_dev@postgres:5432/telemetry
       PORT: "3003"
       INTERNAL_API_SECRET: ci-internal-api-secret-with-at-least-32-chars
+      # Same value gateway holds at :175 below. Required by worker's env schema with no default,
+      # so a worker without it does not start.
+      BILLING_SERVICE_URL: http://billing-service:3004
     ports:
       - "3003:3003"
     depends_on:

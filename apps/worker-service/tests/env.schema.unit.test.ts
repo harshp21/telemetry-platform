@@ -38,13 +38,21 @@ const EXPECTED_DEFAULT_CONSUMER_NAME = `${hostname()}-${process.pid}`;
 const VALID_INTERNAL_API_SECRET = "t-037-worker-internal-secret-at-least-32-chars";
 const OTHER_VALID_INTERNAL_API_SECRET = "t-037-worker-other-secret-at-least-32-chars";
 
+/** A well-formed absolute URL, matching the value `docker/docker-compose.yml` sets. */
+const VALID_BILLING_SERVICE_URL = "http://billing-service:3004";
+
 const buildBaseEnv = (): Record<string, string> => ({
   NODE_ENV: "test",
   DATABASE_URL: "postgresql://telemetry_app:telemetry_app_local_dev@localhost:5432/telemetry",
   REDIS_URL: "redis://localhost:6379",
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318",
   LOG_LEVEL: "silent",
-  INTERNAL_API_SECRET: VALID_INTERNAL_API_SECRET
+  INTERNAL_API_SECRET: VALID_INTERNAL_API_SECRET,
+  // T-042: required with no default, so every fixture built from this needs it. Present here
+  // rather than defaulted in the schema deliberately -- a default would be a guess at another
+  // service's address, and the failure mode of guessing wrong is a nightly job that quietly
+  // invoices nobody.
+  BILLING_SERVICE_URL: VALID_BILLING_SERVICE_URL
 });
 
 const buildEnvWithout = (omittedKey: string): Record<string, string> => {
@@ -638,6 +646,58 @@ describe("worker-service env schema", () => {
         EnvSchema.safeParse(buildEnvWithout("OTEL_EXPORTER_OTLP_ENDPOINT")),
         "OTEL_EXPORTER_OTLP_ENDPOINT"
       );
+    });
+
+    // T-042. Required with no default: `parseEnv` throws at module load, so a worker that has
+    // no billing address fails to start rather than discovering it at 02:00, on a path with no
+    // alarm behind it.
+    it("rejects an env with no BILLING_SERVICE_URL", () => {
+      expectIssueOn(
+        EnvSchema.safeParse(buildEnvWithout("BILLING_SERVICE_URL")),
+        "BILLING_SERVICE_URL"
+      );
+    });
+
+    // `.url()` rather than `.min(1)`: this value is concatenated with a path constant, so a
+    // relative or malformed value would build a URL `fetch` rejects at the first nightly run and
+    // at no earlier moment.
+    //
+    // **What `.url()` does not give, measured rather than assumed.** On zod 3.25.76 it delegates
+    // to `new URL(...)`, which accepts *any* scheme -- so `"billing-service:3004"` parses, as a
+    // URL whose protocol is `billing-service:`. Written here as an accepted value rather than an
+    // omitted one, because a reader who sees only the rejected list will take the field for
+    // http-only. The three genuinely-rejected forms are the ones an operator is likely to
+    // produce by truncation.
+    //
+    // Not tightened to `^https?:` deliberately: `apps/gateway/src/config/env.ts` declares the
+    // same field name as a bare `.url()`, and one service enforcing a stricter rule than the
+    // other on the same operator-supplied value is exactly the producer/consumer divergence S-23
+    // and S-39 are about. If it is worth tightening it is worth tightening in one shared
+    // fragment, which is its own task.
+    it("rejects the malformed BILLING_SERVICE_URL forms, but accepts any scheme", () => {
+      for (const invalid of ["not a url", "/v1/internal", ""]) {
+        expectIssueOn(
+          EnvSchema.safeParse({ ...buildBaseEnv(), BILLING_SERVICE_URL: invalid }),
+          "BILLING_SERVICE_URL"
+        );
+      }
+
+      const anyScheme = EnvSchema.safeParse({
+        ...buildBaseEnv(),
+        BILLING_SERVICE_URL: "billing-service:3004"
+      });
+      expect(anyScheme.success).toBe(true);
+    });
+
+    it("accepts the compose and local forms of BILLING_SERVICE_URL", () => {
+      for (const valid of [VALID_BILLING_SERVICE_URL, "http://localhost:3004", "https://billing.internal"]) {
+        const parsed = EnvSchema.safeParse({ ...buildBaseEnv(), BILLING_SERVICE_URL: valid });
+
+        expect(parsed.success, `${valid} was rejected`).toBe(true);
+        if (parsed.success) {
+          expect(parsed.data.BILLING_SERVICE_URL).toBe(valid);
+        }
+      }
     });
   });
 

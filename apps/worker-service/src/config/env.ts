@@ -13,6 +13,25 @@ export const EnvSchema = z.object({
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().min(1),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().min(1),
+  // billing-service's base URL, for the nightly invoice job's call into
+  // `POST /v1/internal/billing/generate` (T-042). `z.string().url()` and no default, matching
+  // gateway's declaration at `apps/gateway/src/config/env.ts:17` -- gateway is the only other
+  // service that holds this field, and it declares it the same way. Required rather than
+  // optional: `parseEnv` throws at module load, so a worker that cannot reach billing never
+  // reaches `app.listen` rather than discovering it at 02:00.
+  //
+  // `.url()` rather than `.min(1)` because this value is concatenated with a path constant, so a
+  // relative or malformed value builds a URL `fetch` rejects at the first nightly run and at no
+  // earlier moment.
+  //
+  // **Scope of `.url()`, measured rather than assumed** (zod 3.25.76): it delegates to
+  // `new URL(...)` and therefore accepts *any* scheme -- `"billing-service:3004"` parses, with
+  // protocol `billing-service:`, while `"not a url"`, `"/v1/internal"` and `""` are rejected. So
+  // this guards against truncation, not against a wrong scheme. Not tightened to `^https?:`
+  // here: `apps/gateway/src/config/env.ts:17` declares the same field name as a bare `.url()`,
+  // and one service enforcing a stricter rule than the other on the same operator-supplied value
+  // is the divergence S-23 and S-39 are about. Pinned in `tests/env.schema.unit.test.ts`.
+  BILLING_SERVICE_URL: z.string().url(),
   LOG_LEVEL: z.string().default("info"),
   // Service-to-service auth (S-8 item 2). Required with no default: `parseEnv` throws at module
   // load, so a worker-service that cannot authenticate its callers never reaches `app.listen`,

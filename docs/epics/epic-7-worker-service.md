@@ -208,6 +208,12 @@ recorded in the plan's §4:
 **File**: `apps/worker-service/src/jobs/invoice-generation.job.ts`
 **Milestone**: v1
 
+> **The snippet and the File: line below are wrong in six ways — read the "What T-042 shipped"
+> block after them before writing code from this section.** Recorded as `.claude/rules/known-gaps.md`
+> **S-42**. This forward reference sits here because S-32 records that T-041's correction block,
+> placed only at the end of its section, was never reached by a reader who greps for the file path
+> and lands on the wrong line.
+
 **Story**: A scheduled BullMQ job runs at 02:00 UTC daily. It queries all tenants with unbilled `UsageLine` records from the previous calendar day and triggers billing-service via internal HTTP.
 
 ```ts
@@ -230,6 +236,35 @@ async function invoiceGenerationJob(job: Job): Promise<void> {
 ```
 
 **Error handling**: BullMQ handles retries with exponential backoff. Log each tenant result separately — one failure should not block other tenants.
+
+### What T-042 shipped differs from the snippet above in six ways
+
+Full detail, with the measurements, in `.claude/rules/known-gaps.md` **S-42**. In brief:
+
+1. **Five files, not one.** The **File:** line names only the job. The task also shipped
+   `src/queues/invoice-generation.queue.ts`, `src/services/billing-client.service.ts`,
+   `src/repositories/billing-enumeration.repository.ts` and
+   `prisma/migrations/v1_7_worker_billing_enumerator/migration.sql`.
+2. **`getTenantsWithUnbilledUsage` cannot be written as implied.** As `telemetry_app` with no
+   tenant context, `SELECT DISTINCT "tenantId" FROM "UsageLine" WHERE billed = false` returns
+   **zero rows** — RLS forbids the cross-tenant read. T-042 built the exception: a
+   `SECURITY DEFINER` resolver returning `SETOF text`, owned by a `NOLOGIN NOSUPERUSER
+   NOBYPASSRLS` role reading past the policy through one targeted `FOR SELECT` policy, with
+   `EXECUTE` granted to a new fourth application role `telemetry_worker_app` alone. That role is
+   what worker-service now connects as, and it needs an **ordered deploy**:
+   `docs/releases/t-042-worker-billing-enumerator.md`.
+3. **Constructor injection, not a free function over module scope.** `billingServiceUrl` and
+   `env` in the snippet are captured from nowhere.
+4. **`getPreviousDayRange()` returns exactly `periodStart` and `periodEnd`**, which is what
+   `generateInvoiceRequestSchema` requires — the snippet's spread only works for those two names,
+   and the snippet never says so.
+5. **Retries are configured, not inherited.** `attempts` and `backoff` are per-job options;
+   without them a failed job is not retried at all.
+6. **The call has a timeout and checks the status.** `fetch` has no default timeout and the loop
+   is sequential; the snippet ignores the reply, so a `500` would count as a billed tenant.
+
+Also: the repeat schedule sets `tz: "UTC"` explicitly. Omitted, `cron-parser` evaluates
+`"0 2 * * *"` in the **process** zone, which on a UTC+5:30 host fires at 20:30 UTC.
 
 > ### Obligation inherited from T-043 — `bullWorker.close()`
 >

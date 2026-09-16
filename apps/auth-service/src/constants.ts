@@ -75,6 +75,23 @@ export const AUTH_DATABASE = {
   DEFINER_REFRESH_TOKEN_READ_POLICY: "refreshtoken_auth_definer_read",
   AUTH_APP_ROLE: "telemetry_auth_app",
   SHARED_APP_ROLE: "telemetry_app",
+  // The T-042 names, here rather than in worker-service because
+  // `tests/rls.integration.test.ts` is the platform's *standing* assertion about
+  // `SECURITY DEFINER` functions -- `.claude/rules/tenant-isolation.md` names that suite as
+  // what catches a missing revoke -- and it asserts the **exact set**, so it has to know every
+  // definer function on the platform, not only auth's two. Adding a third `prosecdef` function
+  // in `public` turns that case red by design, which is how `v1_7` was discovered here on
+  // purpose rather than by a full-gate run.
+  //
+  // Test-only, like `SHARED_APP_ROLE` and `DEFINER_ROLE` above, which no `src/` file reads
+  // either; kept in this object so there is one vocabulary for these names rather than a
+  // second, test-local one. They must match `WORKER_DATABASE` in
+  // `apps/worker-service/src/constants.ts`; there is no import across service boundaries, and
+  // the values are asserted against the live catalog on every run, which is what would catch a
+  // drift.
+  WORKER_APP_ROLE: "telemetry_worker_app",
+  WORKER_DEFINER_ROLE: "telemetry_worker_definer",
+  WORKER_RESOLVE_UNBILLED_TENANTS_FN: "public.worker_resolve_tenants_with_unbilled_usage",
   // Prisma's unique-constraint error code, the backstop for a concurrent registration that
   // wins the race between the duplicate-email pre-check and the insert.
   UNIQUE_VIOLATION_CODE: "P2002",

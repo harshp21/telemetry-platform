@@ -42,6 +42,13 @@ const start = async (): Promise<void> => {
 	// `stream.consumer.ts` pulls in `./constants`, which pulls in `@telemetry/shared-types`.
 	// Only `startup.constants.ts` may load before `initTracing(...)`.
 	const { StreamConsumer } = await import("./events/stream.consumer");
+	// T-042, dynamically imported for the same reason: `./queues/invoice-generation.queue` pulls
+	// in `./constants`, and only `startup.constants.ts` may load before `initTracing(...)`.
+	// It is constructed here rather than in `createContainer()` because a BullMQ `Worker` begins
+	// consuming the moment it is constructed, so building one inside the container would have
+	// every unit test that touches the container open a blocking read against a real Redis.
+	const { InvoiceGenerationQueue } = await import("./queues/invoice-generation.queue");
+	const { runInvoiceGenerationJob } = await import("./jobs/invoice-generation.job");
 	const app = buildWorkerServiceApp();
 	const container = app.container;
 	// Renamed from `isShuttingDown`, which meant something different from both the exported
@@ -54,11 +61,55 @@ const start = async (): Promise<void> => {
 	// `const` from its temporal dead zone would throw a `ReferenceError` out of the shutdown
 	// path. The `?.` is the same guard for the same window.
 	let streamConsumer: InstanceType<typeof StreamConsumer> | undefined;
+	// Same `let ... | undefined` shape and the same reason: a signal arriving before the
+	// construction below runs `shutdown` first, and reading a `const` from its temporal dead zone
+	// would throw a `ReferenceError` out of the shutdown path.
+	let invoiceQueue: InstanceType<typeof InvoiceGenerationQueue> | undefined;
 
 	const shutdown = async (signal: string): Promise<void> => {
 		shuttingDown = true;
 		container.logger.info({ signal }, "Shutting down gracefully");
 		try {
+			// T-042, and **before** `streamConsumer.stop()`: the scheduler must stop producing
+			// work before the consumer drains what it already holds. This is the obligation S-35
+			// recorded against T-042 -- `docs/epics/epic-7-worker-service.md`'s T-043 snippet
+			// calls `await bullWorker.close()` here, and T-043 deliberately did not implement it
+			// because no BullMQ dependency existed to close. `U87` asserts the order by
+			// invocation order; moving this line below `stop()` turns that case red and leaves
+			// the rest of the file green.
+			//
+			// **This is the third unbounded wait, not a fourth thing inside the drain's budget.**
+			// `close()` waits for an in-flight job, which here is a nightly billing run that may
+			// be mid-HTTP-call, and BullMQ's `close()` carries no timeout of its own. Because it
+			// happens *before* `stop()`, the drain's own `DRAIN_TIMEOUT_MS` budget is unchanged;
+			// what grows is total shutdown time. Left unbounded deliberately, and the bound that
+			// exists is the one that matters: every HTTP call the job makes carries
+			// `AbortSignal.timeout(WORKER_BILLING_CLIENT.TIMEOUT_MS)`, so the wait is at most one
+			// in-flight tenant's timeout plus the remaining tenants' -- not indefinite. Adding a
+			// race here would mean returning while a job still holds a BullMQ lock, and BullMQ
+			// would then redeliver that job to the next instance; since the job is idempotent
+			// through billing's endpoint that is survivable, but it trades a bounded wait for
+			// duplicate work and was not chosen.
+			//
+			// **The worst case, with a number, because "unbounded" was accepted without one.**
+			// `TIMEOUT_MS` (10 000) x the tenants still to be called, sequentially. Measured with
+			// a real `SIGTERM` against a real process whose billing calls hang against a stub
+			// that accepts and never replies, on Redis db 14 (T-042 Gate 5, re-measured at the
+			// Gate-3 rework): SIGTERM to exit was **9 116 ms at one tenant** and **19 106 /
+			// 19 079 ms at two**, against **36-39 ms idle**, with the job never truncated, every
+			// per-tenant outcome logged, the summary emitted and exit code 0. Roughly 10 s per
+			// remaining tenant, which is the formula rather than a curve fitted to two points:
+			// the per-tenant timeouts are serial and each failure line lands 10.00 s after the
+			// previous one.
+			//
+			// So a deployment's termination grace period must exceed
+			// `TIMEOUT_MS x tenants_with_unbilled_usage` or the run is `SIGKILL`ed part way. At
+			// Kubernetes' default 30 s that is three tenants -- arithmetic from the formula above,
+			// not a run anybody made at three. The decision stays "unbounded" --
+			// the alternative loses the in-flight job's lock -- but it is now a decision with its
+			// worst case written down rather than an open end. Revisit when a nightly run's
+			// tenant count approaches the grace period, not before.
+			await invoiceQueue?.close();
 			// Before `app.close()`, and the order is measured, not stylistic. `app.close()`
 			// fires the `onClose` hook at `app.ts:32-36`, which calls `quit()`; `quit()` waits
 			// for an in-flight blocking read to return on its own, while the `disconnect()`
@@ -77,7 +128,11 @@ const start = async (): Promise<void> => {
 			// `quit()` first would add the block interval *on top of* the drain.
 			//
 			// **Bounded by `DRAIN_TIMEOUT_MS` plus two unbounded round trips, not by
-			// `DRAIN_TIMEOUT_MS` alone.** The drain is bounded; the `XINFO CONSUMERS` and
+			// `DRAIN_TIMEOUT_MS` alone** -- and since T-042 there is a **third** unbounded wait,
+			// `invoiceQueue.close()`, which happens *before* this line and is described at its
+			// own call site. The count in this sentence was two when it was written and the diff
+			// that added the third had to correct it; do not copy it forward without re-reading
+			// the handler. The drain is bounded; the `XINFO CONSUMERS` and
 			// `XGROUP DELCONSUMER` that follow it carry no timeout of their own. What bounds those
 			// is the container client's `maxRetriesPerRequest: 2` (`src/config/container.ts`),
 			// which covers the *unreachable* server — measured against a port nothing listens on,
@@ -100,9 +155,11 @@ const start = async (): Promise<void> => {
 			// `tests/index.graceful-shutdown.unit.test.ts`, because `run()` does not return while
 			// the loop is running and `listen` is then never reached. Holding the loop promise
 			// inside `StreamConsumer` instead puts the drain behind a call this line already
-			// awaits. (S-26 cites that failure as `Tests 10 failed | 2 passed (12)`; the file held
-			// **14** tests at `fc66bd3` and holds 15 now, so the parenthesised total is stale --
-			// the direction of the finding is not.)
+			// awaits. (S-26 cites that failure as `Tests 10 failed | 2 passed (12)`; that file held
+			// **14** cases at `fc66bd3` and has gained cases in every task since, so the
+			// parenthesised total is stale and is deliberately not restated here -- a current
+			// count would be stale again at the next task. The shape of the failure is the
+			// durable part; the total is not.)
 			await streamConsumer?.stop();
 			await app.close();
 			await container.prisma.$disconnect();
@@ -195,6 +252,26 @@ const start = async (): Promise<void> => {
 	// network round trip, so any microtask count understates the gap rather than bounding it.
 	// The direction -- read after listen -- was right and is what `U25` asserts.
 	void streamConsumer.run();
+
+	// T-042. Registered *before* `app.listen`, on the same argument the group bootstrap above
+	// makes: a worker answering `/health` while its scheduler does not exist reports healthy and
+	// invoices nobody. Fail-closed -- an unreachable Redis propagates out of `start()` into the
+	// `.catch` below, which exits non-zero.
+	//
+	// The job's collaborators come from the container; only the queue itself is built here, and
+	// only because constructing a BullMQ `Worker` starts it. `U88` asserts the ordering and
+	// `U87` the shutdown half.
+	invoiceQueue = new InvoiceGenerationQueue({
+		env: container.env,
+		logger: container.logger,
+		run: () =>
+			runInvoiceGenerationJob({
+				enumeration: container.billingEnumerationRepository,
+				billingClient: container.billingClient,
+				logger: container.logger
+			})
+	});
+	await invoiceQueue.registerSchedule();
 
 	const port = Number(process.env.PORT ?? WORKER_SERVICE_STARTUP.DEFAULT_PORT);
 	await app.listen({ port, host: WORKER_SERVICE_STARTUP.HOST });

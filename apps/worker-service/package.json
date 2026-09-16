@@ -18,6 +18,7 @@
     "@telemetry/shared-types": "workspace:*",
     "@telemetry/shared-utils": "workspace:*",
     "@telemetry/shared-validation": "workspace:*",
+    "bullmq": "^6.3.6",
     "fastify": "^5.0.0",
     "ioredis": "^5.4.1",
     "pino": "^9.4.0",

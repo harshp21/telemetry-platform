@@ -62,6 +62,24 @@ const BILLING_ENV_EXAMPLE_URL = new URL("../.env.example", import.meta.url);
 const GATEWAY_ENV_EXAMPLE_URL = new URL("../../gateway/.env.example", import.meta.url);
 const DOCKER_COMPOSE_URL = new URL("../../../docker/docker-compose.yml", import.meta.url);
 const COMPOSE_BILLING_SERVICE_KEY = "billing-service";
+/**
+ * The compose services that hold a `BILLING_SERVICE_URL`, i.e. *other* services' view of
+ * billing's port.
+ *
+ * Two since T-042, which gave worker-service one so its nightly invoice job can reach
+ * `POST /v1/internal/billing/generate`. Before that there was exactly one and the locator below
+ * was file-scoped; the second copy made that locator throw
+ * `Expected exactly one BILLING_SERVICE_URL in docker-compose.yml; found 2`, which is the helper
+ * working as designed -- its message says to fix the locator, not the assertion. Scoping it per
+ * service block is the fix, and pinning **both** is strictly stronger than pinning one: a drift
+ * in worker's copy would 502 every nightly billing call exactly as a drift in gateway's would
+ * 502 every proxied request, and nothing else would notice either.
+ *
+ * Add a service here when it gains a `BILLING_SERVICE_URL`. The locator throws rather than
+ * skipping if a named block has none, so a service listed here and later stripped of the
+ * variable fails loudly rather than silently dropping out of the assertion.
+ */
+const COMPOSE_BILLING_CONSUMER_SERVICE_KEYS = ["gateway", "worker-service"] as const;
 
 /**
  * Locators that **throw** when they match anything other than exactly once.
@@ -145,7 +163,10 @@ describe("billing-service env schema", () => {
     //   - compose's `"3004:3004"` mapping is what a caller outside the container reaches, and
     //     is the one that fails silently -- the container still starts, the health check still
     //     passes inside, and nothing on the host can reach it;
-    //   - `BILLING_SERVICE_URL` in **both** of its homes, compose and `apps/gateway/.env.example`.
+    //   - `BILLING_SERVICE_URL` in each of its homes: `apps/gateway/.env.example`, and compose,
+    //     where T-042 took it from one service block to **two** by giving worker-service the
+    //     nightly invoice job's billing address. Both compose copies are pinned, per block --
+    //     the locator was file-scoped until that second copy made it throw.
     //     These are another service's configuration, which is a different *kind* of coupling
     //     (one service's view of another) but the same failure: move billing's port, redeploy,
     //     and every proxied `/v1/billing` request 502s. Gate 6 (M-1) caught the gateway
@@ -181,11 +202,15 @@ describe("billing-service env schema", () => {
         /^ +- "(\d+):(\d+)"$/gm,
         "published port mapping in docker-compose.yml billing-service ports"
       );
-      const [, gatewayUpstreamPort] = extractSoleMatch(
-        compose,
-        /^ +BILLING_SERVICE_URL: http:\/\/billing-service:(\d+)$/gm,
-        "BILLING_SERVICE_URL in docker-compose.yml"
-      );
+      const composeUpstreamPorts = COMPOSE_BILLING_CONSUMER_SERVICE_KEYS.map((serviceKey) => {
+        const [, port] = extractSoleMatch(
+          extractComposeServiceBlock(compose, serviceKey),
+          /^ +BILLING_SERVICE_URL: http:\/\/billing-service:(\d+)$/gm,
+          `BILLING_SERVICE_URL in docker-compose.yml ${serviceKey} environment`
+        );
+
+        return port;
+      });
       // Host-agnostic where compose's is not: compose addresses billing by its service name and
       // this file by `localhost`, and only the port is this case's business. Gateway's
       // `.env.example` holds exactly one `BILLING_SERVICE_URL` and one `3004` (checked), so
@@ -200,8 +225,21 @@ describe("billing-service env schema", () => {
       expect(composeEnvPort).toBe(expectedPort);
       expect(containerPort).toBe(expectedPort);
       expect(publishedPort).toBe(expectedPort);
-      expect(gatewayUpstreamPort).toBe(expectedPort);
+      for (const upstreamPort of composeUpstreamPorts) {
+        expect(upstreamPort).toBe(expectedPort);
+      }
       expect(gatewayEnvExamplePort).toBe(expectedPort);
+      // **Exhaustiveness, which the per-block loop above does not give.** That loop checks the
+      // two services named in `COMPOSE_BILLING_CONSUMER_SERVICE_KEYS`; a *third* consumer added
+      // to compose with a wrong port would satisfy every assertion above. Before T-042 this file
+      // ran one file-scoped `extractSoleMatch` over the whole compose file, which threw the
+      // moment a second `BILLING_SERVICE_URL` appeared -- and that is exactly how T-042
+      // discovered it had to add one. The per-block form is strictly better for the services it
+      // names; this line puts back the property that was traded away, so adding a consumer to
+      // compose without adding it to the constant reddens here rather than passing silently.
+      expect(compose.match(/^ +BILLING_SERVICE_URL:/gm) ?? []).toHaveLength(
+        COMPOSE_BILLING_CONSUMER_SERVICE_KEYS.length
+      );
     });
 
     // AC11

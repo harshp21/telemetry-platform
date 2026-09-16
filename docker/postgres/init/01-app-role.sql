@@ -1,5 +1,6 @@
--- Bootstraps the two least-privilege application roles in a fresh Postgres container:
--- telemetry_app (shared by five services) and telemetry_auth_app (auth-service only).
+-- Bootstraps the three least-privilege application roles in a fresh Postgres container:
+-- telemetry_app (shared by gateway, usage, billing and analytics), telemetry_auth_app
+-- (auth-service only) and telemetry_worker_app (worker-service only).
 --
 -- Why this exists as well as prisma/migrations/v1_4_app_role_non_superuser:
 -- nothing in docker/docker-compose.yml runs `prisma migrate deploy`, so a compose stack
@@ -14,7 +15,9 @@
 -- wins and the other is a no-op.
 --
 -- PARTIALLY mirrored: prisma/migrations/v1_5_auth_tenant_resolvers also creates
--- `telemetry_auth_definer` and the two SECURITY DEFINER resolvers it owns. Those are NOT
+-- `telemetry_auth_definer` and the two SECURITY DEFINER resolvers it owns, and
+-- prisma/migrations/v1_7_worker_billing_enumerator creates `telemetry_worker_definer`, its
+-- policy on "UsageLine" and the cross-tenant enumeration resolver. Those are NOT
 -- created here -- the resolver bodies are `LANGUAGE sql`, which PostgreSQL parses at CREATE
 -- time, and no tables exist when an init script runs; creating the definer role alone would
 -- leave an orphan owning nothing. `telemetry_auth_app` *is* created here, because it is an
@@ -93,3 +96,41 @@ END
 $$;
 
 GRANT USAGE ON SCHEMA "public" TO telemetry_auth_app;
+
+-- worker-service's own role (T-042). Created here for exactly the reason telemetry_auth_app is:
+-- nothing in this stack runs Prisma migrations, so without it the compose worker points at a
+-- role that does not exist and cannot connect at all. That failure would NOT be caught by
+-- `pnpm test:smoke:compose`, which only hits /health -- and /health touches no database.
+--
+-- Table privileges are deliberately NOT mirrored, on the same reasoning the block above gives:
+-- the migration grants DML on exactly "Event" and "UsageLine", which cannot be expressed here
+-- because no table exists when an init script runs, and a blanket ALTER DEFAULT PRIVILEGES would
+-- hand this role the whole schema -- the opposite of what the migration does. Neither the
+-- definer role nor the resolver is created here either (see the header), so worker's nightly
+-- invoice job is non-functional in a compose stack. So are its database paths generally, since
+-- the tables are absent too.
+DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'telemetry_worker_app') THEN
+		CREATE ROLE telemetry_worker_app
+			LOGIN
+			NOSUPERUSER
+			NOBYPASSRLS
+			NOCREATEDB
+			NOCREATEROLE
+			NOREPLICATION
+			PASSWORD 'telemetry_worker_app_local_dev';
+	END IF;
+END
+$$;
+
+DO $$
+BEGIN
+	EXECUTE format(
+		'GRANT CONNECT ON DATABASE %I TO telemetry_worker_app',
+		current_database()
+	);
+END
+$$;
+
+GRANT USAGE ON SCHEMA "public" TO telemetry_worker_app;

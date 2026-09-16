@@ -48,8 +48,17 @@ export interface PersistedUsageEvent {
  *
  * Stated as a decision rather than as a guarantee: nothing in the type system stops a future
  * `$queryRaw` in this service, and this plan does not claim a test that would catch one. The
- * check is `grep -rn '\$queryRaw' apps/worker-service/src` returning only `base.repository.ts`'s
- * `set_config`, and it is a review check.
+ * check is a review check, and **its expected output changed at T-042**:
+ * `grep -rln '\$queryRaw' apps/worker-service/src` now returns **three** files:
+ * `base.repository.ts` (the `set_config`), `billing-enumeration.repository.ts`, and **this
+ * file** -- which holds no `$queryRaw` at all and matches only because this sentence carries
+ * the pattern. That self-match is the S-33 sub-pattern, named here so the next reader does not
+ * spend a round on the off-by-one. The real count of call sites is two. The new one is not a
+ * counter-example to the rule above -- it binds two ISO **strings**, never a `Date`, against a
+ * resolver whose parameters are declared `text` and cast inside its own body, which is what
+ * keeps the comparison independent of the session zone. The rule this docblock states is "no
+ * bound `Date` in raw SQL", not "no raw SQL", and an earlier revision of this sentence named a
+ * grep whose result the very next task falsified.
  *
  * ## What idempotency does and does not buy
  *
