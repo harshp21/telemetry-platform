@@ -642,7 +642,8 @@ nullable one — and `InvoiceStatus` is exactly `DRAFT, FINALIZED, PAID` (probe 
 - [done] **MEDIUM-3 (D-A)** — tie-break mutation. Recorded here at the Gate-3 rework round 3
       answering Gate 6's `CHANGES REQUESTED`, and deliberately **smaller** than the two entries it
       replaces. What holds: deleting `{ [SORT_FIELD_ID]: desc }` from `INVOICE_LIST_ORDER_BY`
-      reddens **BU74c**, in every run at every gate — it asserts the `orderBy` structurally and
+      reddens **BU74c** in every run where its own outcome was recorded (14 of 20 in the
+      exploratory series) — it asserts the `orderBy` structurally and
       does not touch the database, and it is the guard. **BI16's redness is not reproducible**:
       four gates measured it four different ways on an unchanged tree with a byte-identical
       mutation, and Gate 6 observed it flip green→red between two consecutive runs with nothing
@@ -824,7 +825,8 @@ claim that anything was fixed.
 
 All six decisions stand as recorded: **D1** yes (route behind the guard), **D2** no (S-8 not folded
 in — and D3's finding means no middleware edit is needed, so it stays whole), **D3** `onRequest`
-for both hooks (**forced by measurement, not chosen**), **D4** `periodStart DESC, id DESC` — the
+for both hooks (**forced given this scope's tenant-context hook is `onRequest`** — three of the
+four pairings order correctly, so `onRequest` is not the unique answer), **D4** `periodStart DESC, id DESC` — the
 `id` tie-break is what makes pagination deterministic when two invoices share a period, **D5**
 normalize `Decimal` and `Date` in the repository (T-045's precedent), **D6** the epic-8 Q2 line
 fix folded into this commit. D4 was the only one offered as a preference; the other five were

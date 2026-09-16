@@ -1009,3 +1009,400 @@ No production code change is required by any of the above, and none of them can 
 result — but `apps/billing-service/tests/invoice.repository.unit.test.ts` is edited by items 1–3, so
 re-run `pnpm --filter @telemetry/billing-service test` after, and the root `--force` gate once
 before commit.
+
+---
+
+## Round 3 — retrospective close-out of Round 2's conditions
+
+**Verdict: `APPROVED FOR COMMIT` (retrospective).** All six of Round 2's required fixes are
+discharged, and I re-derived the two load-bearing ones by execution rather than by reading the
+diff. Three new findings, all **follow-up** — T-046 shipped as `5cb454a` and HEAD is `73e01ed`,
+so nothing here is a blocker and none of it is a code defect.
+
+**Revisions read.** `.claude/rules/known-gaps.md` at **HEAD (`73e01ed`)**, read from disk with
+`cat`/`sed` — the copy injected into this session ends at **S-39**, an instance of **S-24**, so it
+could not see S-40's or S-41's current text at all. `git diff 5cb454a 73e01ed -- .claude/rules/known-gaps.md`
+shows T-042 appended S-42–S-45 after S-41 and changed exactly one sentence inside S-40
+(`six` → `seven` for S-19's copy count), touching neither S-41 nor the passages Round 2 named. So
+quoting HEAD and quoting `5cb454a` are the same text for every line below except that one.
+
+---
+
+### The six conditions — discharged
+
+Verified by command on the shipped tree, not by reading the rework's account of itself.
+
+| # | Round-2 condition | Status | How established |
+|---|---|---|---|
+| 1 | HIGH-1 — delete the state→outcome run table | **discharged** | `grep -ci` on `invoice.repository.unit.test.ts` returns **0** for each of `Tests 1 failed`, `Tests 2 failed`, `green 4/4`, `reltuples`, `relpages`, `129`, `md5` |
+| 2 | HIGH-2 — delete the mechanism section | **discharged** | **0** for `EXPLAIN`, `Index Scan`, `Seq Scan`, `prefix`, `Sorting is necessary` |
+| 3 | MEDIUM-1 — drop "what 28 runs support" | **discharged** | **0** for `28 runs` and for `20 runs` |
+| 4 | MEDIUM-2 — S-40 concedes QA's `2e+307` | **discharged, re-measured** | below |
+| 5 | LOW-1 — condition the "forced" claim at `tenant-context.middleware.ts:10` | **discharged, re-measured** | below |
+| 6 | LOW-2 — exclude auth-service from the shared-types universal | **discharged** | `packages/shared-types/src/index.ts:83-91`; its own `grep -rn "x-tenant-id" apps/auth-service/src --include=*.ts` re-runs to nothing (exit 1) |
+| LOW-3 (non-blocking) | record F-3/F-4/F-5 | **discharged, beyond the ask** | `docs/plans/t-046-invoice-list-endpoint.md:785-816` dispositions all three; the D3 `toAmountString` note landed too, at `invoice.repository.ts:155-165` |
+
+**The deletions are deletions, not substitutions.** The surviving comment
+(`apps/billing-service/tests/invoice.repository.unit.test.ts:521-544`) claims no mechanism. It
+names the mutation and the case it reddens, says BI16's redness "is not reproducible", says "The
+cause is **not established**, and this comment deliberately does not offer one", lists the three
+refuted/unresolved observations explicitly *as* observations, and closes with the four superseded
+characterisations. That is the right shape.
+
+**The passage arguing against a behavioural case is gone, and BI16 was not weakened.** The only
+surviving mention is its inverse at `:530-532` — *"A behavioural case exists — BI16 — and its
+redness is not reproducible. **Do not delete it on the strength of a run in which it stayed
+green.**"* BI16's walk block (`apps/billing-service/tests/billing.integration.test.ts:944-955`) is
+intact: three single-row pages, `new Set(walked).size` and the sorted-id equality both still
+asserted.
+
+**S-41's title and body do state non-reproducibility with cause not established**
+(`.claude/rules/known-gaps.md:1877`, `:1893-1934`), and it **kept its own disclosure** — the
+`### This entry's own limitation` block at `:1965-1972` still records that the Gate-3 rework's
+pre-probe `pg_class` baseline for `"Invoice"` was not captured. I re-derived the one live claim in
+that section: `show shared_preload_libraries` → `""` and
+`select count(*) from pg_available_extensions where name='auto_explain'` → `0`, on
+PostgreSQL 16.13. S-41's `auto_explain` disclosure is true.
+
+**The plan's MEDIUM-3 entry no longer records the dichotomy as fact.**
+`docs/plans/t-046-invoice-list-endpoint.md:641-668` presents it as the second of two *superseded*
+records — *"The second recorded a two-state dichotomy (0 rows ⇒ BI16 green, 129 unrelated rows ⇒
+BI16 red) as fact; Gate 6 measured the opposite in both states"* — and keeps only the per-outcome
+totals, which are the one numeric thing both series agree on.
+
+#### MEDIUM-2 re-measured, not read
+
+S-40 (`.claude/rules/known-gaps.md:1785-1806`) now says QA's observation **is correct** and that
+its own sweep skipped the band. Both halves re-derive:
+
+- The arithmetic, every row of S-40's four-forms block, in `node`: `(1e306-1)*20` → `2e+307`;
+  `(1e307-1)*2` → `2e+307`; `(2e306-1)*10` → `2e+307`; `(1e306-1)*1` → `1e+306`;
+  `(1e305-1)*20` → `1.9999999999999997e+306`; `(1e307-1)*20` and `(1e308-1)*20` → `Infinity`.
+  Five values, five exact matches, including the two that explain the `` Argument `skip` is
+  missing. `` rows.
+- The message itself, straight through `@prisma/client` against this PostgreSQL:
+  `invoice.findMany({ where, skip: 2e307, take: 20 })` →
+  `PrismaClientValidationError | Unable to fit value 2e+307 into a 64-bit signed integer for field `skip``
+  — QA's text **verbatim** — and `skip: Infinity` → `` Argument `skip` is missing. ``
+  Done at the Prisma layer rather than over HTTP deliberately: it isolates the claim without
+  starting a service or touching Redis, and the HTTP framing was already driven twice.
+
+QA was right, and S-40 now says so at the right strength.
+
+#### LOW-1 re-measured, not read
+
+`apps/billing-service/src/middleware/tenant-context.middleware.ts:10-12` now reads
+*"**`onRequest`, not `preHandler` — a choice, with one forced consequence.**"* and states the
+conditional; `apps/billing-service/src/app.ts:74-87` states the same one. They agree.
+
+I re-derived the ordering independently — standalone probe, fastify **5.10.0**, Node 22.22.2,
+eight configurations (four phase pairings × two registration orders), guard reproduced as
+billing's un-`return`ed `reply.status(401).send(...)`:
+
+```
+onRequest /onRequest   auth-first   -> [auth]          401   <- shipped
+preHandler/preHandler  auth-first   -> [auth]          401
+onRequest /preHandler  auth-first   -> [auth]          401
+preHandler/onRequest   auth-first   -> [tenant,auth]   401   <- the forbidden order
+onRequest /onRequest   tenant-first -> [tenant,auth]   401
+preHandler/preHandler  tenant-first -> [tenant,auth]   401
+onRequest /preHandler  tenant-first -> [auth]          401   <- not in Round 2's table
+preHandler/onRequest   tenant-first -> [tenant,auth]   401   <- forbidden in both orders
+```
+
+Row 7 is one Round 2 did not run, and it is the row that actually establishes the docblock's
+wording: an `onRequest` guard beats a `preHandler` tenant hook **even when the tenant hook is
+registered first**, which is what "*whatever order they are registered in*" asserts. The crossed
+pairing is forbidden in both registration orders, exactly as both texts now say. Both files are
+accurate.
+
+---
+
+### Findings — all follow-up
+
+#### MEDIUM-1 (R3) · S-39's reproduced grep output was falsified by the same commit that shipped it
+
+`.claude/rules/known-gaps.md:1683-1688` presents a fenced block as verbatim command output:
+
+```
+$ grep -rn '"x-tenant-id"' apps/*/src packages/*/src --include=*.ts | grep -v dist
+apps/gateway/src/constants.ts:14:  TENANT_ID: "x-tenant-id",
+apps/usage-service/src/constants.ts:16:  TENANT_ID: "x-tenant-id",
+packages/shared-types/src/index.ts:93:  TENANT_ID: "x-tenant-id"
+```
+
+Re-ran that exact command on the shipped tree. It returns **four** lines, and the shared-types
+constant is at **`:104`**, not `:93`:
+
+```
+apps/gateway/src/constants.ts:14:  TENANT_ID: "x-tenant-id",
+apps/usage-service/src/constants.ts:16:  TENANT_ID: "x-tenant-id",
+packages/shared-types/src/index.ts:87: * `grep -rn "x-tenant-id" apps/auth-service/src --include=*.ts` returns nothing. See
+packages/shared-types/src/index.ts:104:	TENANT_ID: "x-tenant-id"
+```
+
+**It was already wrong in the commit that shipped it**, not rotted by T-042:
+`git show 5cb454a:packages/shared-types/src/index.ts | grep -n x-tenant-id` gives `87` and `104`
+at `5cb454a` itself, identical to HEAD.
+
+**The cause is Round 2's own LOW-2 fix.** That fix lengthened the `TENANT_CONTEXT_HEADERS`
+docblock — pushing the constant from `:93` to `:104` — and added, at `:87`, a self-verifying grep
+containing the literal `"x-tenant-id"`. So S-39's command now matches a comment inside the fix for
+LOW-2, in the same commit, in the same file. This is **S-33**'s named sub-pattern —
+*"a comment carrying its own verification command matches itself"* — occurring inside the
+authoritative file, introduced by the rework that answered the review that created it.
+
+**The conclusion survives and the evidence does not.** There are still three *definitions*: the
+fourth match is prose. Graded MEDIUM rather than HIGH on that basis — the block is false as
+reproduced output, but no claim drawn from it is wrong, and `x-tenant-id` itself is unchanged and
+byte-identical in all three definitions (re-checked).
+
+**Fix**: `.claude/rules/known-gaps.md:1683-1688` — replace the block with the four-line output,
+cite `:104`, and add one clause naming the fourth line as this entry's own pattern matching a
+docblock comment rather than a fourth definition. Fold it into whichever task closes S-39, or into
+the next change that already owns `known-gaps.md`.
+
+#### MEDIUM-2 (R3) · The surviving BU74c claim is a universal wider than the record that supports it
+
+Three places, one of them authoritative:
+
+- `.claude/rules/known-gaps.md:1900` — *"That has held in **every run at every gate**, in every
+  database state any gate was in."*
+- `apps/billing-service/tests/invoice.repository.unit.test.ts:528` — same sentence.
+- `docs/plans/t-046-invoice-list-endpoint.md:645` — *"reddens **BU74c**, in every run at every
+  gate"*.
+
+This review's own committed Round-2 text refutes the quantifier. `docs/reviews/t-046-invoice-list-endpoint.md:597-599`
+records that of the Gate-3 rework's exploratory series, *"BU74c's individual outcome was recorded
+in only **14 of the 20**."* The passage that said so was deleted with the rest of the run tables
+(correctly — it was part of the material Round 2 asked to go), and the universal it qualified was
+kept. So six runs of this mutation have **no BU74c record at all**, and "every run" is asserted
+over them.
+
+The substance is well-evidenced and I am not disputing it: Gate 4 ran it once red, Gate 5's QA
+recorded `Tests 2 failed | 160 passed (162)` *"with BU74c **and** BI16 named"* 7/7
+(`docs/qa/t-046-invoice-list-endpoint.md:406-408`), and Gate 6 recorded 13/13. What is
+over-claimed is the quantifier, in the entry whose entire thesis is that four gates were burned by
+exactly this move.
+
+Second, smaller: the trailing clause *"in every database state any gate was in"* is decorative to
+the point of misleading. The **next sentence** says BU74c *"asserts the `orderBy` argument against
+a Prisma mock and **never reaches the database**"* — so database state cannot be a variable for it,
+and listing it as a dimension the claim survived reads as breadth of evidence where there is none.
+`.claude/rules/review-standards.md` § *Universals Must Cite Their Mutation* is explicit that a
+claim established by probes varying one dimension is not established by naming a second.
+
+**Not verified by execution, and here is why.** Refuting or confirming it means applying the
+tie-break mutation and running the suite, which requires editing a committed tree this review was
+instructed not to modify — and the brief separately rules the mutation out of scope. This finding
+therefore rests on **the record**, specifically this file's own committed Round-2 text, not on a
+run of mine. Stated as reasoning, not measurement.
+
+**Fix**: at all three sites, replace *"in every run at every gate, in every database state any
+gate was in"* with what the record supports, e.g. *"in every run whose individual outcome was
+recorded — 1 at Gate 4, 7 at Gate 5, 13 at Gate 6; a 20-run exploratory series at the Gate-3
+rework recorded BU74c's outcome in only 14 of the 20"* and drop the database-state clause, since
+the very next sentence explains why it cannot be a variable.
+
+#### LOW-1 (R3) · The plan still carries the un-conditioned "forced" universal in the two places the rework did not reach
+
+Round 1's LOW-1 fixed `app.ts`; Round 2's LOW-1 fixed `tenant-context.middleware.ts`. The plan has
+**three** more instances and the rework corrected one:
+
+- `docs/plans/t-046-invoice-list-endpoint.md:108` — heading, *"**Decided: `onRequest`, and it is
+  forced.**"* **Mitigated**: the correction sits at `:122-131` in the same section and names the
+  three correct pairings. This is S-32's residual shape — wrong text where the reader first meets
+  it, correction below — but it is at least signposted within the section.
+- `:826` — §11's approval-gate summary: *"**D3** `onRequest` for both hooks (**forced by
+  measurement, not chosen**)"*. **Not mitigated.** Nothing near it conditions it, and this is the
+  line a reader skimming "what was decided" lands on.
+- `:846` — *"**D3** — `onRequest` hook phase? *Recommend yes, and it is forced by probe P8/P13.*"*
+  **Not mitigated.**
+
+My probe above shows the bare claim is false as stated: three of the four phase pairings order
+correctly. LOW rather than higher because `docs/plans/` is explicitly *not* an authoritative record
+(`CLAUDE.md`), and because the decision itself — both hooks `onRequest`, guard first — is correct
+and unchanged.
+
+**Fix**: `:826` → *"`onRequest` for both hooks — the pairing is a choice among three that order
+correctly; what is forced, given tenant-context is `onRequest`, is that the guard is too and is
+registered first"*. Same clause at `:846`. Follow-up only.
+
+#### NIT-1 (R3) · The mandated gate wrote one key to Redis db 0
+
+Disclosure against the brief's constraint, not a finding against T-046. `pnpm test --force`
+leaves db 0 holding `denylist:b6814dd2e6e795c0e6d0a41e3a251b64` (TTL 815 s) beside the real
+`telemetry:events` stream. That is **S-22** firing exactly as documented — auth-service's
+integration suite hard-codes `redis://localhost:6379`, resolving to db 0 — and it is unavoidable
+while running the gate this review was asked to run. Nothing was flushed, `telemetry:events`
+survives, and the key self-expires. Unchanged by T-046; already recorded at Round 2. db 12/13/14/15
+all at 0.
+
+---
+
+### On the process question the brief asked me to rule on
+
+**Was the orchestrator's grep-and-diff verification adequate for what it claimed to cover?**
+**Yes for the six conditions; no for their collateral effects — and that is demonstrated, not
+hypothesised.**
+
+Adequate for the six: every one discharges under my own re-derivation, including the two I
+re-measured by execution (MEDIUM-2's Prisma error text, LOW-1's eight fastify configurations)
+rather than by inspecting the diff. A grep for the deleted strings is in fact the *right*
+instrument for HIGH-1, HIGH-2 and MEDIUM-1, because those three asked for deletions and a grep
+returning 0 is a stronger check on a deletion than reading is.
+
+Inadequate for the rest, concretely: **MEDIUM-1 (R3) is the thing that verification could not
+see.** S-39's grep block sits in an *unchanged* hunk of a *changed* file, and was falsified by the
+LOW-2 fix several hundred lines away in a different package. A diff-of-the-diff cannot surface
+that; only re-running the *other* entries' commands can, which is what a reviewer does and what a
+fix-confirmation pass does not. The cost was small here — a stale block whose conclusion still
+holds — but the mechanism is general, and it is the second-order form of the very pattern S-33
+catalogues.
+
+**The commit message is an honest record.** Each of its three gate lines matches the artifact:
+
+- *"pre-QA gate: CONDITIONAL, fixes applied"* — Round 1's verdict is `CONDITIONAL` (`:9`).
+- *"QA gate: FAIL on one documentation defect, corrected"* — `docs/qa/…:14` is `# FAIL`, and `:23`
+  and `:38` say the FAIL **is** F-1 and that *"Everything else is PASS. Findings F-2 to F-5 are
+  LOW/NIT and none of them blocks."* F-1 is a claim-accuracy defect, so "one documentation defect"
+  is accurate and not a rounding-up of five findings to one.
+- *"final gate: CHANGES REQUESTED; fixes applied and verified by diff rather than a further review
+  round"* — Round 2's verdict is `CHANGES REQUESTED` (`:467`), and the message **volunteers the
+  weakness in its own verification** rather than implying a review it did not have. That sentence
+  is the reason this round could be scoped at all.
+
+Its counts also reconcile: *"37 added. billing-service 162/162"* — `it("` across
+`apps/billing-service/tests` is **125** at `ed670b3` and **162** at `5cb454a`, and T-045's message
+independently records `125`. 162 − 125 = 37.
+
+---
+
+### Compile-time gate — all 13 packages, `--force`, 0 cached on every task
+
+Run at HEAD `73e01ed` on the committed tree. Every task reported `cache bypass, force executing`;
+`Cached: 0 cached` on all four.
+
+| Task | Result |
+|---|---|
+| `pnpm typecheck --force` | **13 successful, 13 total** · 0 cached · 13.0 s · exit 0 |
+| `pnpm lint --force` | **13 successful, 13 total** · 0 cached · 29.5 s · exit 0 · **0 errors, 14 warnings** |
+| `npx turbo run build --force` | **13 successful, 13 total** · 0 cached · 15.3 s · exit 0 |
+| `pnpm test --force` | **13 successful, 13 total** · 0 cached · 19.1 s · exit 0 · **899 tests** |
+| `pnpm test:smoke` | 6 services, 1 test each, all green |
+
+**Per-package test totals — all 13 report, none skipped:**
+
+| Package | Tests | | Package | Tests |
+|---|---|---|---|---|
+| `worker-service` | 234 | | `shared-utils` | 18 |
+| `usage-service` | 230 | | `shared-validation` | 15 |
+| `auth-service` | 166 | | `shared-types` | 8 |
+| `billing-service` | **162** | | `shared-config` | 4 |
+| `gateway` | 38 | | `shared-logger` | 4 |
+| `analytics-service` | 18 | | `shared-tracing` | 2 |
+| `web` | 0 (task runs, no cases) | | **Total** | **899** |
+
+899 is the expected figure. billing-service is **162**, unchanged from what T-046 shipped.
+
+**Lint: 14 warnings, every one proved pre-existing, 0 `no-unsafe-return`.**
+
+| Rule | Count | File | `git log -1` |
+|---|---|---|---|
+| `@typescript-eslint/no-misused-promises` | 10 | `apps/auth-service/tests/auth.service.unit.test.ts` | `d68e719` · 2026-08-25 |
+| `@typescript-eslint/no-unsafe-assignment` | 4 | `apps/usage-service/tests/ingestion.service.unit.test.ts` | `b0f6921` · 2026-08-31 |
+
+Both dates precede `5cb454a`, and `git show --name-only 5cb454a` touches **neither** file — so
+these cannot be T-046's. `grep -c no-unsafe-return` on the full lint output → **0**.
+
+---
+
+### Environment, and the state I left
+
+- PostgreSQL **16.13**, host service, left running. Read-only throughout: `count`, `pg_available_extensions`,
+  `show shared_preload_libraries`, and three `findMany` calls that raised `PrismaClientValidationError`
+  before reaching the server. No write, no DDL, no `v1_7` rollback, no role dropped.
+- **Row counts on exit**: `Event 0`, `UsageLine 0`, `Invoice 0`, `InvoiceLineItem 0`, `Meter 0`,
+  `Tenant 2` — the required end state.
+- Redis left running. I issued no write; the mandated `pnpm test` wrote one TTL'd `denylist:*` key
+  to db 0 (NIT-1 above). db 12/13/14/15 at 0.
+- Three temporary probe scripts were created inside `apps/billing-service/` so Node could resolve
+  `@prisma/client` and `fastify`, and **all three were removed**. Verified with `git status --porcelain`
+  after each.
+- **Nothing committed, staged or branched.** `git status --porcelain` at close shows one entry —
+  `M docs/reviews/t-042-invoice-generation-job.md` — which is **not mine**: it appeared between my
+  first and second `git status` calls, is a `## Round 3` append to the *T-042* review by the
+  orchestrating session running concurrently, and I did not touch it. My only write is this
+  section. Round 1 and Round 2 above are unmodified.
+
+### What I could not verify, and why
+
+- **Whether BU74c reddens in the six unrecorded runs** (MEDIUM-2 R3). Needs the tie-break mutation,
+  which means editing a committed tree I was told not to modify, and which the brief rules out of
+  scope. The finding is reasoning from this file's own committed record, and is labelled so.
+- **BI16's behaviour under the mutation.** Deliberately not re-opened, per the brief. I did not run
+  it and I make no claim about it beyond confirming that the *text* now claims nothing beyond
+  "not reproducible, cause not established" — which it does, at all three sites.
+- **F-4 live** (`?status[]=DRAFT`). Confirmed at code level only: `invoiceListQuerySchema`
+  (`src/validators/invoice-list.validator.ts`) has no `.strict()`. Not driven over HTTP; no service
+  was started this round.
+- **Whether `5cb454a` itself was green.** I ran the gate at HEAD, not at the shipped commit — a
+  checkout would dirty the tree. 899 at HEAD is consistent with the message's 843 plus T-042, but I
+  did not re-run 843.
+
+### Remaining risks and dispositions
+
+| Risk | Disposition |
+|---|---|
+| S-39's grep block is stale, in `.claude/rules/` | **Follow-up (MEDIUM-1 R3).** Conclusion holds; fix the block in whichever task next owns `known-gaps.md`. |
+| BU74c's "every run at every gate" universal | **Follow-up (MEDIUM-2 R3).** Substance sound, quantifier unsupported; three sites, one authoritative. |
+| Plan's `:826`/`:846` "forced" universal | **Follow-up (LOW-1 R3).** Plan file only; decision itself correct. |
+| BI16 remains a non-deterministic guard | **Accepted and now correctly documented.** S-41 says so and says the cause is unknown. BU74c is the guard. |
+| S-40 — unbounded `page` reaches a `500` | **Correctly filed, not fixed.** Re-measured at the Prisma layer this round; S-40's account is accurate throughout. |
+| S-39 — two legacy `x-tenant-id` literals | Still open and still accurate in substance. Re-checked: all three definitions byte-identical. |
+| S-22 — auth-service writes to Redis db 0 | Observed again (NIT-1). Unchanged by T-046. |
+| S-24 — stale `.claude/rules/` snapshot | **Fired again this session**: the injected `known-gaps.md` ended at S-39 and could not see S-40 or S-41. Recovered by `cat`. Third recorded sighting; worth adding to S-24's list. |
+| F-3 / F-4 / F-5 | **Discharged** — plan `:785-816`, plus the `toAmountString` docblock note. |
+
+**Recommend adding to `.claude/rules/known-gaps.md`, out of scope to fix here:** S-24 should gain
+this third sighting, since its own text says the evidence base is "the two sightings" and a third
+independent one bears on whether the working practice is holding.
+
+### Gate
+
+**`APPROVED FOR COMMIT` — retrospectively.** Round 2's six conditions are discharged; the two that
+could be checked by measurement rather than by reading both re-derive exactly, including one
+configuration Round 2 did not run. The record is now closed honestly: the change shipped against an
+open verdict, the commit message said so in its own words, and the fixes hold.
+
+The three findings above are **follow-up work**, not conditions. None is a code defect, none
+touches tenant isolation, injection, correctness or the error contract, and the gate is green at
+899/899 across 13 packages with 14 proved-pre-existing lint warnings and zero errors.
+
+### Decisions for you
+
+**R3-D1 · Where do the three follow-ups get fixed?** *One sentence:* MEDIUM-1 and MEDIUM-2 are wrong
+text in `.claude/rules/known-gaps.md`, which `CLAUDE.md` designates authoritative — so leaving them
+until "whenever" has a cost the LOW grading understates.
+
+| Option | What changes |
+|---|---|
+| **A · Fold into the next task that already owns `known-gaps.md` (recommended)** | No new task. The next `/ship` corrects `:1683-1688`, `:1900`, `invoice.repository.unit.test.ts:528` and the plan's three lines as part of its own diff. **Diff: ~8 lines of text, no code, no tests.** Zero risk of a fifth mechanism being invented, because all three fixes are *narrowings*. |
+| B · One small docs task now | Same diff, its own commit and its own review. Cleaner history; costs a full gate run for eight lines of prose. |
+| C · Leave all three | Nothing changes. Accepts that an authoritative file carries one falsified command block and one unsupported universal, in the entry that exists because four gates were burned by unsupported universals. |
+
+**Recommendation: A.** All three are subtractive, none can regress behaviour, and the gate is
+already green. B is defensible if you want the correction traceable to its own commit; C is the
+only option I would argue against, and only because of *which* file it is. **None of the three
+changes the diff of any shipped code** — this is a preference about sequencing, not about content.
+
+**R3-D2 · Does S-24 get this session's sighting appended?** *One sentence:* the injected
+`.claude/rules/known-gaps.md` ended at S-39 again, which is a third data point for an entry that
+currently says its whole evidence base is two.
+
+| Option | What changes |
+|---|---|
+| **A · Append it (recommended)** | Two lines in S-24 recording the T-046 Round-3 sighting and that the recovery was again `cat`-from-disk. **Diff: 2 lines.** |
+| B · Do not | S-24 keeps claiming two sightings when there are three, and the argument that the recovery depends on reviewer suspicion loses its third supporting case. |
+
+**Recommendation: A**, folded into whichever change takes R3-D1. Preference, not a diff change.

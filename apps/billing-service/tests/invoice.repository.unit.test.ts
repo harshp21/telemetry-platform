@@ -525,7 +525,8 @@ describe("InvoiceRepository.listInvoices", () => {
     // **This assertion is the guard.** It pins the `orderBy` structurally and does not touch the
     // database. The mutation is deleting `{ [SORT_FIELD_ID]: desc }` from `INVOICE_LIST_ORDER_BY`
     // (`invoice.repository.ts`) and running the billing suite; this case has reddened under it in
-    // every run at every gate, in every database state any gate was in.
+    // every run in which its own outcome was recorded -- 14 of the 20-run exploratory series,
+    // the other six recording only BI16. No gate has seen it survive the mutation.
     //
     // **A behavioural case exists -- BI16 (`tests/billing.integration.test.ts`) -- and its
     // redness is not reproducible. Do not delete it on the strength of a run in which it stayed

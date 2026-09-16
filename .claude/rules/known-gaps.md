@@ -805,7 +805,7 @@ a third strictness.
 
 `CLAUDE.md` designates this directory authoritative and instructs agents to trust it *without
 re-verification*. That instruction is only safe if the copy an agent sees is the copy on disk.
-Twice now it has not been.
+Four times now it has not been.
 
 **Observed, both times by a review agent that then went and read the files with `cat`:**
 
@@ -848,7 +848,7 @@ renumbering something, which every citation of it then points at wrongly.
 text. Reviews that quote these files should say which revision they read, as T-038's Gate-4
 review did. Cheap, and it is what caught both sightings.
 
-**Fix direction:** establish the mechanism before attempting a fix — the two sightings are the
+**Fix direction:** establish the mechanism before attempting a fix — the four sightings are the
 whole evidence base, and a fix aimed at the wrong layer would be unfalsifiable. If it turns out
 to be unfixable from inside the repository, say so here and keep the working practice above.
 
@@ -1684,8 +1684,15 @@ not rewired:**
 $ grep -rn '"x-tenant-id"' apps/*/src packages/*/src --include=*.ts | grep -v dist
 apps/gateway/src/constants.ts:14:  TENANT_ID: "x-tenant-id",
 apps/usage-service/src/constants.ts:16:  TENANT_ID: "x-tenant-id",
-packages/shared-types/src/index.ts:93:  TENANT_ID: "x-tenant-id"
+packages/shared-types/src/index.ts:87: * `grep -rn "x-tenant-id" apps/auth-service/src --include=*.ts` returns nothing. See
+packages/shared-types/src/index.ts:104:	TENANT_ID: "x-tenant-id"
 ```
+
+**Four lines, three definitions**: `:87` is this entry's own sibling grep inside a docblock,
+matching itself — the self-match sub-pattern S-33 names. The executable copies are the other
+three. An earlier revision of this block quoted three lines and put the canonical constant at
+`:93`; both were falsified after it was written, by T-046's own Gate-6 LOW-2 fix lengthening that
+docblock. Re-run the command rather than trusting the fence.
 
 So there are three definitions of one wire-protocol string: one canonical, two legacy. All three
 carry the same value today — checked, byte-identical.
@@ -1897,7 +1904,10 @@ constant, then run `pnpm --filter @telemetry/billing-service test`.
 ### What holds
 
 - **`BU74c` (`apps/billing-service/tests/invoice.repository.unit.test.ts`) reddens under the
-  mutation.** That has held in every run at every gate, in every database state any gate was in.
+  mutation.** It held in every run where its own outcome was recorded — which is not every run:
+  this task's 20-run exploratory series recorded BU74c individually in **14** of them, the other
+  six recording only BI16. No gate has observed BU74c survive the mutation; that is weaker than
+  "every run at every gate", and it is what the record supports.
   It asserts the `orderBy` argument against a Prisma mock and never reaches the database. **It is
   the guard.**
 - **BI16 sometimes reddens and sometimes does not, on an unchanged tree and with a byte-identical

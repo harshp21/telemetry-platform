@@ -1438,3 +1438,59 @@ part of the change and I could not find a way around it from the live catalog or
 connection; the two rework claims the brief flagged as unchecked both re-derive to the digit; the
 S-45 and S-26 records are accurate, including the parts that say what was *not* established. The
 findings are what they have been all task: line citations falsified by the commit that wrote them.
+
+---
+
+## Round 3 — close-out of Round 2's conditions
+
+**Written by the orchestrating session, not by `senior-reviewer`.** That distinction is the point
+of this section: Round 2's verdict was `CONDITIONAL` and the task shipped as `73e01ed` without a
+reviewer ever re-reading the fixes. This records who checked what, by what method, so the gap is
+visible rather than reconstructed from a conversation.
+
+### The four required conditions, each re-derived by command
+
+| # | Condition | Verified | Evidence |
+|---|---|---|---|
+| MEDIUM-1 | `known-gaps.md:890` `:79` → `:129`; `:893` `:95-100` → `:145-150` | yes | `grep -n '"src/events/\*\*"' apps/worker-service/vitest.config.mjs` → `129:`; `grep -n '^      thresholds:'` → `145:`, block runs `145-150` |
+| LOW-1 | `known-gaps.md:868` "233 cases" → "234" | yes | `grep -n "23[34] cases"` → `868:> (234 cases, 17 files)` |
+| LOW-2 | plan's superseded coverage figures labelled | yes | plan `:967` — "**are superseded** and are kept only as the record of what this item did" |
+| LOW-4 | AC7's *shipped* column names the three `rls.integration.test.ts` cases | yes | plan `:696` names them, `:706-722` lists `:464`, `:506`, `:545` by title with `:545` marked not planned |
+
+Additionally confirmed **not** to have been changed: the identical-looking
+`vitest.config.mjs:79` citation inside **S-32**, which is pre-existing and correctly dated.
+`git show 5cb454a:.claude/rules/known-gaps.md` carries it at line 1157; it now sits at `:1331`,
+byte-identical. Round 2 was explicit that it must not be "fixed", and it was not.
+
+### One fix beyond the four, applied after Round 2
+
+`apps/worker-service/vitest.config.mjs` asserted that `src/events/**` is "larger than the rest of
+`src/` combined". Measured: `stream.consumer.ts` is **1262** lines against **3494** for the rest
+of `src/` — false on the shipped tree, and already false at `5cb454a` (1262 against 2437). It was
+false because T-041 and T-043 grew that file, not because of anything T-042 did.
+
+The comment was **added by this diff**, so it was this commit's claim to make true. Corrected to
+what the measurement supports: the largest single file and the largest excluded glob. The
+matching sentence in **S-25** was deliberately left alone — it is pre-existing, and explicitly
+anchored as a T-039-era measurement ("777 lines after T-039"), which is a different and still
+accurate claim.
+
+### What this verification does and does not cover
+
+It covers the four text edits Round 2 required, by re-running the commands behind each, plus the
+comparative above. **It is not an independent review.** Nobody re-read the reworked prose for
+claims Round 2 did not already name, and the orchestrating session is not a disinterested reader
+of fixes it commissioned. Anything found later in this task's records should be treated as
+genuinely unreviewed rather than as having survived a gate.
+
+The gate that did run properly is the one that matters most: the privilege boundary was derived
+independently at Gates 4, 5 and 6 — catalog, behavioural attack, and catalog again — and held
+each time.
+
+### Verdict
+
+**Round 2's conditions are discharged.** The change shipped as `73e01ed` with the full root gate
+green at 899 tests across 13 packages, 0 cached, 14 pre-existing lint warnings and zero
+`no-unsafe-return`.
+
+`S-45` remains open by decision, not by oversight, and is scheduled as the next task.
