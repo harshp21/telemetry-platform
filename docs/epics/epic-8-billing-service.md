@@ -10,8 +10,8 @@
 
 | Question | Decision needed |
 |---|---|
-| Q2 — Pricing model | Flat rate, tiered volume, or per-seat? Defines how `Meter.tierJson` is structured |
-| Q3 — UTC aggregation | Billing period boundaries (midnight UTC assumed until Q3 is answered) |
+| Q2 — Pricing model (**decided**, see `docs/epics/README.md`) | Flat only for v1: `amount = summedQuantity x unitPrice`. `Meter.tierJson` is unread; tiered pricing is deferred pending a graduated-vs-volume ruling |
+| Q3 — UTC aggregation | **Scoped to Epic 9 by `docs/epics/README.md`, not to Epic 8.** It remains open, and it does not block Epic 8's tasks: the billing endpoints bind no timestamp whose bucket boundary Q3 would decide. Where the boundary is actually chosen is `T-042` (`docs/epics/epic-7-worker-service.md`), the daily job that selects "the previous calendar day" |
 
 ---
 

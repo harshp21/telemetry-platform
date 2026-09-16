@@ -130,3 +130,57 @@ export const INTEGRATION_FIXTURE = {
   UNIT_PRICE_PRECISE: "0.000001",
   EXPECTED_PRECISE_AMOUNT: "1.234567"
 } as const;
+
+/**
+ * Fixture vocabulary for the `GET /v1/billing/invoices` cases (T-046, BI14-BI21).
+ *
+ * Three distinct billing periods in ascending order, so the newest-first sort (D4) is
+ * observable rather than accidental, plus a fourth invoice that **shares** `JAN_START` with
+ * the first and differs only in its `periodEnd`.
+ *
+ * That collision is legal -- `Invoice @@unique([tenantId, periodStart, periodEnd])` keys on
+ * all three columns -- and it is the whole reason the sort carries an `id` tie-break. With
+ * `ORDER BY "periodStart" DESC` alone, PostgreSQL may return the two colliding rows in either
+ * order between one `LIMIT/OFFSET` query and the next, which silently skips one row and
+ * repeats another across a page boundary. BI16 walks the pages one at a time and asserts the
+ * union is exactly the seeded set.
+ *
+ * `TOTAL_PRECISE` is the `Decimal(18,6)` case, and the value is chosen rather than copied.
+ * T-045's `QUANTITY_PRECISE` is `"1234567.123456"`, whose comment about losing precision is
+ * about the *multiplication* it feeds, not about a read: measured,
+ * `String(Number("1234567.123456"))` is `"1234567.123456"` -- lossless, so that value would
+ * make a read round trip prove nothing. `"123456789012.123456"` is 18 significant digits, the
+ * full width of `Decimal(18,6)`, and measured `String(Number(...))` gives
+ * `"123456789012.12346"` -- six digits short. An implementation that let the value become a
+ * JS number therefore cannot return the seeded string.
+ */
+export const INTEGRATION_INVOICE_LIST = {
+  JAN_START: "2026-01-01T00:00:00.000Z",
+  JAN_END: "2026-02-01T00:00:00.000Z",
+  /** Same `periodStart` as JAN, different `periodEnd` -- the sort tie-break case. */
+  JAN_END_ALTERNATE: "2026-02-15T00:00:00.000Z",
+  FEB_START: "2026-02-01T00:00:00.000Z",
+  FEB_END: "2026-03-01T00:00:00.000Z",
+  MAR_START: "2026-03-01T00:00:00.000Z",
+  MAR_END: "2026-04-01T00:00:00.000Z",
+  FINALIZED_AT: "2026-04-02T12:00:00.000Z",
+  TOTAL_JAN: "10.500000",
+  TOTAL_JAN_ALTERNATE: "11.500000",
+  TOTAL_FEB: "20.250000",
+  TOTAL_MAR: "30.000000",
+  TOTAL_TENANT_B: "99.000000",
+  /** Measured: `String(Number("123456789012.123456"))` -> `"123456789012.12346"`. */
+  TOTAL_PRECISE: "123456789012.123456",
+  /** What a double round trip degrades `TOTAL_PRECISE` to. Measured, not derived. */
+  TOTAL_PRECISE_AFTER_FLOAT_ROUND_TRIP: "123456789012.12346",
+  PAGE_SIZE_ONE: 1,
+  PAGE_SIZE_TWO: 2,
+  SEEDED_COUNT: 3,
+  QUERY_KEY_STATUS: "status",
+  QUERY_KEY_PAGE: "page",
+  QUERY_KEY_PAGE_SIZE: "pageSize",
+  TENANT_ID_NOT_A_UUID: "not-a-uuid",
+  WRONG_INTERNAL_SECRET: "wrong-internal-secret",
+  /** A tenant that exists but owns no invoice: the empty-list case must be 200, not 404. */
+  EXPECTED_EMPTY_TOTAL: 0
+} as const;

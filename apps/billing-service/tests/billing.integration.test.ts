@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { Prisma, PrismaClient } from "@prisma/client";
+import { InvoiceStatus, Prisma, PrismaClient } from "@prisma/client";
 import type { TenantId } from "@telemetry/shared-types";
 import { buildBillingServiceApp } from "../src/app";
 import { env } from "../src/config/env";
@@ -9,6 +9,7 @@ import { MeterRepository } from "../src/repositories/meter.repository";
 import { UsageLinesChangedError } from "../src/errors";
 import {
   BILLING_HEADERS,
+  BILLING_INVOICE_LIST,
   BILLING_METERING,
   BILLING_RESPONSES,
   BILLING_ROUTES
@@ -19,6 +20,7 @@ import {
   INTEGRATION_DATABASE_ROLE,
   INTEGRATION_FIXTURE,
   INTEGRATION_ID_PREFIX,
+  INTEGRATION_INVOICE_LIST,
   INTEGRATION_SESSION_TIME_ZONE,
   INTEGRATION_TENANT
 } from "./integration.constants";
@@ -121,28 +123,38 @@ const seedTwoMetricPeriod = async (): Promise<void> => {
   ]);
 };
 
+/**
+ * File-level lifecycle, shared by every `describe` below.
+ *
+ * Hoisted out of the T-045 block by T-046 so the two suites share one app instance and one
+ * owner connection: a per-`describe` `afterAll` would close the app and disconnect the fixture
+ * client before the next block ran. The reset semantics are unchanged -- still `beforeEach`
+ * *and* `afterEach` *and* `afterAll`, still scoped to this run's fixed tenant ids.
+ *
+ * Both halves matter: `beforeEach`-only cleanup leaves the last test's rows behind for good
+ * (S-20 is the worked example), and a run-unique filter could never collect them.
+ */
+beforeAll(async () => {
+  await fixtures.assertSchemaReady();
+  app = buildBillingServiceApp();
+});
+
+beforeEach(async () => {
+  await fixtures.reset(SUITE_TENANT_IDS);
+});
+
+afterEach(async () => {
+  await fixtures.reset(SUITE_TENANT_IDS);
+});
+
+afterAll(async () => {
+  await fixtures.reset(SUITE_TENANT_IDS);
+  await fixtures.assertRunStateEmpty(SUITE_TENANT_IDS);
+  await app.close();
+  await fixtures.disconnect();
+});
+
 describe("POST /v1/internal/billing/generate (integration)", () => {
-  beforeAll(async () => {
-    await fixtures.assertSchemaReady();
-    app = buildBillingServiceApp();
-  });
-
-  beforeEach(async () => {
-    await fixtures.reset(SUITE_TENANT_IDS);
-  });
-
-  afterEach(async () => {
-    await fixtures.reset(SUITE_TENANT_IDS);
-  });
-
-  afterAll(async () => {
-    // Both halves matter: `beforeEach`-only cleanup leaves the last test's rows behind for good.
-    await fixtures.reset(SUITE_TENANT_IDS);
-    await fixtures.assertRunStateEmpty(SUITE_TENANT_IDS);
-    await app.close();
-    await fixtures.disconnect();
-  });
-
   it("BI0 - the service connection is the least-privilege role, so RLS is enforcing", async () => {
     const rows = await app.container.prisma.$queryRaw<
       { current_user: string; rolsuper: boolean; rolbypassrls: boolean }[]
@@ -740,5 +752,336 @@ describe("POST /v1/internal/billing/generate (integration)", () => {
     expect(await fixtures.readLineItems(SUITE_TENANT_IDS)).toHaveLength(0);
     const lines = await fixtures.readUsageLines(SUITE_TENANT_IDS);
     expect(lines.filter((line) => line.billed)).toHaveLength(1);
+  });
+});
+
+/**
+ * `GET /v1/billing/invoices` against live PostgreSQL (T-046).
+ *
+ * Same two-connection discipline as the block above: rows are seeded through
+ * `DIRECT_DATABASE_URL` (the owner) and every assertion reads back through the service, which
+ * connects as `telemetry_app` -- `NOSUPERUSER NOBYPASSRLS`, asserted by BI0. BI17 therefore
+ * asserts against rows the requesting tenant could not have created and could not have read
+ * without the policy failing.
+ *
+ * The `FINALIZED` and `PAID` fixtures exist only because the platform cannot produce them:
+ * `createDraftInvoice` writes `DRAFT` and never sets `finalizedAt`, so the status filter and
+ * the nullable-timestamp case have no HTTP spelling to seed through.
+ */
+describe(`GET ${BILLING_ROUTES.INVOICES} (integration)`, () => {
+  const listHeaders = (
+    tenantId: string = TENANT_A,
+    secret: string = env.INTERNAL_API_SECRET
+  ): Record<string, string> => ({
+    [BILLING_HEADERS.INTERNAL_SECRET]: secret,
+    [BILLING_HEADERS.TENANT_ID]: tenantId
+  });
+
+  const list = async (headers: Record<string, string>, query = "") =>
+    app.inject({
+      method: "GET",
+      url: `${BILLING_ROUTES.INVOICES}${query}`,
+      headers
+    });
+
+  interface ListBody {
+    readonly data: {
+      readonly items: Record<string, unknown>[];
+      readonly total: number;
+      readonly page: number;
+      readonly pageSize: number;
+    };
+  }
+
+  const bodyOf = (response: Awaited<ReturnType<typeof list>>): ListBody =>
+    response.json() as ListBody;
+
+  /** Three periods for tenant A, one for tenant B, seeded newest-last so order is observable. */
+  const seedThreePeriods = async (): Promise<void> => {
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    await fixtures.seedInvoices([
+      {
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_INVOICE_LIST.JAN_START,
+        periodEnd: INTEGRATION_INVOICE_LIST.JAN_END,
+        status: BILLING_METERING.INVOICE_STATUS_DRAFT,
+        totalAmount: INTEGRATION_INVOICE_LIST.TOTAL_JAN
+      },
+      {
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_INVOICE_LIST.FEB_START,
+        periodEnd: INTEGRATION_INVOICE_LIST.FEB_END,
+        status: InvoiceStatus.FINALIZED,
+        totalAmount: INTEGRATION_INVOICE_LIST.TOTAL_FEB,
+        finalizedAt: INTEGRATION_INVOICE_LIST.FINALIZED_AT
+      },
+      {
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_INVOICE_LIST.MAR_START,
+        periodEnd: INTEGRATION_INVOICE_LIST.MAR_END,
+        status: InvoiceStatus.PAID,
+        totalAmount: INTEGRATION_INVOICE_LIST.TOTAL_MAR,
+        finalizedAt: INTEGRATION_INVOICE_LIST.FINALIZED_AT
+      }
+    ]);
+  };
+
+  it("BI14 - lists the tenant's invoice headers newest period first, as the eight declared fields", async () => {
+    await seedThreePeriods();
+
+    const response = await list(listHeaders());
+
+    expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
+    const { data } = bodyOf(response);
+    expect(data.total).toBe(INTEGRATION_INVOICE_LIST.SEEDED_COUNT);
+    expect(data.page).toBe(BILLING_INVOICE_LIST.DEFAULT_PAGE);
+    expect(data.pageSize).toBe(BILLING_INVOICE_LIST.DEFAULT_PAGE_SIZE);
+
+    // D4: newest period first, not insertion order and not `createdAt` order -- all three rows
+    // were inserted oldest-period-first, so an unsorted read would return the reverse of this.
+    expect(data.items.map((item) => item.periodStart)).toEqual([
+      INTEGRATION_INVOICE_LIST.MAR_START,
+      INTEGRATION_INVOICE_LIST.FEB_START,
+      INTEGRATION_INVOICE_LIST.JAN_START
+    ]);
+    expect(data.items.map((item) => item.status)).toEqual([
+      InvoiceStatus.PAID,
+      InvoiceStatus.FINALIZED,
+      BILLING_METERING.INVOICE_STATUS_DRAFT
+    ]);
+
+    // Exactly the eight `InvoiceHeader` fields. `lineItems` is T-047's, and `tenantId` is not
+    // echoed back.
+    for (const item of data.items) {
+      expect(Object.keys(item).sort()).toEqual([
+        "createdAt",
+        "currency",
+        "finalizedAt",
+        "id",
+        "periodEnd",
+        "periodStart",
+        "status",
+        "totalAmount"
+      ]);
+    }
+
+    // ISO strings, and `finalizedAt` null for the DRAFT row rather than "" or absent.
+    const [paid, , draft] = data.items;
+    expect(paid?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(paid?.finalizedAt).toBe(INTEGRATION_INVOICE_LIST.FINALIZED_AT);
+    expect(draft?.finalizedAt).toBeNull();
+  });
+
+  it("BI15 - status filters the page and the total together, not just the page", async () => {
+    await seedThreePeriods();
+
+    const response = await list(
+      listHeaders(),
+      `?${INTEGRATION_INVOICE_LIST.QUERY_KEY_STATUS}=${InvoiceStatus.FINALIZED}`
+    );
+
+    const { data } = bodyOf(response);
+    expect(data.items).toHaveLength(1);
+    expect(data.items[0]?.status).toBe(InvoiceStatus.FINALIZED);
+    // `total` is 1, not 3: a count that ignored the filter would page correctly and then lie
+    // about how many pages exist.
+    expect(data.total).toBe(1);
+  });
+
+  it("BI16 - paging covers every row exactly once, even when two invoices share a periodStart", async () => {
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    const seededIds = await fixtures.seedInvoices([
+      {
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_INVOICE_LIST.JAN_START,
+        periodEnd: INTEGRATION_INVOICE_LIST.JAN_END,
+        status: BILLING_METERING.INVOICE_STATUS_DRAFT,
+        totalAmount: INTEGRATION_INVOICE_LIST.TOTAL_JAN
+      },
+      {
+        // Same `periodStart`, different `periodEnd` -- legal under
+        // `@@unique([tenantId, periodStart, periodEnd])`, and the exact shape that makes a
+        // `periodStart`-only sort non-deterministic across two LIMIT/OFFSET queries.
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_INVOICE_LIST.JAN_START,
+        periodEnd: INTEGRATION_INVOICE_LIST.JAN_END_ALTERNATE,
+        status: BILLING_METERING.INVOICE_STATUS_DRAFT,
+        totalAmount: INTEGRATION_INVOICE_LIST.TOTAL_JAN_ALTERNATE
+      },
+      {
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_INVOICE_LIST.FEB_START,
+        periodEnd: INTEGRATION_INVOICE_LIST.FEB_END,
+        status: InvoiceStatus.FINALIZED,
+        totalAmount: INTEGRATION_INVOICE_LIST.TOTAL_FEB,
+        finalizedAt: INTEGRATION_INVOICE_LIST.FINALIZED_AT
+      }
+    ]);
+
+    const pageQuery = (pageNumber: number, pageSize: number) =>
+      `?${INTEGRATION_INVOICE_LIST.QUERY_KEY_PAGE}=${pageNumber}` +
+      `&${INTEGRATION_INVOICE_LIST.QUERY_KEY_PAGE_SIZE}=${pageSize}`;
+
+    const first = bodyOf(
+      await list(listHeaders(), pageQuery(1, INTEGRATION_INVOICE_LIST.PAGE_SIZE_TWO))
+    );
+    const second = bodyOf(
+      await list(listHeaders(), pageQuery(2, INTEGRATION_INVOICE_LIST.PAGE_SIZE_TWO))
+    );
+
+    expect(first.data.items).toHaveLength(INTEGRATION_INVOICE_LIST.PAGE_SIZE_TWO);
+    expect(first.data.total).toBe(seededIds.length);
+    expect(second.data.items).toHaveLength(seededIds.length - INTEGRATION_INVOICE_LIST.PAGE_SIZE_TWO);
+    expect(second.data.total).toBe(seededIds.length);
+
+    // The assertion D4 exists for: the union of the pages is the whole set with no id repeated
+    // and none missing. Without the `id` tie-break the two JAN rows may land on both pages or
+    // on neither, and a status-and-length assertion alone would not notice.
+    const union = [...first.data.items, ...second.data.items].map((item) => item.id as string);
+    expect(new Set(union).size).toBe(union.length);
+    expect([...union].sort()).toEqual([...seededIds].sort());
+
+    // Walked one row at a time as well, which multiplies the chances for a boundary to move.
+    const walked: string[] = [];
+    for (let pageNumber = 1; pageNumber <= seededIds.length; pageNumber += 1) {
+      const singlePage = bodyOf(
+        await list(listHeaders(), pageQuery(pageNumber, INTEGRATION_INVOICE_LIST.PAGE_SIZE_ONE))
+      );
+      expect(singlePage.data.items).toHaveLength(INTEGRATION_INVOICE_LIST.PAGE_SIZE_ONE);
+      walked.push(singlePage.data.items[0]?.id as string);
+    }
+    expect(new Set(walked).size).toBe(seededIds.length);
+    expect([...walked].sort()).toEqual([...seededIds].sort());
+  });
+
+  it("BI17 - a second tenant's invoice never appears, read as telemetry_app with a real RLS context", async () => {
+    await seedThreePeriods();
+    const [tenantBInvoiceId] = await fixtures.seedInvoices([
+      {
+        tenantId: TENANT_B,
+        periodStart: INTEGRATION_INVOICE_LIST.MAR_START,
+        periodEnd: INTEGRATION_INVOICE_LIST.MAR_END,
+        status: InvoiceStatus.PAID,
+        totalAmount: INTEGRATION_INVOICE_LIST.TOTAL_TENANT_B
+      }
+    ]);
+
+    const asA = bodyOf(await list(listHeaders(TENANT_A)));
+    const asB = bodyOf(await list(listHeaders(TENANT_B)));
+
+    // Asserted against a row tenant A could not have created: it was seeded through the owner
+    // connection for the other tenant, so seeing it would be a real leak rather than a fixture
+    // artefact.
+    expect(asA.data.items.map((item) => item.id)).not.toContain(tenantBInvoiceId);
+    expect(asA.data.total).toBe(INTEGRATION_INVOICE_LIST.SEEDED_COUNT);
+    expect(JSON.stringify(asA.data)).not.toContain(INTEGRATION_INVOICE_LIST.TOTAL_TENANT_B);
+
+    // And the row is genuinely there for its own tenant, so the absence above is isolation and
+    // not an empty table.
+    expect(asB.data.items.map((item) => item.id)).toEqual([tenantBInvoiceId]);
+    expect(asB.data.total).toBe(1);
+  });
+
+  it("BI18 - Decimal(18,6) survives the round trip exactly, and no Prisma.Decimal leaves the repository", async () => {
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    await fixtures.seedInvoices([
+      {
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_INVOICE_LIST.JAN_START,
+        periodEnd: INTEGRATION_INVOICE_LIST.JAN_END,
+        status: BILLING_METERING.INVOICE_STATUS_DRAFT,
+        totalAmount: INTEGRATION_INVOICE_LIST.TOTAL_PRECISE
+      }
+    ]);
+
+    const { data } = bodyOf(await list(listHeaders()));
+    expect(data.items[0]?.totalAmount).toBe(INTEGRATION_INVOICE_LIST.TOTAL_PRECISE);
+
+    // The decisive assertion, and it has to be below HTTP. Measured at Gate 1 with no
+    // normalisation layer at all: `Prisma.Decimal` defines `toJSON`, so the wire body carries
+    // the same `"1234567.123456"` either way and `typeof` on the parsed value is `"string"`.
+    // The line above therefore cannot tell a normalised value from a leaked one; this one can.
+    const repository = app.container.invoiceRepositoryFactory(TENANT_A);
+    const { items } = await repository.listInvoices({
+      page: BILLING_INVOICE_LIST.DEFAULT_PAGE,
+      pageSize: BILLING_INVOICE_LIST.DEFAULT_PAGE_SIZE
+    });
+
+    expect(items).toHaveLength(1);
+    expect(typeof items[0]?.totalAmount).toBe("string");
+    expect(items[0]?.totalAmount).not.toBeInstanceOf(Prisma.Decimal);
+    expect(items[0]?.totalAmount).toBe(INTEGRATION_INVOICE_LIST.TOTAL_PRECISE);
+    expect(items[0]?.periodStart).not.toBeInstanceOf(Date);
+    expect(items[0]?.createdAt).not.toBeInstanceOf(Date);
+    // The precision assertion, stated as what was measured: 18 significant digits do not fit
+    // a double, and `String(Number(...))` on this value degrades it to
+    // `TOTAL_PRECISE_AFTER_FLOAT_ROUND_TRIP`. So an implementation that let the column become
+    // a JS number at any point cannot produce the string above -- it would produce this one.
+    expect(String(Number(INTEGRATION_INVOICE_LIST.TOTAL_PRECISE))).toBe(
+      INTEGRATION_INVOICE_LIST.TOTAL_PRECISE_AFTER_FLOAT_ROUND_TRIP
+    );
+    expect(items[0]?.totalAmount).not.toBe(
+      INTEGRATION_INVOICE_LIST.TOTAL_PRECISE_AFTER_FLOAT_ROUND_TRIP
+    );
+    expect(asDecimalString(items[0]?.totalAmount)).toBe(
+      asDecimalString(INTEGRATION_INVOICE_LIST.TOTAL_PRECISE)
+    );
+  });
+
+  it("BI19 - a missing and a malformed X-Tenant-Id are both 401, with distinct codes", async () => {
+    await seedThreePeriods();
+
+    const missing = await list({
+      [BILLING_HEADERS.INTERNAL_SECRET]: env.INTERNAL_API_SECRET
+    });
+    const malformed = await list(listHeaders(INTEGRATION_INVOICE_LIST.TENANT_ID_NOT_A_UUID));
+
+    expect(missing.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
+    expect(missing.json()).toMatchObject({
+      code: BILLING_RESPONSES.CODE_TENANT_CONTEXT_MISSING
+    });
+    expect(malformed.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
+    expect(malformed.json()).toMatchObject({
+      code: BILLING_RESPONSES.CODE_TENANT_CONTEXT_INVALID
+    });
+    // Non-empty is not good enough: a tenant id containing `:` would make another service's
+    // `<prefix>:<tenantId>:<key>` derivation ambiguous.
+    expect(malformed.json()).not.toMatchObject({
+      code: BILLING_RESPONSES.CODE_TENANT_CONTEXT_MISSING
+    });
+  });
+
+  it("BI20 - a missing or wrong X-Internal-Secret is 401 before any tenant context is derived", async () => {
+    await seedThreePeriods();
+
+    const noSecret = await list({ [BILLING_HEADERS.TENANT_ID]: TENANT_A });
+    const wrongSecret = await list(
+      listHeaders(TENANT_A, INTEGRATION_INVOICE_LIST.WRONG_INTERNAL_SECRET)
+    );
+    // Neither header at all: the shape that observes hook *order* rather than just the status,
+    // because both hooks answer 401 and only the code says which one ran.
+    const neither = await list({});
+
+    for (const response of [noSecret, wrongSecret, neither]) {
+      expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
+      expect(response.json()).toMatchObject({ code: BILLING_RESPONSES.CODE_UNAUTHORIZED });
+    }
+    expect(neither.json()).not.toMatchObject({
+      code: BILLING_RESPONSES.CODE_TENANT_CONTEXT_MISSING
+    });
+  });
+
+  it("BI21 - a tenant with no invoices is an empty 200, never a 404", async () => {
+    await seedThreePeriods();
+
+    const response = await list(listHeaders(TENANT_B));
+
+    expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
+    const { data } = bodyOf(response);
+    expect(data.items).toEqual([]);
+    expect(data.total).toBe(INTEGRATION_INVOICE_LIST.EXPECTED_EMPTY_TOTAL);
+    // The tenant id arrives from a gateway-verified JWT, so "no rows" says nothing about
+    // whether the tenant exists -- and answering 404 would make this an existence oracle.
+    expect(response.statusCode).not.toBe(BILLING_RESPONSES.HTTP_STATUS_NOT_FOUND);
   });
 });

@@ -6,6 +6,9 @@ export type {
   CreateDraftInvoiceInput,
   DraftInvoiceLineItemInput,
   DraftInvoiceResult,
+  InvoiceHeader,
+  InvoiceListPage,
+  ListInvoicesQuery,
   UnbilledMetricTotal,
   UnbilledUsage
 } from "./invoice.repository";

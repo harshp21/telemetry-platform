@@ -1495,3 +1495,305 @@ the case must go red, and if it does not, it is measuring the existence check in
 
 **Not a correctness risk today.** Both paths return the same `200 { data: { invoiceId } }`, so a
 lost race is already indistinguishable to the caller. What is untested is that it *stays* that way.
+
+---
+
+## S-39 · `x-tenant-id` has a canonical shared constant and two services still hold their own — **LOW, open**
+
+T-046 promoted the header name to `@telemetry/shared-types` as
+`TENANT_CONTEXT_HEADERS.TENANT_ID`, because `.claude/rules/constants.md` asks for promotion
+*before* a third copy and billing-service would have been the third. Billing derives from the
+shared constant and adds no literal of its own. **The two pre-existing copies were deliberately
+not rewired:**
+
+```
+$ grep -rn '"x-tenant-id"' apps/*/src packages/*/src --include=*.ts | grep -v dist
+apps/gateway/src/constants.ts:14:  TENANT_ID: "x-tenant-id",
+apps/usage-service/src/constants.ts:16:  TENANT_ID: "x-tenant-id",
+packages/shared-types/src/index.ts:93:  TENANT_ID: "x-tenant-id"
+```
+
+So there are three definitions of one wire-protocol string: one canonical, two legacy. All three
+carry the same value today — checked, byte-identical.
+
+**Why they were left.** Rewiring gateway and usage-service inside a billing-service feature task
+puts two other services' constants in that task's diff, which is the same one-task-per-commit
+objection that kept S-8 out of S-4 and out of T-037. The promotion itself was the part that could
+not wait, because the rule's threshold is about the *third* copy and T-046 was it.
+
+**Why it is LOW rather than ignorable.** This is a header name the gateway **writes** and
+usage-service **reads** — a producer/consumer pair resolving one wire contract through two
+unrelated declarations. Nothing enforces that they agree. The failure mode is not subtle if it
+happens (every proxied request loses its tenant context and the downstream guard rejects it), but
+nothing would catch a one-character edit to either file before it shipped. Compare S-23, which is
+the same shape for `REDIS_STREAM_NAME` between usage-service and worker-service, and S-19, where
+the identical `app.tenant_id` duplication reached **six** copies before anyone named it.
+
+**Fix direction:** point `apps/gateway/src/constants.ts:14` and
+`apps/usage-service/src/constants.ts:16` at `TENANT_CONTEXT_HEADERS.TENANT_ID` in one change that
+does nothing else, and delete the local literals. Value-identical, no behaviour change, and the
+full gate re-proves it. Do it as its own task, or fold it into the next change that already owns
+one of those two files — not opportunistically inside a third service's feature work.
+
+---
+
+## S-40 · `page` has no upper bound, so a query parameter reaches a `500` — the shape is declared three times across two services — **LOW, open**
+
+Found as F-2 at T-046's Gate-5 QA and re-derived at that task's Gate-3 rework against a running
+billing-service. **Not introduced by T-046**: billing mirrors usage-service's existing
+declaration, which is what `CLAUDE.md` instruction 5 asks for — and that faithful mirroring is
+also the reason fixing it inside T-046 would have left the platform worse, not better (below).
+
+### What is declared
+
+`grep -rn "page: z\." apps packages --include=*.ts`, excluding `dist/` and `tests/`, returns
+**three** lines and no others:
+
+| Site | `page` | `pageSize` |
+|---|---|---|
+| `apps/billing-service/src/validators/invoice-list.validator.ts:31` | `z.coerce.number().int().min(MIN_PAGE).default(DEFAULT_PAGE)` — **no `.max()`** | `.min(MIN_PAGE_SIZE).max(MAX_PAGE_SIZE)` |
+| `apps/usage-service/src/validators/usage-summary.validator.ts:34` | the same against `USAGE_SUMMARY_CONSTANTS` — **no `.max()`** | `.min(...).max(...)` |
+| `packages/shared-validation/src/index.ts:24` (`paginationSchema`) | `z.coerce.number().int().min(1)` — **no `.max()`** | `.min(1).max(100)` |
+
+`pageSize` is bounded in all three; `page` in none. `grep -rn "MAX_PAGE\b" apps/*/src packages/*/src`
+returns no match (exit 1) — the only constant of that family is `MAX_PAGE_SIZE`
+(`apps/usage-service/src/constants.ts:61`, `apps/billing-service/src/constants.ts:200`), and both
+services' `MIN_PAGE` is `1` (`:59`, `:198`).
+
+The third declaration is inert today: `grep -rn "paginationSchema" apps packages --include=*.ts`
+excluding `dist/` returns three lines — the declaration plus an import and a use inside
+`packages/shared-validation/tests/unit.test.ts` — so no production code reads it. It is listed
+because it is the obvious home for one bounded declaration, not because it is live.
+
+The unbounded value is then multiplied into an offset:
+`apps/billing-service/src/repositories/invoice.repository.ts:388` —
+`skip: (query.page - 1) * query.pageSize` — and
+`apps/usage-service/src/repositories/usage.repository.ts:154` —
+`const offset = (input.page - 1) * input.pageSize;` — bound into
+`LIMIT ${input.pageSize} OFFSET ${offset}` at `:162`.
+
+### What it does, measured against a running billing-service
+
+A real process (`npx tsx src/index.ts`, `PORT=3105`, `DATABASE_URL` as `telemetry_app`,
+`REDIS_URL` on db 12), driven with `curl` carrying a valid `X-Internal-Secret` and a valid
+`X-Tenant-Id`:
+
+| Request | Response |
+|---|---|
+| `?page=1` | `200 {"data":{"items":[],"total":0,"page":1,"pageSize":20}}` |
+| `?page=1e17` | `200`, with `"page":100000000000000000` echoed back |
+| `?page=1e18` | **`500 {"code":"INTERNAL_ERROR","message":"Internal server error"}`** |
+| `?page=1e18&pageSize=1` | `200` — `skip` is `1e18 - 1`, still inside `int8` |
+| `?page=1e18&pageSize=100` | `500` |
+| `?page=9223372036854775807&pageSize=1` | `500` — plain decimal, so it is not an artefact of exponent notation |
+| `?page=1e400`, `?page=Infinity` | `400 VALIDATION_ERROR` — `page: Expected integer, received float` |
+| `?page=NaN` | `400` — `page: Expected number, received nan` |
+| `?page=-1` | `400` — `page: Number must be greater than or equal to 1` |
+
+So there is **no single bad page number**: the threshold is wherever `(page - 1) * pageSize`
+leaves the signed 64-bit range, and it moves with `pageSize` — measured in both directions in
+rows 4 and 5.
+
+Verbatim from the process log for `?page=1e18`:
+
+```
+Unable to fit value 20000000000000000000 into a 64-bit signed integer for field `skip`
+```
+
+logged as `"Unexpected error in invoice list controller"` and preceded by
+`"Tenant-scoped transaction failed and was rolled back"`. The error *class* was established
+separately rather than read off that text: calling `invoice.findMany({ where, skip, take: 20 })`
+straight through `@prisma/client` with `skip = 2e19` gives `PrismaClientValidationError`, with
+`e instanceof Prisma.PrismaClientValidationError === true`. The `500` is written by the
+controller's own non-`AppError` arm (`apps/billing-service/src/controllers/billing.controller.ts:72-74`),
+so `registerGlobalErrorHandler` is never reached.
+
+**The message is value-dependent — do not quote it as *the* error.** The numeral is whatever
+`(page - 1) * pageSize` evaluated to, so reproduce the fault, not the string. The same probe with
+`skip = Infinity` (what a large enough `page` produces once the multiplication overflows) returns
+the same class and a different message, `` Argument `skip` is missing. ``, and the service answers
+`500` either way.
+
+**T-046's QA report quoted a third text — `Unable to fit value 2e+307 … for field 'skip'` — and
+that observation is correct. An earlier revision of this entry said it "did not reproduce here for
+any `page` value tried"; the sweep above simply did not try a value that produces it.** The probe
+table jumps `1e18` → `9223372036854775807` → `1e400`, skipping the whole `1e19`–`1e307` band in
+which QA's value sits. Re-measured at T-046's Gate-3 rework round 3 against a billing-service
+process on port 3117 (`telemetry_app` DSN, Redis db 12, valid secret and tenant), `page=1e306`
+logs QA's text **verbatim**:
+
+```
+?page=1e305 -> 500   Unable to fit value 1.9999999999999997e+306 into a 64-bit signed integer for field `skip`
+?page=1e306 -> 500   Unable to fit value 2e+307 into a 64-bit signed integer for field `skip`
+?page=1e307 -> 500   Argument `skip` is missing.
+?page=1e308 -> 500   Argument `skip` is missing.
+```
+
+Measured in four forms, which is also the evidence for the value-dependence above: `?page=1e306`
+(default `pageSize`), `?page=1e306&pageSize=20`, `?page=1e307&pageSize=2` and
+`?page=2e306&pageSize=10` all log `2e+307`, while `?page=1e306&pageSize=1` logs `1e+306`. So the
+numeral tracks the product and not `page`. QA reproduced the fault; the sweep that doubted them
+missed the band. (Gate-6 finding MEDIUM-2.)
+
+### It fails closed, and that is measured rather than reassurance
+
+The `500` is 59 bytes — `content-length: 59`, body exactly
+`{"code":"INTERNAL_ERROR","message":"Internal server error"}`. No error text, no query, no tenant
+id, no stack. The Prisma message quoted above *does* carry the rendered query tree and the tenant
+id, and it appears only in the server log. The transaction is opened (`withTenant` issues its
+`set_config`) and rolled back; `"Invoice"` was at 0 rows before the probes and 0 after.
+
+It is also unreachable unauthenticated, re-measured on the same process: `?page=1e18` with no
+`X-Internal-Secret` is `401 UNAUTHORIZED`, and with the secret but no tenant header is
+`401 TENANT_CONTEXT_MISSING`. Both guards run before the validator.
+
+### usage-service: same declaration, different failure
+
+usage-service's HTTP behaviour was **not** driven. What follows is the bind itself, measured
+directly through Prisma against the same PostgreSQL:
+
+| Bind | Result |
+|---|---|
+| ORM `findMany({ skip: 2e19 })` — billing's shape | `PrismaClientValidationError`, "Unable to fit value … `skip`" |
+| raw ``Prisma.sql`SELECT 1 … LIMIT ${20} OFFSET ${2e19}` `` — usage's shape | `PrismaClientKnownRequestError` — ``Raw query failed. Code: `22003`. Message: `ERROR: bigint out of range` `` |
+| the same raw form with `OFFSET ${1e17}` | succeeds, empty result |
+
+Both error; neither returns wrong rows. (A raw `OFFSET` bind of `Infinity` does **not** error —
+it returned the row, i.e. behaved as offset 0 — but `Infinity` never reaches either repository,
+because `.int()` rejects it with `400` at the validator, measured above. Recorded so nobody
+concludes from the middle row that the raw path always fails loudly.)
+
+### Severity: LOW, with the argument and not just the grade
+
+QA graded it LOW and this rework reaches the same grade independently. It costs a `500` where a
+`400` belongs, plus a log line. It requires a caller who already holds the internal secret and a
+valid tenant — in production, the gateway with a verified JWT. It discloses nothing, crosses no
+tenant boundary, and costs one transaction opened and rolled back, which is no more than a
+successful request costs, so it is not a cheap amplification either. What keeps it above a NIT is
+that it is a *reachable* `500` on a customer-facing endpoint — it will read as an outage to
+whoever watches error rates — and that the same unbounded shape is now declared in three places,
+which is how S-19 and S-39 got to six and three copies respectively.
+
+### Why filed rather than fixed
+
+Fixing only billing gives the platform two strictnesses for one request parameter, which is the
+**S-23** shape — that entry opens *"the producer and the consumer resolve the same
+operator-supplied value through schemas of different strictness"*. Weaker here than there:
+`page` is a per-request client value each service handles independently, not one operator value
+two services must agree on, so the consequence is an inconsistent API rather than a
+producer/consumer disagreement. Fixing both puts usage-service's constants and validator inside a
+billing feature commit, which is the objection **S-8** records for not having been folded into
+S-4 — *"changing two other services' startup contracts inside a usage-service security fix breaks
+the one-task-per-commit rule."* Both entries were re-read on this tree before being cited.
+
+### Fix direction
+
+Bound `page` once in `packages/shared-validation`'s `paginationSchema` — it already exists, it has
+the same hole, and it has no production consumer to break — then have both services derive from it
+and delete their local `page` declarations, adding a `MAX_PAGE` beside each service's existing
+`MAX_PAGE_SIZE` if a per-service ceiling is wanted. Own it as its own task across both services.
+Choose the bound deliberately rather than by arithmetic alone: any `MAX_PAGE` whose product with
+`MAX_PAGE_SIZE` stays inside `2^63` closes the crash, but a far smaller ceiling — a page no honest
+client can reach — closes it with room to spare and makes the `400` meaningful. Add a case per
+service for the chosen bound; today neither the `400`s above nor the `500` is covered by any test.
+
+---
+
+## S-41 · BI16's redness under the tie-break mutation is not reproducible, and the cause is not established — **LOW, open**
+
+Filed at T-046's Gate-3 rework answering Gate 5's `FAIL`, and rewritten at that task's rework
+round 3 answering Gate 6's `CHANGES REQUESTED`. **Nothing user-facing is at risk and no production
+code is implicated**: this is a *test-confidence* gap.
+
+This entry is deliberately smaller than the three revisions before it. Each of those explained
+*why* BI16 behaves as it does, and each explanation was refuted by the next gate on an unchanged
+tree. What follows is only what has survived re-running.
+
+### The instance
+
+`apps/billing-service/tests/billing.integration.test.ts` **BI16** walks a 3-invoice fixture one
+page at a time and asserts that three single-row pages yield three distinct ids. Two of the three
+rows deliberately share `periodStart`; the `id` tie-break in `INVOICE_LIST_ORDER_BY`
+(`apps/billing-service/src/repositories/invoice.repository.ts`) is what makes the order total.
+
+The mutation, throughout: delete `{ [BILLING_INVOICE_LIST.SORT_FIELD_ID]: ... }` from that
+constant, then run `pnpm --filter @telemetry/billing-service test`.
+
+### What holds
+
+- **`BU74c` (`apps/billing-service/tests/invoice.repository.unit.test.ts`) reddens under the
+  mutation.** That has held in every run at every gate, in every database state any gate was in.
+  It asserts the `orderBy` argument against a Prisma mock and never reaches the database. **It is
+  the guard.**
+- **BI16 sometimes reddens and sometimes does not, on an unchanged tree and with a byte-identical
+  mutation.** It has been characterised **five ways across four gates**: that it observes the
+  consequence; that only BU74c reddens; that it stayed green; that it is red 7/7; and that it is
+  state-dependent on row count. Four of those five rest on a measurement, in order: green once
+  (Gate 3), red 7/7 (Gate 5, QA), a two-state split over 8 instrumented runs (the Gate-3 rework),
+  and the **opposite** of that split in both states (Gate 6). Gate 6 also observed BI16 flip from
+  green to red between two consecutive runs with nothing touched — no schema change, no fixture
+  change, no row inserted or deleted. Gate 6's md5 checks establish that its runs and the rework's
+  used the same file contents before and after the mutation.
+- **Do not delete or weaken BI16's walk block on the strength of a green run.** That is the
+  operative instruction and the reason this entry exists. A green BI16 is **not** evidence that
+  the invoice list's tie-break is guarded; BU74c is.
+
+### What is not established
+
+**The cause.** Three things were proposed or observed and none of them resolved it. They are
+listed as observations, not as a mechanism:
+
+- **Row count in `"Invoice"` was proposed as the variable and then refuted.** The Gate-3 rework
+  recorded 0 unrelated rows ⇒ green and 129 rows belonging to another tenant ⇒ red; Gate 6
+  measured the opposite in both states.
+- **Planner statistics move on their own.** Gate 6's green→red flip coincided with
+  `pg_class.reltuples` for `"Invoice"` changing without anyone asking, i.e. an autoanalyze. That
+  it coincided is measured; that it is the cause is not.
+- **A per-`OFFSET` plan split was observed inside a single database state.** Gate 6 measured
+  `OFFSET 0` getting
+  `Limit -> Index Scan Backward using "Invoice_tenantId_periodStart_periodEnd_key"` while
+  `OFFSET 1` and `OFFSET 2` got `Limit -> Sort -> Seq Scan`. BI16's walk issues exactly those
+  three queries, so one walk can mix both plans and neither plan labels a run. That refuted the
+  plan-per-state account the previous revision of this entry gave; it did not supply another.
+
+Two smaller things that also remain unestablished:
+
+- **The plan the suite's own connection actually used.** `auto_explain` is not available on this
+  server, let alone loaded — `show shared_preload_libraries` is empty and
+  `select count(*) from pg_available_extensions where name='auto_explain'` returns `0` — so every
+  plan captured at any gate came from a separate `psql`/Prisma session reproducing the fixture's
+  shape, not from the running case.
+- **Which database state T-046's QA measured in.** Their report records 7/7 red; their state
+  cannot be reconstructed.
+
+### Consequences to act on
+
+- **T-047 inherits this fixture and this repository.** Treat BU74c as the tie-break's guard.
+- Do not delete BI16 because it was green. Do not add a comment explaining why it was green.
+- If a future task needs BI16 to discriminate deterministically, the lever is the fixture or an
+  assertion on the plan — not the assertion on the ids. Nothing in the suite reports which plan
+  ran, and until something does, a run's outcome is not attributable.
+
+### Relation to S-21 — weaker than it looks
+
+S-21 is about **two independent guards where either alone is sufficient**, so reverting one defect
+leaves its own suite green. This entry is about **one** guard whose redness is not reproducible.
+The kinship is only that both are "a guard whose regression evidence is narrower than it reads";
+the mechanisms are different and the fixes do not resemble each other. S-21's text was re-read on
+this tree before being cited.
+
+### This entry's own limitation
+
+`"Invoice"` was `ANALYZE`d during the Gate-3 rework's probes — explicitly once, and by autovacuum
+after 129 rows were inserted and deleted — and **the pre-probe `pg_class` values for the table
+were not captured**, so that series' planner state cannot be pinned. Gate 6 confirmed this was the
+right thing to have disclosed: it captured that baseline, and `pg_class` did move during its own
+series. That does not make the statistics the cause — see above — it makes the missing baseline
+the disclosure that mattered. What *was* checked for both series is that row contents were
+restored (all five tables at 0, `Tenant` at 2, re-counted).
+
+**Fix direction:** none needed in the code. What would close this is a way for an integration test
+to assert the plan it got, at which point BI16's outcome becomes attributable and this entry can
+record what the attribution is. Until then, the durable practice is the one every gate here
+learned the expensive way: record the outcome, and do not write down the mechanism unless the
+refuting case has been run.

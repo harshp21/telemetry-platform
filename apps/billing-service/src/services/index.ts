@@ -4,3 +4,4 @@ export type {
   InvoiceRepositoryFactory,
   MeterRepositoryFactory
 } from "./billing.service";
+export { InvoiceService } from "./invoice.service";

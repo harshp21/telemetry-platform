@@ -5,7 +5,8 @@ import type { TenantId } from "@telemetry/shared-types";
 import { InvoiceRepository } from "../src/repositories/invoice.repository";
 import type { CreateDraftInvoiceInput } from "../src/repositories/invoice.repository";
 import { UsageLinesChangedError } from "../src/errors";
-import { BILLING_DATABASE, BILLING_METERING } from "../src/constants";
+import { BILLING_DATABASE, BILLING_INVOICE_LIST, BILLING_METERING } from "../src/constants";
+import { InvoiceStatus } from "@prisma/client";
 
 const TENANT_ID = "11111111-1111-4111-8111-111111111111" as TenantId;
 const OTHER_TENANT_ID = "22222222-2222-4222-8222-222222222222";
@@ -49,6 +50,9 @@ interface PrismaMockOptions {
   updatedCount?: number;
   /** Count returned per call, in order -- for asserting the sum across chunks. */
   updatedCounts?: readonly number[];
+  /** Raw list rows, spelled the way the driver hands them over: `Prisma.Decimal` and `Date`. */
+  listRows?: readonly Record<string, unknown>[];
+  listTotal?: number;
 }
 
 /**
@@ -74,6 +78,8 @@ const createPrismaMock = (options: PrismaMockOptions = {}) => {
     return result;
   });
   const invoiceLineItemCreate = vi.fn(async () => ({ id: "unused" }));
+  const invoiceFindMany = vi.fn(async () => options.listRows ?? []);
+  const invoiceCount = vi.fn(async () => options.listTotal ?? 0);
   let updateManyCall = 0;
   const usageLineUpdateMany = vi.fn(async (args: { where: { id: { in: string[] } } }) => {
     const index = updateManyCall;
@@ -88,7 +94,12 @@ const createPrismaMock = (options: PrismaMockOptions = {}) => {
   const tx = {
     $queryRaw: queryRaw,
     tenant: { count: tenantCount },
-    invoice: { findUnique: invoiceFindUnique, create: invoiceCreate },
+    invoice: {
+      findUnique: invoiceFindUnique,
+      create: invoiceCreate,
+      findMany: invoiceFindMany,
+      count: invoiceCount
+    },
     invoiceLineItem: { create: invoiceLineItemCreate },
     usageLine: {
       groupBy: usageLineGroupBy,
@@ -106,6 +117,8 @@ const createPrismaMock = (options: PrismaMockOptions = {}) => {
     tenantCount,
     invoiceFindUnique,
     invoiceCreate,
+    invoiceFindMany,
+    invoiceCount,
     invoiceLineItemCreate,
     usageLineGroupBy,
     usageLineFindMany,
@@ -410,5 +423,203 @@ describe("InvoiceRepository.createDraftInvoice", () => {
     // The error object carries no usable `meta.target`, so a P2002 that is not the period
     // constraint must not be reported as an idempotent hit.
     await expect(mock.repository.createDraftInvoice(draftInput())).rejects.toBe(violation);
+  });
+});
+
+/**
+ * Raw list fixtures, spelled the way the driver hands a row over: `totalAmount` a
+ * `Prisma.Decimal` and the three timestamps `Date`s. The point of the block below is that
+ * none of those types survives the repository boundary (D5).
+ */
+const LIST_PERIOD_START_NEWER = new Date("2026-02-01T00:00:00.000Z");
+const LIST_PERIOD_END_NEWER = new Date("2026-03-01T00:00:00.000Z");
+const LIST_CREATED_AT = new Date("2026-03-02T09:15:30.123Z");
+const LIST_FINALIZED_AT = new Date("2026-03-03T10:00:00.000Z");
+const LIST_TOTAL_PRECISE = "1234567.123456";
+const LIST_INVOICE_ID_NEWER = "44444444-4444-4444-8444-444444444444";
+const LIST_TOTAL_COUNT = 3;
+const LIST_PAGE_TWO = 2;
+const LIST_PAGE_SIZE_TWO = 2;
+
+const rawListRow = (overrides: Record<string, unknown> = {}) => ({
+  id: LIST_INVOICE_ID_NEWER,
+  periodStart: LIST_PERIOD_START_NEWER,
+  periodEnd: LIST_PERIOD_END_NEWER,
+  status: InvoiceStatus.PAID,
+  totalAmount: new Prisma.Decimal(LIST_TOTAL_PRECISE),
+  currency: CURRENCY_USD,
+  createdAt: LIST_CREATED_AT,
+  finalizedAt: LIST_FINALIZED_AT,
+  ...overrides
+});
+
+const defaultListQuery = {
+  page: BILLING_INVOICE_LIST.DEFAULT_PAGE,
+  pageSize: BILLING_INVOICE_LIST.DEFAULT_PAGE_SIZE
+} as const;
+
+describe("InvoiceRepository.listInvoices", () => {
+  it("BU74 - filters on the bound tenant only, inside withTenant, with no other tenant id anywhere in the query", async () => {
+    const mock = createPrismaMock({ listRows: [], listTotal: 0 });
+
+    await mock.repository.listInvoices(defaultListQuery);
+
+    // Layer 4 of `.claude/rules/tenant-isolation.md`: the RLS context is set as the first
+    // statement of the transaction the reads run in.
+    expect(mock.transaction).toHaveBeenCalledTimes(1);
+    expect(String(mock.queryRaw.mock.calls[0]?.[0])).toContain(TENANT_SETTING_NAME);
+
+    // And belt-and-braces: the application predicate carries the tenant too, from the
+    // constructor-bound context. `listInvoices` has no `tenantId` parameter, so there is no
+    // caller-supplied value it could have come from.
+    const findManyArgs = firstArg(mock.invoiceFindMany, "invoice.findMany");
+    const countArgs = firstArg(mock.invoiceCount, "invoice.count");
+    expect(findManyArgs.where).toEqual({ tenantId: TENANT_ID });
+    expect(countArgs.where).toEqual({ tenantId: TENANT_ID });
+
+    // The negative assertion is the load-bearing one: no other tenant's id appears anywhere in
+    // either argument tree, not merely "the tenant we expected is present".
+    expect(JSON.stringify(findManyArgs)).not.toContain(OTHER_TENANT_ID);
+    expect(JSON.stringify(countArgs)).not.toContain(OTHER_TENANT_ID);
+  });
+
+  it("BU74b - applies the status filter when given and omits the predicate entirely when not", async () => {
+    const filtered = createPrismaMock({ listRows: [], listTotal: 0 });
+    await filtered.repository.listInvoices({ ...defaultListQuery, status: InvoiceStatus.FINALIZED });
+
+    const unfiltered = createPrismaMock({ listRows: [], listTotal: 0 });
+    await unfiltered.repository.listInvoices(defaultListQuery);
+
+    expect(firstArg(filtered.invoiceFindMany, "invoice.findMany").where).toEqual({
+      tenantId: TENANT_ID,
+      status: InvoiceStatus.FINALIZED
+    });
+    // The count must carry the same predicate, or `total` describes a different row set than
+    // the page does.
+    expect(firstArg(filtered.invoiceCount, "invoice.count").where).toEqual({
+      tenantId: TENANT_ID,
+      status: InvoiceStatus.FINALIZED
+    });
+
+    // Key-level, not `toEqual`: `toEqual` treats `{ tenantId, status: undefined }` as equal to
+    // `{ tenantId }`, so it would not notice an explicit `status: undefined` being sent.
+    const unfilteredWhere = firstArg(unfiltered.invoiceFindMany, "invoice.findMany").where;
+    expect(Object.keys(unfilteredWhere as Record<string, unknown>)).toEqual(["tenantId"]);
+  });
+
+  it("BU74c - pages with skip/take and sorts periodStart desc then id desc", async () => {
+    const mock = createPrismaMock({ listRows: [], listTotal: LIST_TOTAL_COUNT });
+
+    await mock.repository.listInvoices({
+      page: LIST_PAGE_TWO,
+      pageSize: LIST_PAGE_SIZE_TWO
+    });
+
+    const args = firstArg(mock.invoiceFindMany, "invoice.findMany");
+    expect(args.skip).toBe((LIST_PAGE_TWO - 1) * LIST_PAGE_SIZE_TWO);
+    expect(args.take).toBe(LIST_PAGE_SIZE_TWO);
+    // The `id` tie-break is not cosmetic. `Invoice @@unique([tenantId, periodStart, periodEnd])`
+    // leaves `periodStart` non-unique, and offset pagination over a non-total order lets two
+    // rows sharing a period swap between pages -- silently skipping one and repeating another.
+    //
+    // **This assertion is the guard.** It pins the `orderBy` structurally and does not touch the
+    // database. The mutation is deleting `{ [SORT_FIELD_ID]: desc }` from `INVOICE_LIST_ORDER_BY`
+    // (`invoice.repository.ts`) and running the billing suite; this case has reddened under it in
+    // every run at every gate, in every database state any gate was in.
+    //
+    // **A behavioural case exists -- BI16 (`tests/billing.integration.test.ts`) -- and its
+    // redness is not reproducible. Do not delete it on the strength of a run in which it stayed
+    // green.** Under the same mutation on an unchanged tree, four gates measured BI16 four
+    // different ways, and one of them observed it flip from green to red between two consecutive
+    // runs with nothing touched.
+    //
+    // The cause is **not established**, and this comment deliberately does not offer one. Row
+    // count in `"Invoice"` was proposed and then refuted; planner statistics move on their own;
+    // a per-`OFFSET` plan split was observed inside a single database state, which is enough to
+    // rule out labelling a whole run with one plan. Those are observations that did not resolve
+    // it. See `.claude/rules/known-gaps.md` S-41. T-047 inherits this fixture.
+    //
+    // Earlier revisions of this comment asserted, in turn, that BI16 observes the consequence,
+    // that only this case reddens, that BI16 stayed green, and that the outcome is conditional on
+    // the row count. Each was generalised from one state and each was refuted by the next gate.
+    expect(args.orderBy).toEqual([
+      { [BILLING_INVOICE_LIST.SORT_FIELD_PERIOD_START]: BILLING_INVOICE_LIST.SORT_DIRECTION_DESC },
+      { [BILLING_INVOICE_LIST.SORT_FIELD_ID]: BILLING_INVOICE_LIST.SORT_DIRECTION_DESC }
+    ]);
+    // Count is not paged: `total` is the size of the whole filtered set, not of the page.
+    const countArgs = firstArg(mock.invoiceCount, "invoice.count");
+    expect(countArgs).not.toHaveProperty("skip");
+    expect(countArgs).not.toHaveProperty("take");
+  });
+
+  it("BU74d - runs findMany and count inside one transaction so the page and the total describe the same rows", async () => {
+    const mock = createPrismaMock({ listRows: [rawListRow()], listTotal: LIST_TOTAL_COUNT });
+
+    const result = await mock.repository.listInvoices(defaultListQuery);
+
+    // One `$transaction`, not two: a page read and a count read in separate transactions can
+    // straddle a concurrent insert and report a `total` the page cannot be a window onto.
+    expect(mock.transaction).toHaveBeenCalledTimes(1);
+    expect(mock.invoiceFindMany).toHaveBeenCalledTimes(1);
+    expect(mock.invoiceCount).toHaveBeenCalledTimes(1);
+    expect(result.total).toBe(LIST_TOTAL_COUNT);
+  });
+
+  it("BU75 - returns strings and ISO dates, never a Prisma.Decimal or a Date, and preserves a null finalizedAt", async () => {
+    const mock = createPrismaMock({
+      listRows: [rawListRow(), rawListRow({ finalizedAt: null, status: InvoiceStatus.DRAFT })],
+      listTotal: 2
+    });
+
+    const { items } = await mock.repository.listInvoices(defaultListQuery);
+    const [paid, draft] = items;
+
+    // This is the assertion the HTTP layer cannot make. Measured at Gate 1 with no
+    // normalisation present at all: `Prisma.Decimal` defines `toJSON`, so the wire body carries
+    // `"totalAmount":"1234567.123456"` either way and `typeof` on the parsed value is
+    // `"string"`. A route-level test therefore passes whether or not the leak exists, which is
+    // why the catching assertion lives here, below the boundary.
+    expect(typeof paid?.totalAmount).toBe("string");
+    expect(paid?.totalAmount).toBe(LIST_TOTAL_PRECISE);
+    expect(paid?.totalAmount).not.toBeInstanceOf(Prisma.Decimal);
+    expect(paid?.periodStart).not.toBeInstanceOf(Date);
+    expect(paid?.createdAt).not.toBeInstanceOf(Date);
+
+    expect(paid?.periodStart).toBe(LIST_PERIOD_START_NEWER.toISOString());
+    expect(paid?.periodEnd).toBe(LIST_PERIOD_END_NEWER.toISOString());
+    expect(paid?.createdAt).toBe(LIST_CREATED_AT.toISOString());
+    expect(paid?.finalizedAt).toBe(LIST_FINALIZED_AT.toISOString());
+
+    // `null` is preserved rather than coerced to "" -- a DRAFT invoice has not been finalized,
+    // and an empty string would claim it had been, at an unparseable instant.
+    expect(draft?.finalizedAt).toBeNull();
+  });
+
+  it("BU75b - selects exactly the eight InvoiceHeader columns, so no lineItems and no tenantId can be returned", async () => {
+    const mock = createPrismaMock({ listRows: [rawListRow()], listTotal: 1 });
+
+    const { items } = await mock.repository.listInvoices(defaultListQuery);
+    const args = firstArg(mock.invoiceFindMany, "invoice.findMany");
+    const select = args.select as Record<string, unknown>;
+
+    // An explicit `select` rather than a default read: T-047 owns line items, and an
+    // `include: { lineItems: true }` added here would leak rows from a table whose RLS is
+    // inert (S-10). Absent by construction, not by omission.
+    expect(Object.keys(select).sort()).toEqual([
+      "createdAt",
+      "currency",
+      "finalizedAt",
+      "id",
+      "periodEnd",
+      "periodStart",
+      "status",
+      "totalAmount"
+    ]);
+    expect(select).not.toHaveProperty("lineItems");
+    expect(select).not.toHaveProperty("tenantId");
+    expect(args).not.toHaveProperty("include");
+
+    // And the same eight on the way out, so a widened select would have to be deliberate.
+    expect(Object.keys(items[0] ?? {}).sort()).toEqual(Object.keys(select).sort());
   });
 });

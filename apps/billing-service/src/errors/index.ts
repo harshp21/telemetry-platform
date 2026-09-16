@@ -14,6 +14,41 @@ export class InternalApiSecretMissingError extends AppError {
 }
 
 /**
+ * `X-Tenant-Id` was absent, blank or not a single string value (T-046).
+ *
+ * `401` rather than `400`, matching `apps/usage-service/src/errors/index.ts`: the header is
+ * injected by the gateway from verified JWT context, so its absence means the caller did not
+ * arrive through an authenticated path -- not that it sent a malformed request body.
+ */
+export class TenantContextMissingError extends AppError {
+  constructor() {
+    super(
+      BILLING_RESPONSES.CODE_TENANT_CONTEXT_MISSING,
+      BILLING_RESPONSES.HTTP_STATUS_UNAUTHORIZED,
+      BILLING_RESPONSES.MESSAGE_TENANT_CONTEXT_MISSING
+    );
+  }
+}
+
+/**
+ * `X-Tenant-Id` was present but is not a UUID (T-046).
+ *
+ * Distinct from `TenantContextMissingError` on purpose: reusing "header is required" for a
+ * header that *was* supplied misdescribes the failure to whoever reads the log. Both are only
+ * reachable after the caller has proved it is an internal service, so the extra detail is not
+ * exposed to an unauthenticated client.
+ */
+export class TenantContextInvalidError extends AppError {
+  constructor() {
+    super(
+      BILLING_RESPONSES.CODE_TENANT_CONTEXT_INVALID,
+      BILLING_RESPONSES.HTTP_STATUS_UNAUTHORIZED,
+      BILLING_RESPONSES.MESSAGE_TENANT_CONTEXT_INVALID
+    );
+  }
+}
+
+/**
  * Step 1 of the metering logic: the body named a tenant that does not exist.
  *
  * "Does not exist" is measured through the tenant-scoped read itself, so an absent tenant and

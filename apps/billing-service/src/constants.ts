@@ -1,8 +1,9 @@
-import { InvoiceStatus } from "@prisma/client";
+import { InvoiceStatus, Prisma } from "@prisma/client";
 import {
   ERROR_RESPONSES,
   INTERNAL_AUTH_HEADERS,
-  INTERNAL_AUTH_RESPONSES
+  INTERNAL_AUTH_RESPONSES,
+  TENANT_CONTEXT_HEADERS
 } from "@telemetry/shared-types";
 
 import { BILLING_SERVICE_STARTUP } from "./startup.constants";
@@ -11,11 +12,16 @@ export const BILLING_SERVICE_NAME = "billing-service";
 
 export const BILLING_ROUTES = {
   HEALTH: "/health",
-  INTERNAL_BILLING_GENERATE: "/v1/internal/billing/generate"
+  INTERNAL_BILLING_GENERATE: "/v1/internal/billing/generate",
+  INVOICES: "/v1/billing/invoices"
 } as const;
 
 export const BILLING_HEADERS = {
-  INTERNAL_SECRET: INTERNAL_AUTH_HEADERS.INTERNAL_SECRET
+  INTERNAL_SECRET: INTERNAL_AUTH_HEADERS.INTERNAL_SECRET,
+  // Derived, never re-typed. The same string is still a literal in gateway's and
+  // usage-service's own constants files; promoting those two is a separate edit to two other
+  // services and is deliberately not folded in here.
+  TENANT_ID: TENANT_CONTEXT_HEADERS.TENANT_ID
 } as const;
 
 export const BILLING_RESPONSES = {
@@ -36,6 +42,18 @@ export const BILLING_RESPONSES = {
   CODE_VALIDATION_ERROR: ERROR_RESPONSES.CODE_VALIDATION_ERROR,
   CODE_INTERNAL_ERROR: ERROR_RESPONSES.CODE_INTERNAL_ERROR,
   MESSAGE_INTERNAL_ERROR: "Internal server error",
+  // Tenant-context vocabulary (T-046), matching usage-service's codes, messages and 401
+  // status verbatim -- `apps/usage-service/src/constants.ts` USAGE_SERVICE_RESPONSES. Two
+  // codes rather than one: a header that was supplied but malformed is a different diagnosis
+  // from one that was never sent, and whoever reads the log needs to tell them apart. Both are
+  // only reachable after the caller has proved it is the gateway, so neither leaks anything to
+  // an unauthenticated client.
+  CODE_TENANT_CONTEXT_MISSING: "TENANT_CONTEXT_MISSING",
+  MESSAGE_TENANT_CONTEXT_MISSING: "X-Tenant-Id header is required",
+  CODE_TENANT_CONTEXT_INVALID: "TENANT_CONTEXT_INVALID",
+  MESSAGE_TENANT_CONTEXT_INVALID: "X-Tenant-Id header must be a valid UUID",
+  /** The controller's guard for a request that reached it with no tenant on it at all. */
+  MESSAGE_TENANT_CONTEXT_REQUIRED: "Missing tenantId from context",
   CODE_TENANT_NOT_FOUND: "TENANT_NOT_FOUND",
   MESSAGE_TENANT_NOT_FOUND: "Tenant not found",
   // D1: a metricKey with unbilled usage and no active meter fails the whole request rather
@@ -152,6 +170,37 @@ export const BILLING_METERING = {
    * one past the old ceiling, straight through the repository.
    */
   BILLED_UPDATE_CHUNK_SIZE: 1000
+} as const;
+
+/**
+ * Query contract and sort order for `GET /v1/billing/invoices` (T-046).
+ *
+ * The pagination bounds are the epic's numbers and are deliberately identical to
+ * usage-service's `USAGE_SUMMARY_CONSTANTS`, so the two paged endpoints on the platform do not
+ * disagree about what `pageSize=100` means. `pageSize` past the maximum is **rejected**, not
+ * clamped: silently serving a different page size than the client asked for makes the client's
+ * own offset arithmetic wrong.
+ *
+ * **The `id` tie-break is correctness, not tidiness.** `Invoice @@unique([tenantId,
+ * periodStart, periodEnd])` makes `periodStart` near-unique per tenant but not unique -- two
+ * invoices may share a `periodStart` with different `periodEnd`s. Offset pagination over a
+ * non-total order lets such rows swap between pages, which silently skips one row and repeats
+ * another. `BI16` asserts the union of two pages has no duplicate id and covers the full set;
+ * that case is what this second sort key exists for.
+ *
+ * Field names come from Prisma's generated `InvoiceScalarFieldEnum` and the direction from its
+ * `SortOrder`, so a schema rename is a compile error here rather than a runtime surprise --
+ * the same discipline as `BILLING_METERING.INVOICE_STATUS_DRAFT`.
+ */
+export const BILLING_INVOICE_LIST = {
+  DEFAULT_PAGE: 1,
+  DEFAULT_PAGE_SIZE: 20,
+  MIN_PAGE: 1,
+  MIN_PAGE_SIZE: 1,
+  MAX_PAGE_SIZE: 100,
+  SORT_FIELD_PERIOD_START: Prisma.InvoiceScalarFieldEnum.periodStart,
+  SORT_FIELD_ID: Prisma.InvoiceScalarFieldEnum.id,
+  SORT_DIRECTION_DESC: Prisma.SortOrder.desc
 } as const;
 
 export const BILLING_RUNTIME = {

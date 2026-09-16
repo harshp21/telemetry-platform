@@ -12,7 +12,9 @@ import {
   type InvoiceRepositoryFactory,
   type MeterRepositoryFactory
 } from "../services/billing.service";
+import { InvoiceService } from "../services/invoice.service";
 import { InternalController } from "../controllers/internal.controller";
+import { BillingController } from "../controllers/billing.controller";
 
 export interface AppContainer {
   readonly serviceName: string;
@@ -23,7 +25,9 @@ export interface AppContainer {
   readonly meterRepositoryFactory: MeterRepositoryFactory;
   readonly invoiceRepositoryFactory: InvoiceRepositoryFactory;
   readonly billingService: BillingService;
+  readonly invoiceService: InvoiceService;
   readonly internalController: InternalController;
+  readonly billingController: BillingController;
 }
 
 export const createContainer = (
@@ -60,7 +64,11 @@ export const createContainer = (
     invoiceRepositoryFactory,
     containerLogger
   );
+  // Reuses `invoiceRepositoryFactory`: `InvoiceService` needs the same per-request factory the
+  // write path already has, not a second registration and certainly not a singleton.
+  const invoiceService = new InvoiceService(invoiceRepositoryFactory, containerLogger);
   const internalController = new InternalController(billingService, containerLogger);
+  const billingController = new BillingController(invoiceService, containerLogger);
 
   return {
     serviceName,
@@ -71,6 +79,8 @@ export const createContainer = (
     meterRepositoryFactory,
     invoiceRepositoryFactory,
     billingService,
-    internalController
+    invoiceService,
+    internalController,
+    billingController
   };
 };

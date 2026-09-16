@@ -1,4 +1,5 @@
 import { PrismaClient } from "@prisma/client";
+import type { InvoiceStatus } from "@prisma/client";
 import {
   INTEGRATION_ADMIN_DATABASE_URL_FALLBACK,
   INTEGRATION_FIXTURE,
@@ -38,6 +39,28 @@ export interface MeterSpec {
   readonly currency?: string;
   readonly activeFrom?: string;
   readonly activeTo?: string | null;
+}
+
+/**
+ * One seeded invoice header for the T-046 list cases.
+ *
+ * Seeded through the owner connection because the platform's own write path cannot produce
+ * these rows: `InvoiceRepository.createDraftInvoice` writes `DRAFT` only
+ * (`BILLING_METERING.INVOICE_STATUS_DRAFT`) and never sets `finalizedAt`, so a `FINALIZED` or
+ * `PAID` invoice with a non-null `finalizedAt` has no HTTP spelling today. The status filter
+ * and the nullable-timestamp case need both.
+ *
+ * `createdAt` is settable so a case can pin it rather than inherit `now()`.
+ */
+export interface InvoiceSpec {
+  readonly tenantId: string;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+  readonly status: InvoiceStatus;
+  readonly totalAmount: string;
+  readonly currency?: string;
+  readonly createdAt?: string;
+  readonly finalizedAt?: string | null;
 }
 
 export interface FixtureRowCounts {
@@ -216,6 +239,43 @@ export class BillingFixtures {
         }))
       });
     }
+  }
+
+  /**
+   * Seeds invoice headers and returns their ids in the order given.
+   *
+   * No line items: T-046 reads headers only, and `"InvoiceLineItem"` has no enforcing RLS
+   * (S-10), so seeding rows this task never reads would add a cross-tenant surface for
+   * nothing. T-047 is where that changes.
+   */
+  async seedInvoices(specs: readonly InvoiceSpec[]): Promise<string[]> {
+    const ids: string[] = [];
+
+    for (const spec of specs) {
+      this.seedSequence += 1;
+      const id = `${INTEGRATION_ID_PREFIX}invoice-${this.seedSequence}`;
+
+      await this.client.invoice.create({
+        data: {
+          id,
+          tenantId: spec.tenantId,
+          periodStart: new Date(spec.periodStart),
+          periodEnd: new Date(spec.periodEnd),
+          status: spec.status,
+          totalAmount: spec.totalAmount,
+          currency: spec.currency ?? INTEGRATION_FIXTURE.CURRENCY_USD,
+          ...(spec.createdAt === undefined ? {} : { createdAt: new Date(spec.createdAt) }),
+          finalizedAt:
+            spec.finalizedAt === undefined || spec.finalizedAt === null
+              ? null
+              : new Date(spec.finalizedAt)
+        }
+      });
+
+      ids.push(id);
+    }
+
+    return ids;
   }
 
   async countUsageLines(tenantIds: readonly string[], billed: boolean): Promise<number> {

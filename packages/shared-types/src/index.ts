@@ -75,6 +75,35 @@ export const INTERNAL_AUTH_HEADERS = {
 	INTERNAL_SECRET: "x-internal-secret"
 } as const;
 
+/**
+ * The header the gateway re-injects from verified JWT context. For the services that receive
+ * their tenant *from the gateway* -- usage-service and billing-service today -- it is the
+ * source of tenant identity, and a tenant id from anywhere else in the request is forbidden
+ * (`.claude/rules/tenant-isolation.md` § *Forbidden*).
+ *
+ * **Not every service reads it.** auth-service is the deliberate exception: it *discovers* the
+ * tenant from a credential rather than being told it, through the `SECURITY DEFINER` resolvers
+ * of `prisma/migrations/v1_5_auth_tenant_resolvers`, and reads no tenant header at all --
+ * `grep -rn "x-tenant-id" apps/auth-service/src --include=*.ts` returns nothing. See
+ * `.claude/rules/tenant-isolation.md` § *auth-service's pre-tenant path*. An earlier revision
+ * of this docblock called this "the only source of tenant identity a downstream service may
+ * read", which is a universal auth-service refutes -- and this is a shared package that service
+ * imports (review LOW-2).
+ *
+ * Promoted here rather than copied a third time: it was written as a literal in
+ * `apps/gateway/src/constants.ts` and `apps/usage-service/src/constants.ts`, and
+ * billing-service's tenant-context middleware (T-046) would have been the third copy.
+ * `.claude/rules/constants.md` asks for promotion before that copy. The two existing literals
+ * are left alone on purpose -- rewiring them is a two-service edit with no behaviour change,
+ * and it does not belong inside a billing-service task.
+ *
+ * Lower-case because Node lower-cases every inbound header name, so this is the key
+ * `request.headers` is actually indexed by, not the wire spelling.
+ */
+export const TENANT_CONTEXT_HEADERS = {
+	TENANT_ID: "x-tenant-id"
+} as const;
+
 export const INTERNAL_AUTH_RESPONSES = {
 	CODE_UNAUTHORIZED: "UNAUTHORIZED",
 	// Deliberately identical for a missing and for a wrong secret: telling the two apart
