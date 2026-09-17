@@ -595,6 +595,12 @@ comes from `@telemetry/shared-types`, so the dependency direction is established
 own task across all five services, not opportunistically inside the next repository change,
 because it touches every service's data path at once.
 
+**That task inherits S-48.** Billing's copy could give the platform's one RLS-less table a
+type-level guard — a `| "invoiceLineItem"` in `TransactionClient`'s `Omit`, measured at two lines
+— and narrowing one copy and not the other four is precisely this entry's subject. S-48 carries
+the measurements, the limit (it binds `tx`, not `this.prisma`) and the design note that a shared
+base cannot hard-code a per-service model name.
+
 ---
 
 ## S-20 · auth-service's integration fixtures leak permanently, and the reset cannot see it — **MEDIUM, open**
@@ -2740,3 +2746,287 @@ wants a real behavioural guard: run one test as a role that is exempt from the p
 migration owner through `DIRECT_DATABASE_URL` — where the predicate becomes the only control and
 its removal is observable. That was **not** built or attempted here; it is a suggestion, and it
 would need care not to become a test that exercises a connection production never uses.
+
+---
+
+## S-47 · `docs/epics/epic-8-billing-service.md`'s T-047 section diverges from the shipped code in four ways — **LOW, open**
+
+The billing-service sibling of S-29, S-32, S-35 and S-42, which record the same class of defect
+in four *different sections* of `docs/epics/epic-7-worker-service.md`. A **new id** rather than an
+extension of any of those: each of their titles is scoped to its own section and its own file, so
+folding this in would make one of them false — the exact objection S-32 records for not having
+been folded into S-29.
+
+All four re-derived with `grep -n` against the working tree at T-047 Gate 3.
+
+1. **`:115` — "File: `controllers/billing.controller.ts`".** A controller alone cannot deliver
+   this. T-047 shipped a repository method, a service method, a param validator, a route
+   registration and three constants alongside the controller handler — **3 new files and 13
+   changed**, scoped to `apps/billing-service` and derived with
+   `git status --porcelain apps/billing-service | grep -c '^??'` → 3 and the same command with
+   `grep -c '^ M'` → 13. That count read **12** until Gate 5 caught it
+   (`docs/qa/t-047-invoice-detail-endpoint.md`, F-1): this task's own Gate-4 rework added
+   `tests/billing.controller.unit.test.ts` and the number was not re-derived afterwards, which is
+   an S-33 instance landing inside the very file whose S-33 entry catalogues the pattern.
+   Same defect as S-29's first item and S-32's first item.
+2. **`:118` — "Fetch `Invoice` by `id` with `lineItems` included" carries no tenant predicate.**
+   `.claude/rules/tenant-isolation.md` § *Required* is explicit: "Every tenant-scoped query
+   carries an explicit `tenantId` predicate **and** runs inside `withTenant`. Belt and braces —
+   neither alone." The shipped `findDetailById` carries it. Note also that "included" names
+   Prisma's `include`, which returns every column of `"InvoiceLineItem"` — `invoiceId` today, and
+   whatever the table gains later; the shipped code uses a nested `select` and `BU108` asserts
+   `include` is absent.
+3. **`:119` — "Verify `invoice.tenantId === req.tenantId`" is dead code, and implementing it would
+   reverse a decision T-046 made deliberately.** Dead because the foreign row never arrives:
+   measured at T-047 Gate 1 and **re-derived independently at Gate 3** as `telemetry_app`
+   (`rolsuper=f, rolbypassrls=f`, read from `pg_roles`) under tenant B's context, `findFirst` for
+   tenant A's invoice returned `null` **both** with and without the application tenant predicate
+   (probes P1a/P1b). `pg_class` on the same connection: `"Invoice"` is `relrowsecurity = t` with
+   the single policy `invoice_tenant_isolation`, and `"InvoiceLineItem"` is `relrowsecurity = f`
+   with **zero** policies (S-10) — which is why the same bare read against the child table
+   returned A's two line items with their amounts. So the
+   comparison can only ever see `true`. And it requires **selecting `tenantId`**, which
+   `INVOICE_HEADER_SELECT` excludes on purpose and which `BU75b` pins. T-047 filters in the
+   `where` instead.
+4. **`:122-136` — the response block declares no ordering for `lineItems` and takes no position on
+   a repeated `metricKey`.** Not a contradiction; a silence. T-047's D1 (one JSON line per stored
+   row) and D2 (`metricKey asc, id asc`) fill it. Worth recording because the silence is load
+   bearing: one invoice really can carry two `api.request` lines at different unit prices —
+   measured through the shipped repository at Gate 1, `unitPrice` 1 and 5 — since `absorbLateUsage`
+   appends a tranche rather than merging it (S-45 D2).
+
+**What the epic gets right**, stated so this entry is not read as "the section is worthless":
+`:119`'s parenthetical "do not leak existence" is the correct requirement and the shipped code
+meets it more strictly than the line asks — `BI29` asserts the unknown-id and foreign-id responses
+are **deep-equal**, not merely both `404`. And the `:122-136` field list is exactly what shipped,
+five line-item fields included.
+
+**Five sibling entries for two epic files is itself the finding.** S-29, S-32, S-35, S-42 and this
+one all say the same thing about different sections. The economical fix is one consolidated entry
+plus one pass over both files, but that would retire four live ids, which this file's stability
+rule forbids, and it is a docs task with its own review. Recorded rather than done.
+
+**Fix direction:** correct `:115`, `:118` and `:119` in place, and add the ordering and
+repeated-`metricKey` decisions to `:122-136` — or, if the epic files are to stay a historical
+record of what was *specified*, add a forward reference under `:115` pointing at
+`docs/plans/t-047-invoice-detail-endpoint.md` § 3.4. Do **not** "fix" any of them by editing a
+test: T-047's suite pins the shipped behaviour deliberately, with the reasons inline. Pairs with
+S-15's wider point that the epic files are not a reliable manifest.
+
+---
+
+## S-48 · The bare-`invoiceId` read is prevented by convention, and a two-line narrowing would make most of it a compile error — **LOW, open**
+
+`"InvoiceLineItem"` has RLS `FORCE`d but never `ENABLE`d and carries no policy (S-10), so the
+application layer is its **entire** tenant control. `InvoiceRepository` upholds that by exposing no
+method that takes a bare `invoiceId`: line items are reached only as a nested `select` under an
+`"Invoice"` the tenant already matched, and `BU109`
+(`apps/billing-service/tests/invoice.repository.unit.test.ts`) asserts `tx.invoiceLineItem` is
+never touched. That is a **convention plus one test**, not a type.
+
+Measured at T-047's Gate 3 rework, four steps, each a `pnpm --filter @telemetry/billing-service
+exec tsc --noEmit -p tsconfig.json` against the shipped tree (billing's `tsconfig.json` includes
+`tests/**/*.ts`, so this is the whole package):
+
+| Step | Edit | Result |
+|---|---|---|
+| A | `await tx.invoiceLineItem.findMany({ where: { invoiceId: id } })` inserted at the top of `findDetailById`'s `withTenant` callback | **compiles clean** — the convention is not mechanical today |
+| B | A, plus `\| "invoiceLineItem"` added to `TransactionClient`'s `Omit` (`apps/billing-service/src/repositories/base.repository.ts`, the `type TransactionClient = Omit<PrismaClient, …>` declaration) | `error TS2339: Property 'invoiceLineItem' does not exist on type 'TransactionClient'` **on the step-A call itself**, inside `findDetailById`, **plus** `TS2345` at both `markUsageLinesBilled(tx, …)` call sites |
+| C | B, plus `markUsageLinesBilled`'s parameter (`invoice.repository.ts:407`) narrowed to `Omit<Prisma.TransactionClient, "invoiceLineItem">` | both `TS2345` clear; **only** the intended `TS2339` remains |
+| D | C with the step-A re-route removed — i.e. the two narrowings alone | typecheck clean, `Tests 207 passed (207)` |
+
+**Cite this one by method and symbol, not by `file(line,col)`.** The `TS2339`'s reported position
+is the step-A *mutation's own inserted line*, so it moves with anything above `findDetailById`:
+`(733,16)` when this entry was first written, `(740,16)` when Gate 5 re-ran steps A and B
+(`docs/qa/t-047-invoice-detail-endpoint.md`, F-2) and again when the Gate-5 rework re-ran them a
+third time. What is **measured** is that the drift is below `:626`, because the two `TS2345` sites
+were `:467` and `:626` in every run, and step C's parameter has read `:407` at every
+measurement (by `grep -n`, not by having run step C each time); that it is
+`findDetailById`'s docblock growing by seven lines at the Gate-4 rework is the obvious
+explanation and is **inference, not measurement** — the intermediate revision was never committed,
+so there is nothing to diff against. Re-derive the three shipped line numbers with
+`grep -n "markUsageLinesBilled" apps/billing-service/src/repositories/invoice.repository.ts`
+rather than trusting them. Error code, property name and type are the stable part of the citation;
+the line is not.
+
+So the complete change is **two lines** and no behaviour change, and it converts the code-level
+re-route from a convention into `TS2339`.
+
+**The limit, which matters more than the guarantee and was not stated when this was first
+measured.** The narrowing binds `tx` — the `withTenant` callback parameter — and nothing else.
+`TenantScopedRepository` holds `protected readonly prisma: PrismaClient`
+(`base.repository.ts`), so with **both** narrowings in place,
+
+```ts
+await this.prisma.invoiceLineItem.findMany({ where: { invoiceId: id } });
+```
+
+inside that same method **compiles clean** — measured as step E, same command, no diagnostic.
+That route is the worse of the two: it runs outside the transaction, so no
+`set_config('app.tenant_id', …)` has been issued at all, and `"InvoiceLineItem"` has no policy to
+fall back on. State the property as "a `tx.invoiceLineItem` re-route becomes `TS2339`", never as
+"the bare-`invoiceId` read becomes unrepresentable".
+
+**Why this is filed against S-19 rather than fixed in T-047.**
+`apps/billing-service/src/repositories/base.repository.ts` is one of the five copies S-19 records.
+Narrowing billing's copy alone adds a fifth way in which the five disagree, inside a read-endpoint
+commit — the one-task-per-commit objection S-19 raises about itself. The property should be
+decided once, for all five, by whoever unifies them. Recorded as its own id rather than folded
+into S-19 for the reason S-32 and S-35 both give: S-19's title is scoped to *duplication and
+drift*, and this is a missing type-level guarantee in the class, not an instance of the copies
+having diverged.
+
+**One design note for that task, reasoning rather than measurement:** the `Omit` member is
+billing-specific, so a shared `@telemetry/shared-db` base cannot hard-code `"invoiceLineItem"`. It
+would need the excluded-model set as a type parameter (or each service aliasing its own narrowed
+`TransactionClient`), which is a larger decision than the two lines measured above and is exactly
+why it belongs in the unification task rather than here.
+
+**Until then:** keep `BU109`, and keep the `findDetailById` docblock's account of the Prisma
+suppression. They are the whole control.
+
+---
+
+## S-49 · Nothing mechanically notices a Prisma upgrade that would invalidate the `InvoiceLineItem` statement suppression — **LOW, open**
+
+`InvoiceLineItem` is the one tenant-scoped table on the platform the database does not protect:
+`relrowsecurity = f` and **zero** policies (S-10), and no `tenantId` column to write one against.
+Re-queried here:
+
+```
+$ psql -h localhost -U postgres -d telemetry -Atc "select c.relname, c.relrowsecurity,
+    c.relforcerowsecurity, (select count(*) from pg_policy p where p.polrelid=c.oid)
+    from pg_class c join pg_namespace n on n.oid=c.relnamespace
+    where n.nspname='public' and c.relname in ('Invoice','InvoiceLineItem') order by 1;"
+Invoice|t|t|1
+InvoiceLineItem|f|t|0
+```
+
+So the *only* thing keeping `GET /v1/billing/invoices/:id` from returning another tenant's line
+items is that `InvoiceRepository.findDetailById` reaches them through the `Invoice` relation, and
+that **`@prisma/client` suppresses the child statement when the tenant-filtered parent read
+misses**. That is a client behaviour. Nothing re-checks it when the client changes.
+
+### The behaviour, with the command that establishes it
+
+Measured at T-047's Gate-3 rework round 3 — independently of the Gate-1 and Gate-4 derivations, not
+copied from them. A node script using the generated client with query logging
+(`new PrismaClient({ datasources: { db: { url: <DATABASE_URL> } }, log: [{ emit: "event", level:
+"query" }] })` plus `prisma.$on("query", …)`), issuing `findDetailById`'s exact nested select inside
+`$transaction` after `SELECT set_config('app.tenant_id', $1, true)`, counting logged statements
+containing `"InvoiceLineItem"`:
+
+```
+connection: [{"u":"telemetry_app","b":false,"s":false}]     <- current_user, rolbypassrls, rolsuper
+R1 A asks for A's invoice       | result=invoice(lineItems=2) | totalStatements=5 | InvoiceLineItem=1
+R2 B asks for A's invoice       | result=null                 | totalStatements=4 | InvoiceLineItem=0
+R3 B, tenant predicate removed  | result=null                 | totalStatements=4 | InvoiceLineItem=0
+R4 A asks for an unknown uuid   | result=null                 | totalStatements=4 | InvoiceLineItem=0
+```
+
+**1, 0, 0, 0** — the figures `findDetailById`'s docblock carries. The connection line is part of the
+evidence: the read ran as `telemetry_app` with `rolbypassrls = false` and `rolsuper = false`, so
+this is RLS as production sees it, per `.claude/rules/tenant-isolation.md`.
+
+The same script, same connection, shows what the suppression is holding back:
+
+```
+P-bare  invoiceLineItem.findMany({ invoiceId: <A's invoice> }) as tenant B
+        -> [{"metricKey":"api.request","amount":"10"},{"metricKey":"storage.gb","amount":"20"}]
+P-count unfiltered as tenant B -> InvoiceLineItem: 3   Invoice: 1
+```
+
+The unfiltered count is bounded on the parent and unbounded on the child, on one connection.
+
+**Scope it exactly.** This is a behaviour of **`@prisma/client` 6.19.3 on this schema** — not a
+property of the schema, and not something the database enforces. Version re-derived from
+`node_modules/@prisma/client/package.json` (`"version": "6.19.3"`) and from
+`pnpm-lock.yaml` (`'@prisma/client@6.19.3'`).
+
+### What would invalidate it
+
+1. **A Prisma major bump.** The emitted plan for a nested relation select is not a documented
+   contract.
+2. **The `relationJoins` preview feature**, which changes the client to emit a real JOIN rather than
+   two statements. It is **off**: `prisma/schema.prisma`'s `generator client` block is three lines
+   (`generator client {` / `provider = "prisma-client-js"` / `}`) and declares no `previewFeatures`
+   (`grep -n "previewFeatures" prisma/schema.prisma` → no match).
+
+**One trigger is quieter than it looks.** `"@prisma/client": "^6.1.0"` is declared in **six**
+manifests — `grep -rn '"@prisma/client"' apps/*/package.json packages/*/package.json` returns
+analytics, auth, billing, gateway, usage and worker — and the caret resolves to 6.19.3 only in the
+lockfile. A within-major client change therefore arrives on a `pnpm update` with **no manifest
+edit at all**, so the reviewer of that PR sees a lockfile line and no reason to open a billing
+docblock. The major bump and the `previewFeatures` edit are both visible; the lockfile refresh is
+not.
+
+### No test would catch the change, and here is the mutation that establishes the distinction
+
+`BU109` (`apps/billing-service/tests/invoice.repository.unit.test.ts`) asserts that
+`tx.invoiceLineItem`'s `findMany` / `findUnique` / `count` / `create` are never called. It catches a
+**code-level** re-route and does not catch a **client-level** plan change, and the two halves are
+established differently:
+
+- **Code-level, measured.** Rewriting `findDetailById` to read the header alone and then issue
+  `tx.invoiceLineItem.findMany({ where: { invoiceId: id } })` separately, then
+  `pnpm --filter @telemetry/billing-service exec vitest run --reporter=verbose`:
+  `Tests 4 failed | 203 passed (207)`, `Test Files 1 failed | 18 passed (19)` — **BU108, BU109,
+  BU110, BU111**. Reverted; the file re-checksums identical.
+- **Client-level, structural rather than measured.** There is no mutation to run, and that is the
+  point: the source does not change when the client's plan does. `invoice.repository.unit.test.ts:3`
+  imports `PrismaClient` as `import type`, and `:163` is
+  `const prisma = { $transaction: transaction } as unknown as PrismaClient` — a hand-built object.
+  So that suite constructs no `@prisma/client` runtime and issues no SQL; there is no emitted
+  statement for any assertion in it to observe, whatever the client does.
+
+**Not established:** that enabling `relationJoins` actually reddens anything. Doing so regenerates
+the client for all six consumers, which is outside a comment-only round, so it was not run. The
+expectation that a `LEFT JOIN LATERAL` names `"InvoiceLineItem"` in the parent's own statement — and
+would therefore take the three miss rows from `0` to `1` — is **inference from the feature's
+description, not a measurement**. Do not restate it as fact.
+
+### Fix direction
+
+One **integration** test — it must hold a real client against real PostgreSQL, since a double emits
+no SQL — pinning the client's major version and all four statement counts together, so an
+invalidating upgrade is red rather than silent. Concretely it should assert:
+
+- `InvoiceLineItem`-naming statements are **1** for the own-tenant read **and** `0` for each of
+  foreign, unknown and predicate-removed;
+- the own-tenant read actually returned its line items (`lineItems.length === 2` against the
+  fixture), and the total statement counts `5 / 4 / 4 / 4`;
+- `@prisma/client`'s **major** version, read from its `package.json`. Pin the major, not `6.19.3`:
+  an exact pin reddens on every patch bump for no semantic reason, which trains people to bump the
+  literal.
+
+**How it could pass vacuously, which is the part to get right.** If the query-log capture is never
+wired — no `log: [{ emit: "event", level: "query" }]`, or `$on("query")` attached to a different
+client instance — every count is `0`, and a test that asserts only the three *miss* rows passes
+having measured nothing. Asserting the own-tenant `1` in the same case is what makes an empty log
+fail. Likewise, a test that asserts only "foreign equals unknown" passes under any plan including a
+JOIN, and a mis-seeded own-tenant fixture degenerates into a fourth miss case unless the returned
+line items are asserted too. Write the vacuous form first and confirm it is green, then add the
+assertions that make it red — the S-38 discipline.
+
+### Severity
+
+**LOW, argued, with the escalation condition named.** Nothing is wrong today: the four rows have
+now been derived at three gates and the last derivation is above. Both *visible* triggers are
+deliberate edits, and the docblock at `findDetailById` tells whoever makes them exactly which four
+rows to re-measure.
+
+It is not lower than LOW, and is recorded rather than waved off, because the consequence of missing
+it is a cross-tenant read on the one table the database does not protect, and because the lockfile
+path has no reviewer looking at this docblock at all. It becomes **MEDIUM** the moment either of
+these is true: a second production path reads `InvoiceLineItem`, or an upgrade lands without the
+four rows being re-derived in that PR. Today there is exactly one such path, and no direct call at
+all: `grep -rn "invoiceLineItem\." apps/*/src --include=*.ts` returns **five** lines and **all five
+are comments** (`invoice.repository.ts:522`, `:537`, `:539`, `:699`, `:725`). Line items are reached
+only through the `Invoice` relation — the nested `select` in `findDetailById` and the nested
+`create` in `createDraftInvoice` — so `BU109` plus that docblock is the whole control.
+
+Related but distinct, and deliberately a new id rather than an extension: **S-48** is about a
+*type-level* guard on a `tx` re-route — a different mechanism and a different failure — and
+**S-33** is about stale counts in comments, not about a dependency silently invalidating a measured
+behaviour. **S-10** is the reason this matters at all and stays the underlying fix: give
+`InvoiceLineItem` a policy and the client's plan stops being load-bearing.

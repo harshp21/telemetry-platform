@@ -10,10 +10,42 @@ import { BILLING_SERVICE_STARTUP } from "./startup.constants";
 
 export const BILLING_SERVICE_NAME = "billing-service";
 
+/**
+ * Route param and line-item sort order for `GET /v1/billing/invoices/:id` (T-047).
+ *
+ * Declared **above** `BILLING_ROUTES` because that object derives the detail path from
+ * `PARAM_ID`: a `const` referenced before its declaration is a temporal-dead-zone error at
+ * module load, not a hoisted read. The ordering is therefore forced by the derivation, and the
+ * derivation is the point -- the route path and the name the controller reads the param by
+ * cannot drift apart if there is only one spelling of `id`.
+ *
+ * Field names come from Prisma's generated `InvoiceLineItemScalarFieldEnum` and the direction
+ * from its `SortOrder`, the same discipline `BILLING_INVOICE_LIST` already applies, so a schema
+ * rename is a compile error here rather than a runtime surprise.
+ *
+ * **Why two sort keys.** `metricKey` is not unique within an invoice: `absorbLateUsage` appends
+ * a late tranche as its own `InvoiceLineItem` rather than merging it into the existing line
+ * (S-45 D2), so one invoice can carry two `api.request` rows at different unit prices. Ordering
+ * by `metricKey` alone leaves those two in an order PostgreSQL does not promise. Measured at
+ * Gate 1 (plan probe P3): three line items read back with **no** `orderBy` gave `10,20,30`
+ * fresh and `20,30,10` after a single `UPDATE` of the first row -- heap order, and an update
+ * relocates the tuple. `id` is the tie-break that makes the response a function of the data.
+ */
+export const BILLING_INVOICE_DETAIL = {
+  PARAM_ID: "id",
+  SORT_FIELD_METRIC_KEY: Prisma.InvoiceLineItemScalarFieldEnum.metricKey,
+  SORT_FIELD_ID: Prisma.InvoiceLineItemScalarFieldEnum.id,
+  SORT_DIRECTION_ASC: Prisma.SortOrder.asc
+} as const;
+
+const INVOICES_PATH = "/v1/billing/invoices";
+
 export const BILLING_ROUTES = {
   HEALTH: "/health",
   INTERNAL_BILLING_GENERATE: "/v1/internal/billing/generate",
-  INVOICES: "/v1/billing/invoices"
+  INVOICES: INVOICES_PATH,
+  /** Derived from both halves, never re-typed -- see `BILLING_INVOICE_DETAIL` for why. */
+  INVOICE_DETAIL: `${INVOICES_PATH}/:${BILLING_INVOICE_DETAIL.PARAM_ID}`
 } as const;
 
 export const BILLING_HEADERS = {
@@ -88,7 +120,15 @@ export const BILLING_RESPONSES = {
   // both values go to billing's own log line (divergence E1 in the plan). `409` reuses
   // `HTTP_STATUS_CONFLICT`, which already exists above.
   CODE_INVOICE_IMMUTABLE: "INVOICE_IMMUTABLE",
-  MESSAGE_INVOICE_IMMUTABLE: "Invoice is not a draft and cannot absorb late usage"
+  MESSAGE_INVOICE_IMMUTABLE: "Invoice is not a draft and cannot absorb late usage",
+  // T-047 D3: **one** code and **one** message for both "no such invoice" and "that invoice
+  // belongs to another tenant". Two spellings would be an existence oracle -- a caller could
+  // enumerate ids and learn which exist on the platform from the difference. The message says
+  // nothing a caller could not have deduced from the status. `BI29` asserts the two responses
+  // are deep-equal rather than merely both 404, which is the assertion a differing message
+  // would fail and a status-only one would not.
+  CODE_INVOICE_NOT_FOUND: "INVOICE_NOT_FOUND",
+  MESSAGE_INVOICE_NOT_FOUND: "Invoice not found"
 } as const;
 
 /**

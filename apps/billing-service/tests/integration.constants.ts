@@ -1,5 +1,9 @@
 /**
- * Test-scoped constants for `billing.integration.test.ts`.
+ * Test-scoped constants for `billing.integration.test.ts`, and -- since T-047's Gate 3 rework --
+ * for the two unit suites that assert the same field-name lists
+ * (`billing-invoice-detail.route.test.ts`, `invoice.repository.unit.test.ts`). This module has
+ * no imports and no side effects, so a unit suite importing it pulls in no connection, no app
+ * and no Prisma client.
  *
  * Nothing that already exists in `src/` is re-typed here: route paths, header names, HTTP
  * status codes, error codes and the invoice status are imported from `../src/constants` by the
@@ -263,4 +267,142 @@ export const INTEGRATION_LATE_USAGE = {
   ROLLBACK_DELTA: "4",
   /** 2 x `LATE_QUANTITY_API`, the quantity the single appended line item would have carried. */
   ROLLBACK_LINE_QUANTITY: "400.000000"
+} as const;
+
+/**
+ * Fixture vocabulary for the `GET /v1/billing/invoices/:id` cases (T-047, BI28-BI33).
+ *
+ * Amounts reuse `INTEGRATION_FIXTURE`'s rates wherever the two-metric shape is the same one
+ * the generate cases already seed, so a rate change moves both. What is new here is the
+ * **normalised** spelling of each value, which is not the seeded spelling: the repository
+ * crosses the boundary through `String(...)` on a `Prisma.Decimal`, which drops trailing zeros
+ * -- measured in this package, `String(new Prisma.Decimal("1000.000000"))` is `"1000"` and
+ * `String(new Prisma.Decimal("0.010000"))` is `"0.01"`. Writing both spellings out is what lets
+ * the assertion fail; deriving the expectation with the same `String(...)` the implementation
+ * uses would assert nothing.
+ *
+ * The ordering fixture (`ORDERED_*`) is built so that **three** different orders are
+ * distinguishable: insertion order, `id asc` alone, and `metricKey asc, id asc`. See
+ * `LINE_ITEM_ID_*`.
+ */
+export const INTEGRATION_INVOICE_DETAIL = {
+  /**
+   * A well-formed UUID matching no row -- the unknown-id half of the 404 oracle case (BI29).
+   *
+   * It must be a valid UUID: a malformed id is refused by the param validator with `400`
+   * before any repository is built, so it could not reach the same code path the foreign-id
+   * request does, and the two bodies would differ for an uninteresting reason.
+   */
+  UNKNOWN_INVOICE_ID: "0450a5e0-0000-4000-8000-0000000000ff",
+  /**
+   * Explicit invoice ids for the detail cases, as **UUIDs**.
+   *
+   * `BillingFixtures.seedInvoices` otherwise mints a readable `<prefix>invoice-<n>` id, which
+   * this endpoint rejects with `400` before any lookup -- the param is validated as a UUID and
+   * a readable id is not one. Production invoice ids are always UUIDs (`@default(uuid())`), so
+   * these fixtures match what the platform actually stores rather than working around the
+   * validator. Fixed rather than random, so an earlier run's residue is collectable by id.
+   */
+  INVOICE_ID_TENANT_A: "0450a5e0-0000-4000-8000-0000000000a1",
+  INVOICE_ID_TENANT_B: "0450a5e0-0000-4000-8000-0000000000b1",
+  INVOICE_ID_ORDERED: "0450a5e0-0000-4000-8000-0000000000c1",
+  INVOICE_ID_PRECISE: "0450a5e0-0000-4000-8000-0000000000d1",
+  /** BI32's malformed id. Not a UUID in any version, so the validator refuses it. */
+  INVOICE_ID_NOT_A_UUID: "not-a-uuid",
+  /**
+   * Explicit line-item ids for the ordering case, assigned so that no two of the three
+   * candidate orders agree:
+   *
+   * | Order | Result |
+   * |---|---|
+   * | insertion (`storage`, `api` @5, `api` @1) | STORAGE, API_SECOND, API_FIRST |
+   * | `id asc` alone | STORAGE (`-a`), API_FIRST (`-b`), API_SECOND (`-c`) |
+   * | `metricKey asc, id asc` (shipped) | API_FIRST, API_SECOND, STORAGE |
+   *
+   * So dropping `metricKey` from the sort puts `storage.gb` first, and dropping `id` leaves the
+   * two `api.request` rows in an order PostgreSQL does not promise. The storage row deliberately
+   * carries the **lowest** id, which is what makes the first of those two mutations visible.
+   */
+  LINE_ITEM_ID_STORAGE: `${INTEGRATION_ID_PREFIX}line-item-a`,
+  LINE_ITEM_ID_API_FIRST: `${INTEGRATION_ID_PREFIX}line-item-b`,
+  LINE_ITEM_ID_API_SECOND: `${INTEGRATION_ID_PREFIX}line-item-c`,
+  /**
+   * The two `api.request` tranches of one invoice, at **different** unit prices.
+   *
+   * Reachable by construction rather than contrived: `readAndPrice` selects the meter in force
+   * as of `periodStart` at the moment of each call, so an operator who inserts a later
+   * `activeFrom` (still `<= periodStart`) between a generate and an absorption prices the two
+   * tranches differently. This is D1's evidence that a merged line would have no correct
+   * `unitPrice` -- the column is one value per row, and any blend is a rate no meter charged.
+   */
+  DUP_QUANTITY_FIRST: "10.000000",
+  DUP_UNIT_PRICE_FIRST: "1.000000",
+  DUP_AMOUNT_FIRST: "10.000000",
+  DUP_QUANTITY_SECOND: "3.000000",
+  DUP_UNIT_PRICE_SECOND: "5.000000",
+  DUP_AMOUNT_SECOND: "15.000000",
+  /** 10 + 15 + 2.5 */
+  ORDERED_TOTAL: "27.500000",
+  EXPECTED_DUP_QUANTITY_FIRST: "10",
+  EXPECTED_DUP_UNIT_PRICE_FIRST: "1",
+  EXPECTED_DUP_AMOUNT_FIRST: "10",
+  EXPECTED_DUP_QUANTITY_SECOND: "3",
+  EXPECTED_DUP_UNIT_PRICE_SECOND: "5",
+  EXPECTED_DUP_AMOUNT_SECOND: "15",
+  /** Normalised spellings of `INTEGRATION_FIXTURE`'s two-metric rates, for BI28. */
+  EXPECTED_QUANTITY_API: "1000",
+  EXPECTED_QUANTITY_STORAGE: "5",
+  EXPECTED_UNIT_PRICE_API: "0.01",
+  EXPECTED_UNIT_PRICE_STORAGE: "0.5",
+  /** Two lines on BI28's invoice; three on BI31's. */
+  EXPECTED_LINE_COUNT_TWO: 2,
+  EXPECTED_LINE_COUNT_THREE: 3,
+  /**
+   * BI33's `Decimal(18,6)` case, on a **line item** rather than the invoice total -- the second
+   * Decimal surface the list endpoint never had.
+   *
+   * The value is chosen, not copied. `String(Number("123456789012.123456"))` is measured as
+   * `"123456789012.12346"` -- six digits short, so an implementation that let the column become
+   * a JS number cannot produce the seeded string. A value like `"10.000000"` would be useless
+   * here: `String` on a `Prisma.Decimal` drops trailing zeros, so `"10.000000"` and a leaked
+   * Decimal both render `"10"` and the case could not discriminate.
+   *
+   * 12 integer digits plus 6 fractional is exactly the full width of `Decimal(18,6)`, so
+   * `quantity` at this value with `unitPrice` 1 keeps the row arithmetically consistent.
+   */
+  AMOUNT_PRECISE: "123456789012.123456",
+  UNIT_PRICE_ONE: "1.000000",
+  EXPECTED_UNIT_PRICE_ONE: "1",
+  /** Measured: what a double round trip degrades `AMOUNT_PRECISE` to. */
+  AMOUNT_PRECISE_AFTER_FLOAT_ROUND_TRIP: "123456789012.12346",
+  /**
+   * Exactly the five `InvoiceLineItemView` keys -- no `invoiceId`, which is the parent's id.
+   *
+   * **The single spelling, and spelled out on purpose.** Three suites assert against it --
+   * `billing.integration.test.ts` (BI28), `billing-invoice-detail.route.test.ts` (BU119) and
+   * `invoice.repository.unit.test.ts` (BU108) -- and before the Gate 3 rework each carried its
+   * own copy, which is the third copy `.claude/rules/constants.md` asks to be promoted before.
+   * It is **not** derived from `INVOICE_LINE_ITEM_SELECT`: deriving it would compare the
+   * production `select` with itself and a widened select would then pass silently. One
+   * independent list is the point; three is duplication.
+   */
+  LINE_ITEM_FIELDS: ["amount", "id", "metricKey", "quantity", "unitPrice"] as const,
+  /**
+   * Exactly the nine keys of the detail response envelope's `data` -- the eight `InvoiceHeader`
+   * fields plus `lineItems`, and **no `tenantId`**.
+   *
+   * Sorted, because every caller asserts `Object.keys(...).sort()`. Independent of
+   * `INVOICE_HEADER_SELECT` for the same reason `LINE_ITEM_FIELDS` is.
+   */
+  DETAIL_RESPONSE_FIELDS: [
+    "createdAt",
+    "currency",
+    "finalizedAt",
+    "id",
+    "lineItems",
+    "periodEnd",
+    "periodStart",
+    "status",
+    "totalAmount"
+  ] as const
 } as const;

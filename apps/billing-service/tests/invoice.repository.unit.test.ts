@@ -10,11 +10,13 @@ import type {
 import { InvoiceImmutableError, UsageLinesChangedError } from "../src/errors";
 import {
   BILLING_DATABASE,
+  BILLING_INVOICE_DETAIL,
   BILLING_INVOICE_LIST,
   BILLING_METERING,
   BILLING_RESPONSES
 } from "../src/constants";
 import { InvoiceStatus } from "@prisma/client";
+import { INTEGRATION_INVOICE_DETAIL } from "./integration.constants";
 
 const TENANT_ID = "11111111-1111-4111-8111-111111111111" as TenantId;
 const OTHER_TENANT_ID = "22222222-2222-4222-8222-222222222222";
@@ -68,6 +70,11 @@ interface PrismaMockOptions {
   invoiceForAbsorb?: { id: string; status: InvoiceStatus } | Error;
   /** The post-increment total the `update` reports, as the driver would: a `Prisma.Decimal`. */
   absorbedTotalAmount?: string;
+  /**
+   * What `invoice.findFirst` answers on the detail path (T-047), spelled the way the driver
+   * hands it over: `Prisma.Decimal` and `Date` throughout, line items nested under the parent.
+   */
+  detailRow?: Record<string, unknown> | null;
 }
 
 /**
@@ -106,6 +113,17 @@ const createPrismaMock = (options: PrismaMockOptions = {}) => {
   }));
   const invoiceFindMany = vi.fn(async () => options.listRows ?? []);
   const invoiceCount = vi.fn(async () => options.listTotal ?? 0);
+  const invoiceFindFirst = vi.fn(async () => options.detailRow ?? null);
+  /**
+   * The three line-item reads that must never be issued (T-047, BU109).
+   *
+   * They exist on the double purely so that a re-route can be *observed*: a spy that is never
+   * wired cannot be asserted `not.toHaveBeenCalled()` in any meaningful way, because a typo in
+   * the property name would make the assertion pass against nothing.
+   */
+  const invoiceLineItemFindMany = vi.fn(async () => []);
+  const invoiceLineItemFindUnique = vi.fn(async () => null);
+  const invoiceLineItemCount = vi.fn(async () => 0);
   let updateManyCall = 0;
   const usageLineUpdateMany = vi.fn(async (args: { where: { id: { in: string[] } } }) => {
     const index = updateManyCall;
@@ -126,9 +144,15 @@ const createPrismaMock = (options: PrismaMockOptions = {}) => {
       create: invoiceCreate,
       update: invoiceUpdate,
       findMany: invoiceFindMany,
-      count: invoiceCount
+      count: invoiceCount,
+      findFirst: invoiceFindFirst
     },
-    invoiceLineItem: { create: invoiceLineItemCreate },
+    invoiceLineItem: {
+      create: invoiceLineItemCreate,
+      findMany: invoiceLineItemFindMany,
+      findUnique: invoiceLineItemFindUnique,
+      count: invoiceLineItemCount
+    },
     usageLine: {
       groupBy: usageLineGroupBy,
       findMany: usageLineFindMany,
@@ -149,7 +173,11 @@ const createPrismaMock = (options: PrismaMockOptions = {}) => {
     invoiceUpdate,
     invoiceFindMany,
     invoiceCount,
+    invoiceFindFirst,
     invoiceLineItemCreate,
+    invoiceLineItemFindMany,
+    invoiceLineItemFindUnique,
+    invoiceLineItemCount,
     usageLineGroupBy,
     usageLineFindMany,
     usageLineUpdateMany,
@@ -790,5 +818,181 @@ describe("InvoiceRepository.listInvoices", () => {
 
     // And the same eight on the way out, so a widened select would have to be deliberate.
     expect(Object.keys(items[0] ?? {}).sort()).toEqual(Object.keys(select).sort());
+  });
+});
+
+/**
+ * T-047 detail fixtures.
+ *
+ * `DETAIL_*` values are spelled the way the driver hands a row over -- `Prisma.Decimal` and
+ * `Date` -- so the normalisation under test has something real to normalise.
+ */
+const DETAIL_LINE_ITEM_ID_FIRST = "55555555-5555-4555-8555-555555555551";
+const DETAIL_LINE_ITEM_ID_SECOND = "55555555-5555-4555-8555-555555555552";
+const DETAIL_QUANTITY = "1000.000000";
+const DETAIL_UNIT_PRICE = "0.010000";
+const DETAIL_AMOUNT = "10.000000";
+/** What `String(Prisma.Decimal)` makes of the three above -- trailing zeros dropped (D5). */
+const DETAIL_EXPECTED_QUANTITY = "1000";
+const DETAIL_EXPECTED_UNIT_PRICE = "0.01";
+const DETAIL_EXPECTED_AMOUNT = "10";
+
+const rawLineItemRow = (id: string, metricKey: string) => ({
+  id,
+  metricKey,
+  quantity: new Prisma.Decimal(DETAIL_QUANTITY),
+  unitPrice: new Prisma.Decimal(DETAIL_UNIT_PRICE),
+  amount: new Prisma.Decimal(DETAIL_AMOUNT)
+});
+
+const rawDetailRow = (overrides: Record<string, unknown> = {}) => ({
+  ...rawListRow(),
+  lineItems: [
+    rawLineItemRow(DETAIL_LINE_ITEM_ID_FIRST, METRIC_API),
+    rawLineItemRow(DETAIL_LINE_ITEM_ID_SECOND, METRIC_STORAGE)
+  ],
+  ...overrides
+});
+
+describe("InvoiceRepository.findDetailById", () => {
+  it("BU107 - the where is exactly { id, tenantId } with the bound tenant, inside withTenant", async () => {
+    const mock = createPrismaMock({ detailRow: rawDetailRow() });
+
+    await mock.repository.findDetailById(LIST_INVOICE_ID_NEWER);
+
+    // Layer 4: the RLS context is the first statement of the transaction the read runs in.
+    expect(mock.transaction).toHaveBeenCalledTimes(1);
+    expect(String(mock.queryRaw.mock.calls[0]?.[0])).toContain(TENANT_SETTING_NAME);
+
+    const args = firstArg(mock.invoiceFindFirst, "invoice.findFirst");
+    expect(args.where).toEqual({ id: LIST_INVOICE_ID_NEWER, tenantId: TENANT_ID });
+    // The negative is the load-bearing half: no other tenant id anywhere in the argument tree.
+    expect(JSON.stringify(args)).not.toContain(OTHER_TENANT_ID);
+
+    // **Read this before deleting the predicate on the evidence that deleting it is green.**
+    // It *is* green: `"Invoice"` has RLS enabled with `invoice_tenant_isolation`, so a foreign
+    // id answers `null` with or without the `tenantId` term and no behavioural case can tell
+    // the difference (S-46, measured at Gate 1 as probes P1a/P1b -- both `null`). This shape
+    // assertion is the only thing that catches the deletion, exactly as `BU98` is for
+    // `absorbLateUsage`. `.claude/rules/tenant-isolation.md` requires the predicate regardless:
+    // belt and braces, neither alone.
+  });
+
+  it("BU108 - selects the eight header columns plus lineItems, never tenantId and never via include", async () => {
+    const mock = createPrismaMock({ detailRow: rawDetailRow() });
+
+    const detail = await mock.repository.findDetailById(LIST_INVOICE_ID_NEWER);
+    const args = firstArg(mock.invoiceFindFirst, "invoice.findFirst");
+    const select = args.select as Record<string, unknown>;
+
+    // The one spelling of this list lives in `tests/integration.constants.ts`; it is written out
+    // rather than derived from `INVOICE_HEADER_SELECT`, which would compare the production
+    // `select` with itself.
+    expect(Object.keys(select).sort()).toEqual([
+      ...INTEGRATION_INVOICE_DETAIL.DETAIL_RESPONSE_FIELDS
+    ]);
+    // `tenantId` stays out for the reason `INVOICE_HEADER_SELECT` already gives, and because
+    // conforming to the epic's `invoice.tenantId === req.tenantId` check would require putting
+    // it back -- reversing a decision T-046 made deliberately (`BU75b`).
+    expect(select).not.toHaveProperty("tenantId");
+    // `select` on the nested relation, not `include`: `include` returns every column of
+    // `"InvoiceLineItem"`, `invoiceId` included, and grows silently when the table does.
+    expect(args).not.toHaveProperty("include");
+
+    const lineItemArgs = select.lineItems as Record<string, unknown>;
+    const lineItemSelect = lineItemArgs.select as Record<string, unknown>;
+    expect(Object.keys(lineItemSelect).sort()).toEqual([
+      ...INTEGRATION_INVOICE_DETAIL.LINE_ITEM_FIELDS
+    ]);
+    // `invoiceId` is the parent's `id` repeated on every row; echoing it invites a client to
+    // key on it and is one more identifier on the wire for nothing.
+    expect(lineItemSelect).not.toHaveProperty("invoiceId");
+
+    // And the same keys on the way out, so a widened select would have to be deliberate.
+    expect(Object.keys(detail ?? {}).sort()).toEqual(Object.keys(select).sort());
+    expect(Object.keys(detail?.lineItems[0] ?? {}).sort()).toEqual(Object.keys(lineItemSelect).sort());
+  });
+
+  it("BU109 - never touches tx.invoiceLineItem: line items are reached only through the Invoice relation", async () => {
+    const mock = createPrismaMock({ detailRow: rawDetailRow() });
+
+    await mock.repository.findDetailById(LIST_INVOICE_ID_NEWER);
+
+    // **This is the case that makes the routing property a test rather than a grep.**
+    // Measured at Gate 1 as `telemetry_app` under tenant B's context: a bare
+    // `invoiceLineItem.findMany({ where: { invoiceId: <A's invoice> } })` returned tenant A's
+    // two line items with their amounts, and an unfiltered `count()` returned every tenant's
+    // rows. `"InvoiceLineItem"` has `relrowsecurity = f` and zero policies (S-10), so the
+    // database does not stop that read -- the relation is the entire tenant control.
+    //
+    // Scope, stated as measured: this catches a **code-level** re-route, because the call
+    // surface changes. It does not catch a Prisma-level plan change -- see `findDetailById`'s
+    // docblock for the four statement counts that would need re-deriving after a major bump.
+    expect(mock.invoiceLineItemFindMany).not.toHaveBeenCalled();
+    expect(mock.invoiceLineItemFindUnique).not.toHaveBeenCalled();
+    expect(mock.invoiceLineItemCount).not.toHaveBeenCalled();
+    expect(mock.invoiceLineItemCreate).not.toHaveBeenCalled();
+  });
+
+  it("BU110 - orders line items metricKey asc then id asc, from the constants", async () => {
+    const mock = createPrismaMock({ detailRow: rawDetailRow() });
+
+    await mock.repository.findDetailById(LIST_INVOICE_ID_NEWER);
+
+    const select = firstArg(mock.invoiceFindFirst, "invoice.findFirst").select as Record<
+      string,
+      unknown
+    >;
+    const lineItemArgs = select.lineItems as Record<string, unknown>;
+
+    // Structural, and it does not touch the database -- which is the point. The behavioural
+    // sibling is `BI31`, and the tie-break half of that one depends on the order PostgreSQL
+    // happens to hold rows in, which S-41 is the standing record of being non-reproducible.
+    // This assertion reddens on the mutation whatever the heap is doing.
+    expect(lineItemArgs.orderBy).toEqual([
+      { [BILLING_INVOICE_DETAIL.SORT_FIELD_METRIC_KEY]: BILLING_INVOICE_DETAIL.SORT_DIRECTION_ASC },
+      { [BILLING_INVOICE_DETAIL.SORT_FIELD_ID]: BILLING_INVOICE_DETAIL.SORT_DIRECTION_ASC }
+    ]);
+  });
+
+  it("BU111 - normalises every Decimal and Date, and answers null for a miss without throwing", async () => {
+    const found = createPrismaMock({ detailRow: rawDetailRow() });
+    const detail = await found.repository.findDetailById(LIST_INVOICE_ID_NEWER);
+
+    // The header, on `listInvoices`' contract (D6 reuses its two helpers rather than adding a
+    // second pair).
+    expect(typeof detail?.totalAmount).toBe("string");
+    expect(detail?.totalAmount).toBe(LIST_TOTAL_PRECISE);
+    expect(detail?.totalAmount).not.toBeInstanceOf(Prisma.Decimal);
+    expect(detail?.periodStart).toBe(LIST_PERIOD_START_NEWER.toISOString());
+    expect(detail?.createdAt).not.toBeInstanceOf(Date);
+
+    // The line items are the **second** Decimal surface, which the list endpoint never had --
+    // three Decimal columns per row rather than one per invoice.
+    const [first, second] = detail?.lineItems ?? [];
+    for (const item of [first, second]) {
+      expect(typeof item?.quantity).toBe("string");
+      expect(typeof item?.unitPrice).toBe("string");
+      expect(typeof item?.amount).toBe("string");
+      expect(item?.quantity).not.toBeInstanceOf(Prisma.Decimal);
+      expect(item?.unitPrice).not.toBeInstanceOf(Prisma.Decimal);
+      expect(item?.amount).not.toBeInstanceOf(Prisma.Decimal);
+    }
+    expect(first?.quantity).toBe(DETAIL_EXPECTED_QUANTITY);
+    expect(first?.unitPrice).toBe(DETAIL_EXPECTED_UNIT_PRICE);
+    expect(first?.amount).toBe(DETAIL_EXPECTED_AMOUNT);
+    expect(first?.metricKey).toBe(METRIC_API);
+    expect(second?.metricKey).toBe(METRIC_STORAGE);
+
+    // An invoice with no line items is a valid invoice, not a miss: `lineItems` is `[]`.
+    const empty = createPrismaMock({ detailRow: rawDetailRow({ lineItems: [] }) });
+    await expect(empty.repository.findDetailById(LIST_INVOICE_ID_NEWER)).resolves.toMatchObject({
+      lineItems: []
+    });
+
+    // A miss is `null` from this layer -- no throw. Mapping `null` to a `404` is the service's
+    // job, so the repository stays a data accessor and the status lives in one place.
+    const missing = createPrismaMock({ detailRow: null });
+    await expect(missing.repository.findDetailById(LIST_INVOICE_ID_NEWER)).resolves.toBeNull();
   });
 });

@@ -1,6 +1,8 @@
 import type { Logger } from "pino";
 import type { PaginatedResult, TenantId } from "@telemetry/shared-types";
-import type { InvoiceHeader } from "../repositories/invoice.repository";
+import type { InvoiceDetail, InvoiceHeader } from "../repositories/invoice.repository";
+import type { InvoiceDetailParams } from "../validators/invoice-detail.validator";
+import { InvoiceNotFoundError } from "../errors";
 import type { InvoiceRepositoryFactory } from "./billing.service";
 import type { InvoiceListQuery } from "../validators/invoice-list.validator";
 
@@ -49,5 +51,41 @@ export class InvoiceService {
       page: query.page,
       pageSize: query.pageSize
     };
+  }
+
+  /**
+   * One invoice of the requesting tenant, with its line items (T-047).
+   *
+   * The repository comes from the injected factory, bound to the tenant the middleware
+   * validated -- never constructed here, because `tenantId` is a constructor argument of
+   * `TenantScopedRepository` and a singleton would pin one tenant process-wide
+   * (`.claude/rules/tenant-isolation.md`). The invoice id is caller-supplied; the tenant is
+   * not. That asymmetry is the whole design: the id selects a row *within* a scope the caller
+   * does not choose.
+   *
+   * **`null` becomes `InvoiceNotFoundError`, and that is the only mapping this layer makes.**
+   * The repository answers `null` for an unknown id and for another tenant's id alike -- its
+   * read carries the tenant predicate and runs under an RLS context, so a foreign row is
+   * neither returned nor counted -- so one error for both is what the data supports, not a
+   * simplification. Telling them apart would need a second, unscoped read: a cross-tenant
+   * existence oracle, which is exactly what the epic's own "do not leak existence" asks to
+   * avoid. Any other repository failure propagates unchanged; `BillingController` owns the
+   * mapping to a status.
+   */
+  async getInvoice(tenantId: TenantId, params: InvoiceDetailParams): Promise<InvoiceDetail> {
+    const repository = this.createInvoiceRepository(tenantId);
+
+    const invoice = await repository.findDetailById(params.id);
+
+    if (invoice === null) {
+      throw new InvoiceNotFoundError();
+    }
+
+    this.logger.debug(
+      { tenantId, invoiceId: invoice.id, lineItems: invoice.lineItems.length },
+      "Invoice detail read"
+    );
+
+    return invoice;
   }
 }

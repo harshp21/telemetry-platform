@@ -1,5 +1,6 @@
 import { PrismaClient } from "@prisma/client";
 import type { InvoiceStatus } from "@prisma/client";
+import { BILLING_INVOICE_DETAIL } from "../src/constants";
 import {
   INTEGRATION_ADMIN_DATABASE_URL_FALLBACK,
   INTEGRATION_FIXTURE,
@@ -61,6 +62,40 @@ export interface InvoiceSpec {
   readonly currency?: string;
   readonly createdAt?: string;
   readonly finalizedAt?: string | null;
+  /** T-047: line items, written through the nested `create` -- see `InvoiceLineItemSpec`. */
+  readonly lineItems?: readonly InvoiceLineItemSpec[];
+  /**
+   * An explicit invoice id, overriding this helper's readable `<prefix>invoice-<n>` default.
+   *
+   * Needed by every case that feeds the id back into a URL: `GET /v1/billing/invoices/:id`
+   * validates the param as a UUID, and the readable default is not one -- measured, the T-047
+   * cases answered `400` before this existed. Production ids always are UUIDs
+   * (`Invoice.id` is `String @default(uuid())`), so the readable default was only ever legal
+   * because no endpoint had taken an invoice id as input.
+   */
+  readonly id?: string;
+}
+
+/**
+ * One seeded `InvoiceLineItem` (T-047).
+ *
+ * Written through Prisma's **nested** `create` on the parent invoice, never as a bare
+ * `invoiceLineItem.create` keyed by an `invoiceId` the caller supplies. That is the same
+ * routing property the production repository holds (S-10: `"InvoiceLineItem"` has
+ * `relrowsecurity = f` and zero policies, so the parent relation is its only tenant control),
+ * and keeping the fixture on it means no helper here can be copied into `src/` and become the
+ * cross-tenant read `BI30` exists to catch.
+ *
+ * `id` is settable so a case can make the `id asc` tie-break decidable rather than an accident
+ * of insertion order -- `BI31` seeds two rows sharing a `metricKey` and needs to know which is
+ * which. Omitted, Prisma generates a uuid.
+ */
+export interface InvoiceLineItemSpec {
+  readonly metricKey: string;
+  readonly quantity: string;
+  readonly unitPrice: string;
+  readonly amount: string;
+  readonly id?: string;
 }
 
 export interface FixtureRowCounts {
@@ -242,18 +277,20 @@ export class BillingFixtures {
   }
 
   /**
-   * Seeds invoice headers and returns their ids in the order given.
+   * Seeds invoice headers -- and, since T-047, their line items -- returning the invoice ids in
+   * the order given.
    *
-   * No line items: T-046 reads headers only, and `"InvoiceLineItem"` has no enforcing RLS
-   * (S-10), so seeding rows this task never reads would add a cross-tenant surface for
-   * nothing. T-047 is where that changes.
+   * Line items are optional: the T-046 list cases still seed none, because `"InvoiceLineItem"`
+   * has no enforcing RLS (S-10) and rows a case never reads are a cross-tenant surface for
+   * nothing. Where they are seeded they go through the **nested** `create`, so this helper
+   * never issues a write keyed by a bare `invoiceId`.
    */
   async seedInvoices(specs: readonly InvoiceSpec[]): Promise<string[]> {
     const ids: string[] = [];
 
     for (const spec of specs) {
       this.seedSequence += 1;
-      const id = `${INTEGRATION_ID_PREFIX}invoice-${this.seedSequence}`;
+      const id = spec.id ?? `${INTEGRATION_ID_PREFIX}invoice-${this.seedSequence}`;
 
       await this.client.invoice.create({
         data: {
@@ -268,7 +305,20 @@ export class BillingFixtures {
           finalizedAt:
             spec.finalizedAt === undefined || spec.finalizedAt === null
               ? null
-              : new Date(spec.finalizedAt)
+              : new Date(spec.finalizedAt),
+          ...(spec.lineItems === undefined || spec.lineItems.length === 0
+            ? {}
+            : {
+                lineItems: {
+                  create: spec.lineItems.map((item) => ({
+                    ...(item.id === undefined ? {} : { id: item.id }),
+                    metricKey: item.metricKey,
+                    quantity: item.quantity,
+                    unitPrice: item.unitPrice,
+                    amount: item.amount
+                  }))
+                }
+              })
         }
       });
 
@@ -308,10 +358,45 @@ export class BillingFixtures {
     });
   }
 
+  /**
+   * Line items for the suite's tenants, through the owner connection.
+   *
+   * **Two sort keys since T-047**, and the second one is not decoration: `metricKey` is not
+   * unique within an invoice (`absorbLateUsage` appends a tranche rather than merging it), so
+   * `metricKey` alone is a partial order and two rows sharing a key came back in whatever
+   * order the heap held them. That is the same defect `BILLING_INVOICE_DETAIL`'s sort exists
+   * to fix on the response side; a fixture reader used as a cross-check must not be the looser
+   * of the two.
+   *
+   * **No existing caller's expectation moves, measured rather than reasoned about.** Reverting
+   * this to the pre-T-047 `orderBy: { metricKey: "asc" }` and running
+   * `billing.integration.test.ts` three times gave `Tests 36 passed (36)` each time (T-047
+   * Gate 3 rework; the Gate 4 reviewer measured the same three runs independently; Gate 5's QA
+   * measured them a third time). Scope: that one file, on this host, three runs -- not a proof
+   * that no future caller can be disturbed.
+   *
+   * Read that the right way round: **no case goes red when the `id` tie-break is removed**, so it
+   * is unfalsifiable today and must not be deleted on the evidence that deleting it is green --
+   * the S-28 hazard, recorded here rather than in a gap entry because here is where a deleter
+   * reads (T-047 Gate 5, observation O-1).
+   *
+   * The reason is *not* that callers count, filter or sort first -- an earlier revision of this
+   * docblock said so and it is false: `BI1` (`billing.integration.test.ts:194-195`), `BI8`
+   * (`:498-499`) and `BI13` (`:580-587`) all index `lineItems[0]`/`[1]` positionally. They are
+   * undisturbed because each of their fixtures gives every row a **distinct `metricKey`**, so
+   * `metricKey asc` was already a total order for them. The tie-break matters only where one
+   * invoice carries two rows under one key, which is `BI31`'s fixture and no other.
+   *
+   * Sort field and direction come from `BILLING_INVOICE_DETAIL`, the same constants the
+   * production sort uses, so a schema rename is a compile error here too.
+   */
   async readLineItems(tenantIds: readonly string[]) {
     return this.client.invoiceLineItem.findMany({
       where: { invoice: { tenantId: { in: [...tenantIds] } } },
-      orderBy: { metricKey: "asc" },
+      orderBy: [
+        { [BILLING_INVOICE_DETAIL.SORT_FIELD_METRIC_KEY]: BILLING_INVOICE_DETAIL.SORT_DIRECTION_ASC },
+        { [BILLING_INVOICE_DETAIL.SORT_FIELD_ID]: BILLING_INVOICE_DETAIL.SORT_DIRECTION_ASC }
+      ],
       select: { id: true, invoiceId: true, metricKey: true, quantity: true, unitPrice: true, amount: true }
     });
   }

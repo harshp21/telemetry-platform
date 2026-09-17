@@ -1,5 +1,10 @@
 import type { InvoiceStatus, Prisma } from "@prisma/client";
-import { BILLING_DATABASE, BILLING_INVOICE_LIST, BILLING_METERING } from "../constants";
+import {
+  BILLING_DATABASE,
+  BILLING_INVOICE_DETAIL,
+  BILLING_INVOICE_LIST,
+  BILLING_METERING
+} from "../constants";
 import { InvoiceImmutableError, UsageLinesChangedError } from "../errors";
 import { TenantScopedRepository } from "./base.repository";
 
@@ -132,6 +137,39 @@ export interface ListInvoicesQuery {
 }
 
 /** What one page of the list answers with: the window, plus the size of the whole filtered set. */
+/**
+ * One priced line of an invoice, as the detail endpoint returns it (T-047).
+ *
+ * **Three string-valued Decimals**, where `InvoiceHeader` had one. `quantity`, `unitPrice` and
+ * `amount` are all `Decimal(18,6)`, which exceeds IEEE-754 safe precision, so each crosses this
+ * boundary through `toAmountString` -- the same helper `listInvoices` uses, not a second one.
+ *
+ * **No `invoiceId`.** It is the parent's `id` repeated on every row: one more identifier on the
+ * wire for nothing, and echoing it invites a client to key on it. Absent by construction, via
+ * `INVOICE_LINE_ITEM_SELECT`, rather than deleted afterwards.
+ */
+export interface InvoiceLineItemView {
+  readonly id: string;
+  readonly metricKey: string;
+  readonly quantity: string;
+  readonly unitPrice: string;
+  readonly amount: string;
+}
+
+/**
+ * One invoice with its lines: the eight `InvoiceHeader` fields plus `lineItems` (T-047 D5).
+ *
+ * `lineItems` may be empty -- an invoice with no lines is a valid invoice, not a miss -- and is
+ * ordered `metricKey asc, id asc` (D2). A repeated `metricKey` renders as **separate lines**
+ * (D1): `absorbLateUsage` appends a late tranche rather than merging it, and the two tranches
+ * may carry different `unitPrice` values, so a merged line would have no correct value for that
+ * column. Measured through the shipped repository at Gate 1: two `api.request` lines at
+ * `unitPrice` 1 and 5 on one invoice.
+ */
+export interface InvoiceDetail extends InvoiceHeader {
+  readonly lineItems: readonly InvoiceLineItemView[];
+}
+
 export interface InvoiceListPage {
   readonly items: readonly InvoiceHeader[];
   readonly total: number;
@@ -157,6 +195,27 @@ const INVOICE_HEADER_SELECT = {
   createdAt: true,
   finalizedAt: true
 } as const;
+
+/**
+ * The exact five columns of `InvoiceLineItemView` -- deliberately not `invoiceId`.
+ *
+ * An explicit `select` on the nested relation, never `include`: `include` returns every column
+ * the table has, so `invoiceId` would be on the wire today and any column added to
+ * `"InvoiceLineItem"` later would join it without anyone deciding to publish it.
+ */
+const INVOICE_LINE_ITEM_SELECT = {
+  id: true,
+  metricKey: true,
+  quantity: true,
+  unitPrice: true,
+  amount: true
+} as const;
+
+/** `metricKey ASC, id ASC` (T-047 D2). See `BILLING_INVOICE_DETAIL` for why there are two keys. */
+const INVOICE_LINE_ITEM_ORDER_BY = [
+  { [BILLING_INVOICE_DETAIL.SORT_FIELD_METRIC_KEY]: BILLING_INVOICE_DETAIL.SORT_DIRECTION_ASC },
+  { [BILLING_INVOICE_DETAIL.SORT_FIELD_ID]: BILLING_INVOICE_DETAIL.SORT_DIRECTION_ASC }
+] as const;
 
 /** `periodStart DESC, id DESC` (D4). See `BILLING_INVOICE_LIST` for why the tie-break exists. */
 const INVOICE_LIST_ORDER_BY = [
@@ -215,28 +274,31 @@ const toIsoString = (value: Date): string => value.toISOString();
  *    constructor-bound context -- and no method has a `tenantId` parameter through which a
  *    caller could supply a different one.
  * 3. **No method here takes a bare `invoiceId`** -- checkable, and checked:
- *    `grep -n "^  async" invoice.repository.ts` lists six signatures and none has one, and
- *    every `invoiceId` in the file is a local binding, a returned interface field or a comment
- *    -- never a parameter. (Re-run at S-45 Gate 3: `tenantExists`, `findByPeriod`,
- *    `sumUnbilledByMetricKey`, `createDraftInvoice`, `absorbLateUsage`, `listInvoices`. T-046
- *    added the fifth and the count said four until that was corrected; S-45 added the sixth.
- *    Re-run it rather than trusting the numeral, which is the S-33 failure this comment is
- *    itself an instance of. Note the grep is anchored to `^  async` and so **excludes** the
- *    private `markUsageLinesBilled`, which is `private async` -- `grep -nE "^  (private )?async"`
- *    returns seven. Neither takes an `invoiceId` either.) This is a
+ *    `grep -cE "^  async" invoice.repository.ts` returns **seven** and none of those signatures
+ *    has one, and every `invoiceId` in the file is a local binding, a returned interface field
+ *    or a comment -- never a parameter. (Re-run at T-047 Gate 3: `tenantExists`,
+ *    `findByPeriod`, `sumUnbilledByMetricKey`, `createDraftInvoice`, `absorbLateUsage`,
+ *    `listInvoices`, `findDetailById`. T-046 added the fifth and the count said four until that
+ *    was corrected; S-45 added the sixth and T-047 the seventh. Re-run it rather than trusting
+ *    the numeral, which is the S-33 failure this comment is itself an instance of. Note the
+ *    grep is anchored to `^  async` and so **excludes** the private `markUsageLinesBilled`,
+ *    which is `private async` -- `grep -nE "^  (private )?async"` returns **eight**. None of
+ *    the eight takes an `invoiceId` either.) This is a
  *    property of the shape as shipped, not something the type system forbids: nothing stops a
  *    later method adding the parameter, which is why it is written down here. Line items are
  *    written through Prisma's nested `create` on the invoice -- by `createDraftInvoice` and,
- *    since S-45, by `absorbLateUsage`, which are the only two writers on this tree -- and no
- *    method here reads them. That
+ *    since S-45, by `absorbLateUsage`, which are the only two writers on this tree -- and the
+ *    one method that *reads* them, `findDetailById` (T-047), reaches them through the nested
+ *    `select` on a tenant-filtered `Invoice`, never by `invoiceId`. That
  *    matters more here than it would elsewhere: `"InvoiceLineItem"` has `relrowsecurity = f`
  *    and no policy (S-10), and no `tenantId` column to write one against, so the join through
  *    `"Invoice"` is its *only* tenant control. Measured at Gate 1 inside the transaction this code writes in: after
  *    creating an invoice and its line item under tenant A and switching `app.tenant_id`, the
  *    invoice disappeared and the line item did not -- re-measured here by BI9 itself, which
  *    performs exactly that switch against rows this repository wrote. T-045 ships the platform's first rows into
- *    that table; `billing.integration.test.ts` case BI9 pins the gap as it is today so that
- *    closing S-10 turns it red rather than passing unnoticed. T-047 inherits this constraint.
+ *    that table; `billing.integration.test.ts` cases BI9 and BI32 pin the gap as it is today so
+ *    that closing S-10 turns them red rather than passing unnoticed, and `BU109` asserts that
+ *    the detail read never touches `tx.invoiceLineItem` at all.
  *
  * Date predicates go through the ORM only -- never `$queryRaw` -- for the reason recorded on
  * `MeterRepository` and in `CLAUDE.md` § *Raw SQL and timestamps*.
@@ -611,6 +673,101 @@ export class InvoiceRepository extends TenantScopedRepository {
           finalizedAt: row.finalizedAt === null ? null : toIsoString(row.finalizedAt)
         })),
         total
+      };
+    });
+  }
+
+  /**
+   * One invoice of the bound tenant, with its line items (T-047).
+   *
+   * **The signature takes an `id` and no tenant**, matching `listInvoices`: identifiers in,
+   * tenant from `this.where({})`. A parameter nobody can supply cannot be supplied wrongly.
+   * That is a design choice this file makes, not one the compiler makes for it -- see this
+   * class's docblock for the three probes showing what `where<T extends { tenantId?: never }>`
+   * does and does not reject.
+   *
+   * `findFirst`, not `findUnique`. Both work: `findUnique({ where: { id, tenantId } })` is legal
+   * at Prisma 6.19.3 (extended `where` unique, GA since 5.0) and compiles to **identical** SQL,
+   * `LIMIT`/`OFFSET` included, measured side by side at Gate 1. `findFirst` is chosen because it
+   * composes with `this.where({ id })` without depending on that feature.
+   *
+   * ## Why the nested select is safe, and exactly how far that goes
+   *
+   * Prisma emits **two** statements for a nested relation select, not a JOIN. The second is
+   * `SELECT … FROM "InvoiceLineItem" WHERE "invoiceId" IN (…)` -- the same shape that, issued
+   * directly, returns another tenant's line items: measured at Gate 1 as `telemetry_app` under
+   * tenant B's context, `invoiceLineItem.findMany({ where: { invoiceId: <A's invoice> } })`
+   * returned A's two line items with their amounts, and an unfiltered `count()` returned every
+   * tenant's rows. `"InvoiceLineItem"` has `relrowsecurity = f` and **zero** policies (S-10) and
+   * no `tenantId` column to write one against, so the database will not stop it.
+   *
+   * What makes it safe here is that the `IN` list is bound from the tenant-filtered parent read,
+   * and that Prisma **skips the second statement entirely** when the parent read matches
+   * nothing. Re-derived at Gate 3 against this method, counting statements mentioning
+   * `"InvoiceLineItem"` in the query log, one dimension varied at a time:
+   *
+   * | Context | `where` | Result | `InvoiceLineItem` statements |
+   * |---|---|---|---|
+   * | A | `{ id: A_INV, tenantId: A }` | the invoice | **1** |
+   * | B | `{ id: A_INV, tenantId: B }` | `null` | **0** |
+   * | B | `{ id: A_INV }`, predicate removed | `null` | **0** |
+   * | A | `{ id: <unknown uuid>, tenantId: A }` | `null` | **0** |
+   *
+   * **Scope that precisely.** It is a behaviour of `@prisma/client` 6.19.3 on this schema, not
+   * a property of the schema and not something the database enforces. A Prisma major bump, or
+   * enabling the `relationJoins` preview feature (which rewrites nested reads as
+   * `LEFT JOIN LATERAL`), changes the emitted SQL, and this table must be re-measured before
+   * such an upgrade lands -- the re-verification is exactly the four rows above. `BU109` catches
+   * a **code-level** re-route, because the call surface changes; it cannot catch a Prisma-level
+   * plan change, because the call surface would not.
+   *
+   * `BU109` is also the *only* thing catching the re-route: it is a test, not a type. Measured
+   * at the Gate 3 rework -- inserting `tx.invoiceLineItem.findMany({ where: { invoiceId: id } })`
+   * here typechecks clean today, and adding `| "invoiceLineItem"` to `TransactionClient`'s
+   * `Omit` would make it `TS2339` for two lines' cost. Not done here: that file is one of
+   * S-19's five copies. Recorded as **S-48**, with the limit that the narrowing binds `tx` and
+   * not `this.prisma`.
+   *
+   * No date predicate is bound here, so S-19's missing `TimeZone` pin in billing's
+   * `base.repository.ts` cannot bite this path. If one is ever added it goes through the ORM --
+   * never `$queryRaw` (`CLAUDE.md` § *Raw SQL and timestamps*).
+   *
+   * `null` for a miss, and for another tenant's invoice: the two are indistinguishable here by
+   * construction, which is what makes `InvoiceNotFoundError` one error rather than two.
+   */
+  async findDetailById(id: string): Promise<InvoiceDetail | null> {
+    return this.withTenant(async (tx) => {
+      const row = await tx.invoice.findFirst({
+        where: this.where({ id }),
+        select: {
+          ...INVOICE_HEADER_SELECT,
+          lineItems: {
+            select: INVOICE_LINE_ITEM_SELECT,
+            orderBy: [...INVOICE_LINE_ITEM_ORDER_BY]
+          }
+        }
+      });
+
+      if (row === null) {
+        return null;
+      }
+
+      return {
+        id: row.id,
+        periodStart: toIsoString(row.periodStart),
+        periodEnd: toIsoString(row.periodEnd),
+        status: row.status,
+        totalAmount: toAmountString(row.totalAmount),
+        currency: row.currency,
+        createdAt: toIsoString(row.createdAt),
+        finalizedAt: row.finalizedAt === null ? null : toIsoString(row.finalizedAt),
+        lineItems: row.lineItems.map((item) => ({
+          id: item.id,
+          metricKey: item.metricKey,
+          quantity: toAmountString(item.quantity),
+          unitPrice: toAmountString(item.unitPrice),
+          amount: toAmountString(item.amount)
+        }))
       };
     });
   }

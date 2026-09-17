@@ -20,6 +20,7 @@ import {
   INTEGRATION_DATABASE_ROLE,
   INTEGRATION_FIXTURE,
   INTEGRATION_ID_PREFIX,
+  INTEGRATION_INVOICE_DETAIL,
   INTEGRATION_INVOICE_LIST,
   INTEGRATION_LATE_USAGE,
   INTEGRATION_SESSION_TIME_ZONE,
@@ -1518,5 +1519,400 @@ describe(`GET ${BILLING_ROUTES.INVOICES} (integration)`, () => {
     // The tenant id arrives from a gateway-verified JWT, so "no rows" says nothing about
     // whether the tenant exists -- and answering 404 would make this an existence oracle.
     expect(response.statusCode).not.toBe(BILLING_RESPONSES.HTTP_STATUS_NOT_FOUND);
+  });
+});
+
+describe(`GET ${BILLING_ROUTES.INVOICE_DETAIL} (integration)`, () => {
+  const detailHeaders = (
+    tenantId: string = TENANT_A,
+    secret: string = env.INTERNAL_API_SECRET
+  ): Record<string, string> => ({
+    [BILLING_HEADERS.INTERNAL_SECRET]: secret,
+    [BILLING_HEADERS.TENANT_ID]: tenantId
+  });
+
+  const detail = async (id: string, headers: Record<string, string> = detailHeaders()) =>
+    app.inject({
+      method: "GET",
+      url: `${BILLING_ROUTES.INVOICES}/${id}`,
+      headers
+    });
+
+  interface DetailBody {
+    readonly data: Record<string, unknown> & {
+      readonly lineItems: Record<string, unknown>[];
+    };
+  }
+
+  const bodyOf = (response: Awaited<ReturnType<typeof detail>>): DetailBody =>
+    response.json() as DetailBody;
+
+  /** One tenant-A invoice carrying the two-metric line items BI28 and BI30 share. */
+  const seedTwoLineInvoice = async (tenantId: string = TENANT_A): Promise<string> => {
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    const [invoiceId] = await fixtures.seedInvoices([
+      {
+        // An explicit UUID: the readable default `seedInvoices` mints is refused by the param
+        // validator with `400`, and production ids are `@default(uuid())` anyway.
+        id: INTEGRATION_INVOICE_DETAIL.INVOICE_ID_TENANT_A,
+        tenantId,
+        periodStart: INTEGRATION_FIXTURE.PERIOD_START,
+        periodEnd: INTEGRATION_FIXTURE.PERIOD_END,
+        status: BILLING_METERING.INVOICE_STATUS_DRAFT,
+        totalAmount: INTEGRATION_FIXTURE.EXPECTED_TOTAL,
+        lineItems: [
+          {
+            metricKey: INTEGRATION_FIXTURE.METRIC_API,
+            quantity: INTEGRATION_FIXTURE.QUANTITY_API,
+            unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_API,
+            amount: INTEGRATION_FIXTURE.EXPECTED_AMOUNT_API
+          },
+          {
+            metricKey: INTEGRATION_FIXTURE.METRIC_STORAGE,
+            quantity: INTEGRATION_FIXTURE.QUANTITY_STORAGE,
+            unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_STORAGE,
+            amount: INTEGRATION_FIXTURE.EXPECTED_AMOUNT_STORAGE
+          }
+        ]
+      }
+    ]);
+
+    if (invoiceId === undefined) {
+      throw new Error("Expected seedInvoices to return the seeded invoice id");
+    }
+    return invoiceId;
+  };
+
+  it("BI28 - returns the tenant's own invoice with its line items, as the eight header fields plus lineItems", async () => {
+    const invoiceId = await seedTwoLineInvoice();
+
+    const response = await detail(invoiceId);
+
+    expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
+    const { data } = bodyOf(response);
+    expect(Object.keys(data).sort()).toEqual([
+      ...INTEGRATION_INVOICE_DETAIL.DETAIL_RESPONSE_FIELDS
+    ]);
+    expect(data).not.toHaveProperty("tenantId");
+    expect(data.id).toBe(invoiceId);
+    expect(data.totalAmount).toBe(INTEGRATION_FIXTURE.EXPECTED_TOTAL);
+    expect(data.status).toBe(BILLING_METERING.INVOICE_STATUS_DRAFT);
+    expect(data.finalizedAt).toBeNull();
+
+    expect(data.lineItems).toHaveLength(INTEGRATION_INVOICE_DETAIL.EXPECTED_LINE_COUNT_TWO);
+    for (const item of data.lineItems) {
+      expect(Object.keys(item).sort()).toEqual([...INTEGRATION_INVOICE_DETAIL.LINE_ITEM_FIELDS]);
+      expect(item).not.toHaveProperty("invoiceId");
+    }
+
+    // `metricKey asc`: `api.request` before `storage.gb`, which is also the seeded order here
+    // -- the case that makes the sort observable rather than accidental is BI31.
+    const [api, storage] = data.lineItems;
+    expect(api?.metricKey).toBe(INTEGRATION_FIXTURE.METRIC_API);
+    expect(api?.quantity).toBe(INTEGRATION_INVOICE_DETAIL.EXPECTED_QUANTITY_API);
+    expect(api?.unitPrice).toBe(INTEGRATION_INVOICE_DETAIL.EXPECTED_UNIT_PRICE_API);
+    expect(api?.amount).toBe(INTEGRATION_FIXTURE.EXPECTED_AMOUNT_API);
+    expect(storage?.metricKey).toBe(INTEGRATION_FIXTURE.METRIC_STORAGE);
+    expect(storage?.quantity).toBe(INTEGRATION_INVOICE_DETAIL.EXPECTED_QUANTITY_STORAGE);
+    expect(storage?.unitPrice).toBe(INTEGRATION_INVOICE_DETAIL.EXPECTED_UNIT_PRICE_STORAGE);
+    expect(storage?.amount).toBe(INTEGRATION_FIXTURE.EXPECTED_AMOUNT_STORAGE);
+
+    // The lines sum to the header total, which is what makes this a bill rather than two
+    // unrelated numbers.
+    const summed = data.lineItems.reduce(
+      (running, item) => running.add(new Prisma.Decimal(String(item.amount))),
+      new Prisma.Decimal(0)
+    );
+    expect(summed.toString()).toBe(asDecimalString(INTEGRATION_FIXTURE.EXPECTED_TOTAL));
+  });
+
+  it("BI29 - an unknown id and another tenant's id answer byte-identical 404s", async () => {
+    await seedTwoLineInvoice();
+    const [tenantBInvoiceId] = await fixtures.seedInvoices([
+      {
+        id: INTEGRATION_INVOICE_DETAIL.INVOICE_ID_TENANT_B,
+        tenantId: TENANT_B,
+        periodStart: INTEGRATION_FIXTURE.PERIOD_START,
+        periodEnd: INTEGRATION_FIXTURE.PERIOD_END,
+        status: BILLING_METERING.INVOICE_STATUS_DRAFT,
+        totalAmount: INTEGRATION_INVOICE_LIST.TOTAL_TENANT_B,
+        lineItems: [
+          {
+            metricKey: INTEGRATION_FIXTURE.METRIC_API,
+            quantity: INTEGRATION_FIXTURE.QUANTITY_API,
+            unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_API,
+            amount: INTEGRATION_FIXTURE.EXPECTED_AMOUNT_API
+          }
+        ]
+      }
+    ]);
+
+    const unknown = await detail(INTEGRATION_INVOICE_DETAIL.UNKNOWN_INVOICE_ID);
+    const foreign = await detail(String(tenantBInvoiceId));
+
+    expect(unknown.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_NOT_FOUND);
+    expect(foreign.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_NOT_FOUND);
+    expect(unknown.json()).toMatchObject({
+      code: BILLING_RESPONSES.CODE_INVOICE_NOT_FOUND,
+      message: BILLING_RESPONSES.MESSAGE_INVOICE_NOT_FOUND
+    });
+
+    // **Deep-equal, not merely both 404.** D3: anything that distinguishes the two is an
+    // existence oracle -- a caller could enumerate ids and learn which exist on the platform
+    // from a differing `message`, or from a field present in one body and not the other. A
+    // status-only assertion would pass against exactly that leak; this one does not. The raw
+    // payload is compared too, so a difference in key order or whitespace is caught as well.
+    expect(unknown.json()).toEqual(foreign.json());
+    expect(unknown.payload).toBe(foreign.payload);
+    expect(unknown.payload).not.toContain(String(tenantBInvoiceId));
+  });
+
+  it("BI30 - tenant B is refused tenant A's invoice, and A's line items are still there afterwards", async () => {
+    const invoiceId = await seedTwoLineInvoice(TENANT_A);
+
+    const asB = await detail(invoiceId, detailHeaders(TENANT_B));
+
+    expect(asB.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_NOT_FOUND);
+    // Nothing about A's invoice is in the refusal -- not a metric key, not an amount.
+    expect(asB.payload).not.toContain(INTEGRATION_FIXTURE.METRIC_API);
+    expect(asB.payload).not.toContain(INTEGRATION_FIXTURE.METRIC_STORAGE);
+    expect(asB.payload).not.toContain(invoiceId);
+
+    // The rows are genuinely there, read through the **owner** connection: so the 404 above is
+    // a refusal rather than an empty table, which is the difference between isolation and a
+    // broken fixture.
+    const lineItems = await fixtures.readLineItems(SUITE_TENANT_IDS);
+    expect(lineItems).toHaveLength(INTEGRATION_INVOICE_DETAIL.EXPECTED_LINE_COUNT_TWO);
+    expect(lineItems.every((item) => item.invoiceId === invoiceId)).toBe(true);
+
+    // And A still gets its own invoice, so the refusal is scoped to B rather than the endpoint
+    // being broken for everyone.
+    const asA = await detail(invoiceId, detailHeaders(TENANT_A));
+    expect(asA.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
+    expect(bodyOf(asA).data.lineItems).toHaveLength(
+      INTEGRATION_INVOICE_DETAIL.EXPECTED_LINE_COUNT_TWO
+    );
+
+    // **The mutation this case is written against is the re-route, not the predicate.**
+    // Deleting `tenantId` from the `Invoice` lookup is *invisible* to any behavioural test:
+    // `"Invoice"` has RLS enabled with `invoice_tenant_isolation`, so a foreign id answers
+    // `null` either way (S-46; measured at Gate 1 as probes P1a/P1b, both `null`). `BU107` is
+    // the shape case that stands in for it, and the predicate stays because
+    // `.claude/rules/tenant-isolation.md` requires it.
+    //
+    // What this case *does* guard is the routing: replacing the nested `lineItems` select with
+    // a second `tx.invoiceLineItem.findMany({ where: { invoiceId: id } })` merged onto the
+    // header with no early return on a null invoice. `"InvoiceLineItem"` has
+    // `relrowsecurity = f` and zero policies (S-10), so nothing below the application stops it.
+    //
+    // **Confirmed red at Gate 3 under two variants of that edit, and they fail differently --
+    // which is why the assertions below the status line are not decoration.** Both were run
+    // against this suite and against `invoice.repository.unit.test.ts`:
+    //
+    // - *Naive re-route* (spread the possibly-null header): this case fails
+    //   `expected 500 to be 404`. The line-item read runs and finds A's rows, but normalising
+    //   the absent header throws first, so the leak is masked by a crash.
+    // - *Leaking re-route* (answer with whatever the line-item read found when the header is
+    //   null): this case fails `expected 200 to be 404`, and the body tenant B received was
+    //   measured as A's two lines in full --
+    //   `{"metricKey":"api.request","quantity":"1000","unitPrice":"0.01","amount":"10"}` and
+    //   `{"metricKey":"storage.gb",...,"amount":"2.5"}`.
+    //
+    // Under the second variant `BI29` reddens too, because the foreign id stops answering 404.
+    // Do not rewrite this case in a way that stops observing the line items themselves: a
+    // status-only assertion would survive a variant that leaked with a different status.
+  });
+
+  it("BI31 - a repeated metricKey renders as separate lines, ordered metricKey asc then id asc", async () => {
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    // Seeded in an order that agrees with **neither** candidate sort: `storage.gb` first (and
+    // with the lowest id), then the dearer `api.request` tranche, then the cheaper one. So
+    // `id asc` alone would put storage first, and insertion order would too.
+    const [invoiceId] = await fixtures.seedInvoices([
+      {
+        id: INTEGRATION_INVOICE_DETAIL.INVOICE_ID_ORDERED,
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_FIXTURE.PERIOD_START,
+        periodEnd: INTEGRATION_FIXTURE.PERIOD_END,
+        status: BILLING_METERING.INVOICE_STATUS_DRAFT,
+        totalAmount: INTEGRATION_INVOICE_DETAIL.ORDERED_TOTAL,
+        lineItems: [
+          {
+            id: INTEGRATION_INVOICE_DETAIL.LINE_ITEM_ID_STORAGE,
+            metricKey: INTEGRATION_FIXTURE.METRIC_STORAGE,
+            quantity: INTEGRATION_FIXTURE.QUANTITY_STORAGE,
+            unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_STORAGE,
+            amount: INTEGRATION_FIXTURE.EXPECTED_AMOUNT_STORAGE
+          },
+          {
+            id: INTEGRATION_INVOICE_DETAIL.LINE_ITEM_ID_API_SECOND,
+            metricKey: INTEGRATION_FIXTURE.METRIC_API,
+            quantity: INTEGRATION_INVOICE_DETAIL.DUP_QUANTITY_SECOND,
+            unitPrice: INTEGRATION_INVOICE_DETAIL.DUP_UNIT_PRICE_SECOND,
+            amount: INTEGRATION_INVOICE_DETAIL.DUP_AMOUNT_SECOND
+          },
+          {
+            id: INTEGRATION_INVOICE_DETAIL.LINE_ITEM_ID_API_FIRST,
+            metricKey: INTEGRATION_FIXTURE.METRIC_API,
+            quantity: INTEGRATION_INVOICE_DETAIL.DUP_QUANTITY_FIRST,
+            unitPrice: INTEGRATION_INVOICE_DETAIL.DUP_UNIT_PRICE_FIRST,
+            amount: INTEGRATION_INVOICE_DETAIL.DUP_AMOUNT_FIRST
+          }
+        ]
+      }
+    ]);
+
+    const { data } = bodyOf(await detail(String(invoiceId)));
+
+    // D1: three lines, not two. `absorbLateUsage` appends a late tranche rather than merging
+    // it, so one invoice really does carry two `api.request` rows -- and merging them for
+    // display would have no correct `unitPrice`, because the column is one value per row and
+    // any blend is a rate no meter ever charged.
+    expect(data.lineItems).toHaveLength(INTEGRATION_INVOICE_DETAIL.EXPECTED_LINE_COUNT_THREE);
+    expect(data.lineItems.map((item) => item.id)).toEqual([
+      INTEGRATION_INVOICE_DETAIL.LINE_ITEM_ID_API_FIRST,
+      INTEGRATION_INVOICE_DETAIL.LINE_ITEM_ID_API_SECOND,
+      INTEGRATION_INVOICE_DETAIL.LINE_ITEM_ID_STORAGE
+    ]);
+    expect(data.lineItems.map((item) => item.metricKey)).toEqual([
+      INTEGRATION_FIXTURE.METRIC_API,
+      INTEGRATION_FIXTURE.METRIC_API,
+      INTEGRATION_FIXTURE.METRIC_STORAGE
+    ]);
+
+    // The two tranches carry **different** unit prices, which is the whole of D1's argument.
+    const [first, second] = data.lineItems;
+    expect(first?.unitPrice).toBe(INTEGRATION_INVOICE_DETAIL.EXPECTED_DUP_UNIT_PRICE_FIRST);
+    expect(second?.unitPrice).toBe(INTEGRATION_INVOICE_DETAIL.EXPECTED_DUP_UNIT_PRICE_SECOND);
+    expect(first?.unitPrice).not.toBe(second?.unitPrice);
+    expect(first?.quantity).toBe(INTEGRATION_INVOICE_DETAIL.EXPECTED_DUP_QUANTITY_FIRST);
+    expect(second?.quantity).toBe(INTEGRATION_INVOICE_DETAIL.EXPECTED_DUP_QUANTITY_SECOND);
+
+    // **What this case guards, stated as measured rather than as a general property.** Both
+    // sort mutations were applied to `INVOICE_LINE_ITEM_ORDER_BY` at Gate 3 and this case went
+    // red under each:
+    //
+    // - dropping `metricKey` (leaving `id asc`): red, and `BI28` red with it. That one is
+    //   robust by construction -- the ids were chosen so the two orders disagree.
+    // - dropping the `id` tie-break (leaving `metricKey asc`): red in **3 of 3** runs on this
+    //   host. That is a measurement, not a guarantee: the two `api.request` rows are then in an
+    //   order PostgreSQL does not promise, and S-41 is this repository's standing record of a
+    //   tie-break case (the list endpoint's `BI16`) whose redness under exactly this kind of
+    //   mutation turned out not to be reproducible. Do not read "3 of 3" as "always".
+    //
+    // `BU110` is the structural guard that reddens on either mutation whatever the heap is
+    // doing -- verified red under both. Do not delete it on the strength of this case existing.
+    const summed = data.lineItems.reduce(
+      (running, item) => running.add(new Prisma.Decimal(String(item.amount))),
+      new Prisma.Decimal(0)
+    );
+    expect(summed.toString()).toBe(asDecimalString(INTEGRATION_INVOICE_DETAIL.ORDERED_TOTAL));
+  });
+
+  it("BI32 - a malformed id is 400 VALIDATION_ERROR, and S-10 still leaves InvoiceLineItem unprotected", async () => {
+    const invoiceId = await seedTwoLineInvoice();
+
+    const malformed = await detail(INTEGRATION_INVOICE_DETAIL.INVOICE_ID_NOT_A_UUID);
+
+    expect(malformed.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_BAD_REQUEST);
+    expect(malformed.json()).toMatchObject({
+      code: BILLING_RESPONSES.CODE_VALIDATION_ERROR
+    });
+    // 400, not 404: the id is malformed rather than missing, and it could not be any tenant's
+    // invoice id, so this distinction leaks nothing that the 404 conceals.
+    expect(malformed.statusCode).not.toBe(BILLING_RESPONSES.HTTP_STATUS_NOT_FOUND);
+
+    // `BI9`'s sibling marker, from the detail endpoint's side. Read on the **service**
+    // connection (`telemetry_app`, `NOSUPERUSER NOBYPASSRLS`) with tenant B's context set, i.e.
+    // exactly the connection and context the endpoint itself runs under: the `Invoice` row
+    // disappears and its `InvoiceLineItem` rows do not, because `"InvoiceLineItem"` has
+    // `relrowsecurity = f` and zero policies (S-10) and no `tenantId` column to write one
+    // against.
+    //
+    // That is why the endpoint reads line items **only** through the `Invoice` relation, and
+    // why `InvoiceRepository` exposes no method taking a bare `invoiceId`. When S-10 is closed
+    // this expectation goes red -- the line-item count under the other tenant becomes 0.
+    // Change it deliberately then, and delete this comment with it.
+    const rows = await app.container.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT set_config('app.tenant_id', ${TENANT_B}, true)`;
+      const invoices = await tx.$queryRaw<
+        { count: bigint }[]
+      >`SELECT COUNT(*) AS count FROM "Invoice" WHERE "id" = ${invoiceId}`;
+      const lineItems = await tx.$queryRaw<
+        { count: bigint }[]
+      >`SELECT COUNT(*) AS count FROM "InvoiceLineItem" WHERE "invoiceId" = ${invoiceId}`;
+      return {
+        invoices: Number(invoices[0]?.count ?? 0),
+        lineItems: Number(lineItems[0]?.count ?? 0)
+      };
+    });
+
+    expect(rows.invoices).toBe(0);
+    expect(rows.lineItems).toBe(INTEGRATION_INVOICE_DETAIL.EXPECTED_LINE_COUNT_TWO);
+  });
+
+  it("BI33 - Decimal(18,6) survives on a line item exactly, asserted below the HTTP boundary", async () => {
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    const [invoiceId] = await fixtures.seedInvoices([
+      {
+        id: INTEGRATION_INVOICE_DETAIL.INVOICE_ID_PRECISE,
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_FIXTURE.PERIOD_START,
+        periodEnd: INTEGRATION_FIXTURE.PERIOD_END,
+        status: BILLING_METERING.INVOICE_STATUS_DRAFT,
+        totalAmount: INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE,
+        lineItems: [
+          {
+            metricKey: INTEGRATION_FIXTURE.METRIC_API,
+            quantity: INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE,
+            unitPrice: INTEGRATION_INVOICE_DETAIL.UNIT_PRICE_ONE,
+            amount: INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE
+          }
+        ]
+      }
+    ]);
+
+    const { data } = bodyOf(await detail(String(invoiceId)));
+    expect(data.lineItems[0]?.amount).toBe(INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE);
+    expect(data.lineItems[0]?.quantity).toBe(INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE);
+    expect(data.lineItems[0]?.unitPrice).toBe(
+      INTEGRATION_INVOICE_DETAIL.EXPECTED_UNIT_PRICE_ONE
+    );
+
+    // The decisive assertions, and they have to be below HTTP. `Prisma.Decimal` defines
+    // `toJSON`, so the wire body is byte-identical whether or not the value was normalised --
+    // measured at Gate 1 on this very shape, with `lineItems` included. `BU75`/`BI18` are
+    // T-046's precedent for the same limit; line-item `quantity`, `unitPrice` and `amount` are
+    // the **second** Decimal surface, three columns per row where the list had one per invoice.
+    const repository = app.container.invoiceRepositoryFactory(TENANT_A);
+    const fromRepository = await repository.findDetailById(String(invoiceId));
+
+    expect(fromRepository).not.toBeNull();
+    const [line] = fromRepository?.lineItems ?? [];
+    expect(typeof line?.amount).toBe("string");
+    expect(typeof line?.quantity).toBe("string");
+    expect(typeof line?.unitPrice).toBe("string");
+    expect(line?.amount).not.toBeInstanceOf(Prisma.Decimal);
+    expect(line?.quantity).not.toBeInstanceOf(Prisma.Decimal);
+    expect(line?.unitPrice).not.toBeInstanceOf(Prisma.Decimal);
+    expect(fromRepository?.periodStart).not.toBeInstanceOf(Date);
+    expect(fromRepository?.createdAt).not.toBeInstanceOf(Date);
+
+    // Precision, stated as what was measured: 18 significant digits do not fit a double, and
+    // `String(Number(...))` degrades this value to `AMOUNT_PRECISE_AFTER_FLOAT_ROUND_TRIP`. So
+    // an implementation that let the column become a JS number at any point could not produce
+    // the seeded string -- it would produce the shorter one. A fixture like `"10.000000"` could
+    // not discriminate at all: `String` on a `Prisma.Decimal` drops trailing zeros, so both the
+    // leaked and the normalised value render `"10"`.
+    expect(String(Number(INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE))).toBe(
+      INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE_AFTER_FLOAT_ROUND_TRIP
+    );
+    expect(line?.amount).toBe(INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE);
+    expect(line?.amount).not.toBe(
+      INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE_AFTER_FLOAT_ROUND_TRIP
+    );
+    expect(asDecimalString(line?.amount)).toBe(
+      asDecimalString(INTEGRATION_INVOICE_DETAIL.AMOUNT_PRECISE)
+    );
   });
 });

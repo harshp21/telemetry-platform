@@ -157,3 +157,26 @@ export class InvoiceImmutableError extends AppError {
     );
   }
 }
+
+/**
+ * T-047 D3: the requested invoice is not the bound tenant's, or does not exist.
+ *
+ * **One error for both, deliberately.** `InvoiceRepository.findDetailById` answers `null` in
+ * either case and cannot tell them apart -- the read carries the tenant predicate and runs
+ * under an RLS context, so a foreign row is not returned and not counted. Distinguishing them
+ * would require a second, unscoped read, which is exactly the cross-tenant existence oracle
+ * the epic's own wording asks to avoid (`docs/epics/epic-8-billing-service.md:119`, "do not
+ * leak existence"). `BI29` pins it by asserting the unknown-id and foreign-id responses are
+ * deep-equal.
+ *
+ * `404` rather than `403`: a `403` would confirm the resource exists.
+ */
+export class InvoiceNotFoundError extends AppError {
+  constructor() {
+    super(
+      BILLING_RESPONSES.CODE_INVOICE_NOT_FOUND,
+      BILLING_RESPONSES.HTTP_STATUS_NOT_FOUND,
+      BILLING_RESPONSES.MESSAGE_INVOICE_NOT_FOUND
+    );
+  }
+}
