@@ -1407,6 +1407,15 @@ edit was in place.
 That is two of the five rows, and it is how a count and its grep disagree by exactly one while
 both look right.
 
+**A third shape, added at S-45's Gate-4 review: a `file:line` citation broken by the citing
+change's own edit.** S-45 inserted a 13-line forward-reference block into
+`docs/epics/epic-8-billing-service.md` and, in the same diff, added four citations of a line that
+the insert had moved -- `grep -n "INVOICE_IMMUTABLE" docs/epics/epic-8-billing-service.md` puts
+the **Error response** declaration at `:171` where all four said `:158`. The remedy that generalises
+is the one applied there: **cite the section heading, not a line inside a file the change is
+editing.** The Gate-4 reviewer counted it as that session's sixth instance of this entry's shape;
+the count is theirs, not re-derived here.
+
 **Why LOW.** No instance caused wrong behaviour. The cost is reviewer time and the erosion of
 `.claude/rules/`' authority — `CLAUDE.md` tells agents to trust these files without
 re-verification.
@@ -1669,6 +1678,17 @@ the case must go red, and if it does not, it is measuring the existence check in
 
 **Not a correctness risk today.** Both paths return the same `200 { data: { invoiceId } }`, so a
 lost race is already indistinguishable to the caller. What is untested is that it *stays* that way.
+
+**S-45 gave that path a second consumer, and did not close this.** `BillingService` no longer
+returns `createDraftInvoice`'s `created: false` to the caller: it re-reads the unbilled set once
+and routes into the absorb branch, because the loser's own transaction — including its billed
+update — has rolled back, and if it read a *superset* of the winner's set those extra rows would
+stay unbilled while the caller got a `200`. That is S-45's own defect reached through a different
+door, which is why the arm exists. It ships with **unit coverage only** (`BU94` drives the
+routing, `BU94b` the ordinary case where the winner billed everything), which is exactly the
+coverage this entry already records as insufficient — a repository double, not a real unique
+violation. Whoever writes the real-connection test now has two paths to cover, not one, and the
+vacuity trap above applies to both.
 
 ---
 
@@ -2178,7 +2198,193 @@ a third strictness). Do not tighten worker alone.
 
 ---
 
-## S-45 · Usage landing in a window whose invoice already exists is never billed **by the job**, and the job reports success — **MEDIUM, open**
+## S-45 · Usage landing in a window whose invoice already exists is never billed **by the job**, and the job reports success — **LOW, largely closed by the S-45 change; kept for the residuals**
+
+> **Closed by the billing-service change reviewed in
+> `docs/reviews/s-045-late-usage-absorption.md`, and this entry is kept for what that change
+> deliberately did not do.** (The plan of the same name is context, not evidence: `CLAUDE.md`
+> says a plan marks a task *started*, so it cannot carry "closed by" — review NIT.) Fix direction 1 below
+> was taken: `findByPeriod`'s result is now a *branch*, not an early return. When an invoice
+> exists for the period and unbilled usage remains, `BillingService` prices it and
+> `InvoiceRepository.absorbLateUsage` adds it to that invoice in one transaction — line items
+> appended (never merged), `totalAmount` raised by a SQL `{ increment }`, the rows marked
+> billed through the same chunked helper `createDraftInvoice` uses. A non-`DRAFT` invoice is
+> refused with `409 INVOICE_IMMUTABLE` and nothing is written. The response gains
+> `absorbed: boolean` beside `created`, and the line count goes to billing's log line.
+>
+> **Confirmed red before the fix**, on the tree at `07ed02a`, which is the property this entry
+> spent a paragraph demanding: `BI22` failed at `expected false to be true` on the late row's
+> `billed`, and — with that assertion temporarily pinned to the defect so execution reached the
+> next one — at `expected '12.5' to be '14.5'` on the invoice total. `BI23` failed
+> `expected 200 to be 409`. Those are the two named red values this entry asked for, in the two
+> places it asked for them.
+>
+> **Eight residuals, none of them the revenue loss:**
+>
+> 1. **worker's log line still prints only `created`** (plan D5, user-confirmed at Gate 2). The
+>    job's summary does not count absorptions, so *worker's* observability cannot tell a
+>    retro-billing from a no-op even though billing's can. worker-service was not touched by
+>    this change. T-057 owns metrics.
+> 2. **S-38 is not closed** — see its own entry; the lost-race arm now routes into the absorb
+>    branch, which gives that path a second consumer and still no real-connection test.
+> 3. **S-10 is not closed.** `"InvoiceLineItem"` RLS is still inert, so the application route is
+>    still the entire tenant control on the line-item write. `BI9` stays as the marker.
+> 4. **The isolation case cannot distinguish the two isolation layers. Minted as S-46** at this
+>    change's Gate-4 review, because it is platform-wide rather than billing's. In short:
+>    `BI24` stays green when the application tenant predicate is removed, since `"Invoice"` RLS
+>    supplies the same answer. What *is* guarded, and by what, is stated in S-46 — briefly, the
+>    structural "no `invoiceId` parameter" property is caught by **`BU98`** (the address) and
+>    **`BU99`** (the line-item route), both named unit cases and both measured red under the
+>    mutation that reintroduces the parameter; an earlier revision of this bullet credited grep
+>    and `BU99` alone, having run only the integration suite.
+> 5. **A re-run of an already-invoiced period can now answer `422` where it always answered
+>    `200`** — an unstated contract change until this bullet, added at Gate 4 (review LOW-3).
+>    Before the change, `findByPeriod !== null` returned `200` unconditionally; now the unbilled
+>    read and both D1 refusals run first on that branch, so a late row carrying a `metricKey`
+>    with no active meter raises `MeterNotFoundError` or `MeterCurrencyConflictError`. It is the
+>    intended behaviour — `BU97` pins it, and a loud refusal beats silently skipping usage — but
+>    the operational consequence is that worker's nightly job counts that tenant `failed: 1`:
+>    `apps/worker-service/src/services/billing-client.service.ts` throws on any status that is
+>    not `200`/`201` (re-read at Gate 4, the status check and the throw are there). Also written
+>    into `BillingService`'s ordering docblock, which is where the ordering is explained.
+>
+>    **Two consequences this bullet did not state, added at the Gate-3 rework round 2 that
+>    answered Gate-5 QA's G-1 — and one of QA's two is corrected here rather than copied.** Measured
+>    against the real billing-service as a real process on `telemetry_app`, driven over HTTP,
+>    with fixtures seeded and asserted through `DIRECT_DATABASE_URL`, plus the real
+>    `runInvoiceGenerationJob` over the real `BillingEnumerationRepository` (as
+>    `telemetry_worker_app`) at pinned `now` values. Fixtures removed afterwards; the five tables
+>    back to `0`.
+>
+>    - **One unpriceable row blocks every other late row in the same window.** An invoice of
+>      `10.000000` for `[2026-07-10, 2026-07-11)`, then two late rows inserted into that window —
+>      one `unmetered.metric`, and one perfectly priceable `api.request` worth `6.000000`. The
+>      call answers `422 METER_NOT_FOUND`, the invoice stays `10.000000` with its one line item,
+>      and **both** rows stay `billed = false`. `readAndPrice` prices the whole set or refuses it,
+>      so one unpriceable row holds the rest of that window's late usage hostage.
+>    - **What an operator sees is one night's failures, and then nothing further.** QA's G-1
+>      wrote this as a failure that "recurs every night, permanently"; that is refuted by the job
+>      itself. `getPreviousDayRange` makes the window *yesterday*, so the job visits each window
+>      exactly once. With the poisoned rows sitting in `[2026-07-10, 2026-07-11)`, runs at
+>      `now = 2026-07-12T02:00:00.000Z` and `now = 2026-07-13T02:00:00.000Z` enumerated
+>      `{tenants: 0, succeeded: 0, failed: 0}`. The window never moving back into range is *why*
+>      the alarm does not repeat, not why it does. A nightly alarm **does** appear when the
+>      *cause* persists rather than the row: unmetered rows seeded into `[07-12, 07-13)` and
+>      `[07-13, 07-14)` produced `failed: 1` on both of those nights, and `tenants: 0` on the
+>      night after. That is one failure per new window, and the already-failed window is still
+>      never revisited. Scope of all of this: worker's nightly path, where `now` advances, **and
+>      the attempt on which the enumeration succeeds**. A whole-job BullMQ retry re-runs the
+>      *same* window — the `run` closure at `apps/worker-service/src/index.ts:267-272` passes
+>      no `now`, so each
+>      attempt takes its own clock, and `getPreviousDayRange` returned
+>      `[2026-07-12, 2026-07-13)` at `2026-07-13T02:00`, `02:01` and `02:03` alike, so a 60 s
+>      exponential backoff over `ATTEMPTS` = 3 cannot roll the window off the cron instant.
+>      (It *can* roll if two attempts straddle midnight UTC: `23:59:30` and `00:01:30` on the
+>      same probe returned different windows. Not reachable from the 02:00 schedule.)
+>      **A retry does reach this arm, which an earlier revision of this bullet reasoned it did
+>      not.** Measured with a real BullMQ `Queue`/`Worker` on Redis db 14 at the real
+>      `WORKER_INVOICE_JOB.ATTEMPTS` = 3 and `BACKOFF_TYPE` = `exponential` (probe delay
+>      shortened to 300 ms; the delay changes when the retry lands, not whether it lands),
+>      driving the real `runInvoiceGenerationJob` over the real `BillingEnumerationRepository`
+>      as `telemetry_worker_app` against a real billing-service on `telemetry_app`, with an
+>      enumeration wrapper that throws a fixed number of times and then delegates:
+>
+>      | enumeration throws | attempt that reached the per-tenant loop | summary lines for the window |
+>      |---|---|---|
+>      | never | 1 | one — `{tenants: 1, succeeded: 0, failed: 1}` |
+>      | once | **2** | one — same window, same figures |
+>      | twice | **3** | one — same window, same figures |
+>
+>      So the `422` can be reported on a *retry* attempt rather than on the first, and the
+>      premise behind the old wording — the job only rejects on enumeration failure, which
+>      happens before any tenant call — is true and does not imply what it was used to imply.
+>      **What the retry does not do is multiply the `failed: 1` line**, and that is a mutation
+>      claim rather than an absence of evidence: the attempt that reaches the loop *resolves*
+>      the job (a per-tenant failure is counted, not thrown), so there is no further retry.
+>      Mutating the closure to reject when `summary.failed > 0` — which the shipped closure at
+>      `apps/worker-service/src/index.ts:267-272` does **not** do — produced three
+>      `{tenants: 1, succeeded: 0, failed: 1}` lines for one window and a job in state `failed`;
+>      every unmutated configuration above produced exactly one. What an operator can see more
+>      than once on that night is the separate `"Invoice generation job failed"` line from each
+>      enumeration failure — measured at the boundary rather than extrapolated: an enumeration
+>      that throws on all three attempts produced **3** of them and left the job in state
+>      `failed`, with the per-tenant loop never reached. The `422` itself is announced once per
+>      window and then never again.
+>      Not probed: a *stalled*-job re-delivery, which BullMQ counts against the same attempt
+>      budget and which could re-enter the loop for the same window.
+>    - **Nothing clears it automatically, and adding the meter is not by itself enough.** Adding
+>      the missing `Meter` and re-calling *that* window by hand returned
+>      `200 {"absorbed":true}` and took the invoice `10.000000 -> 19.000000`, billing both late
+>      rows (`api.request` 20 @ `10.000000`, `api.request` 12 @ `6.000000`, `unmetered.metric` 3 @
+>      `3.000000`). The enumeration takes no view of meters and is window-scoped, so a priceable,
+>      unbilled row left in `[07-10, 07-11)` was still `tenants: 0` at
+>      `now = 2026-07-12T02:00:00.000Z`, and was billed only by a run pinned back to
+>      `now = 2026-07-11T02:00:00.000Z`. Recovery therefore needs the fix **and** an out-of-band
+>      call naming the original window. **The operator-facing version of these three bullets now
+>      lives in `docs/releases/s-045-late-usage-absorption.md`** (Gate-6 decision D-C), because
+>      this file is scoped to Claude Code sessions and the recovery is something a human performs
+>      by hand. Note S-44's warning about the reverse arrangement: a note is read at deploy time
+>      and not again, so the two are deliberately kept in both places rather than moved.
+>
+>    None of it is a regression — before this change both rows were equally unbilled, just
+>    silently, so no money moves the wrong way and the direction is loud-not-silent, which is D1's
+>    own argument. What changes is that the fix's benefit is withheld for that whole window, and
+>    the loss is announced once rather than never.
+>
+> 6. **The absorb path's concurrency safety has no standing guard.** Gate-5 QA drove four
+>    genuinely simultaneous `generate` calls at one invoice: exactly one `200 {"absorbed":true}`
+>    and three `409 USAGE_LINES_CHANGED … (expected 2, marked 0)`, the invoice
+>    `100.000000 -> 110.000000`, one line item summing `10.000000`, both rows billed. No
+>    double-billing, no partial write. What produces that is the invoice row lock plus the
+>    cross-chunk count assertion, and **no test exercises either under concurrency** —
+>    `BU27b` ("sums the counts across chunks before comparing, never per chunk") pins where the
+>    count assertion sits, and `BU98` pins `{ increment }`, both as call shapes rather than as
+>    outcomes. Recorded rather than written, on the S-21 and S-38 precedent, and S-38's objection
+>    applies directly: a naive `Promise.all` case can pass by serialising, so the vacuous form
+>    must be made to fail first. **Worth writing when** the locking or the placement of the count
+>    assertion changes; the form that would work is an assertion on the *final total*, which is
+>    wrong if any absorber double-counts, whatever the interleaving.
+> 7. **`{ increment }` is pinned as a Prisma call shape, not as SQL-side arithmetic.** `BU98`
+>    asserts `{ increment }` appears in the call. A read-modify-write on a stale read, spelled as
+>    `increment`, would still satisfy that, and `BI25`'s exactness cannot separate the two because
+>    `Prisma.Decimal` is arbitrary-precision as well. The discriminator is a lost update, and QA
+>    ran it: an owner connection held `UPDATE … SET "totalAmount" = "totalAmount" + 100` open under
+>    `pg_sleep(3)`, the absorb blocked ~2.1 s on the locked row, and the committed result was
+>    `1234667.123459` — the addition evaluated against the post-commit row, where a
+>    read-modify-write would have produced `1234567.123459` and silently discarded the `+100`.
+>    **Worth writing when** anything replaces `increment` or moves the update out of the
+>    transaction. It was recorded instead because it costs ~3 s of real wall clock and a second
+>    connection, which is the per-case budget trade S-36 records for the same reason.
+> 8. **The `absorbed` flag's no-op/absorb distinction is not asserted end to end at the job
+>    layer.** It is asserted at the route — `BU102`
+>    (`tests/internal.controller.unit.test.ts`), and `BI3` and `BI8`, which both pin the response
+>    envelope's key set including `absorbed` — and it was driven over real HTTP at Gate 5, where
+>    the real `BillingClientService` consumed a live
+>    `200 {"data":{"invoiceId":"…","absorbed":true}}` and the job reported
+>    `succeeded: 1, failed: 0` with `created: false`. The added field is ignored and non-breaking,
+>    measured on the wire rather than inferred from the
+>    `as GenerateInvoiceResponseBody` cast. **Nothing standing asserts it**, and worker's consumer
+>    reads `body?.data?.invoiceId ?? null` through that cast rather than a schema. **Worth writing
+>    when** worker starts *reading* `absorbed`; while the consumer ignores it, a test would pin
+>    the cast rather than the contract.
+>
+> Residuals 6-8 are QA's G-2, G-3 and G-4 (`docs/qa/s-045-late-usage-absorption.md` §8), recorded
+> on the user's Gate-5 decision to record rather than guard. They are filed **here** rather than
+> under S-46 because each is a property of *this* change — the absorb transaction's concurrency,
+> its arithmetic, and its response field. S-46's subject is narrower and different: an integration
+> test over an RLS-enabled table cannot isolate the application-layer *tenant predicate*, because
+> the policy returns the same rows either way. None of these three is about tenant isolation or
+> RLS, and filing them there would make that title false — the objection this file already records
+> for keeping S-32 out of S-29.
+>
+> One accepted cost, stated rather than hidden: the unbilled query now runs on **every** re-run
+> of an already-billed period (plan D7), so a nightly re-run costs one extra grouped read per
+> tenant. `UsageLine` carries `UsageLine_tenantId_periodStart_periodEnd_idx` and
+> `UsageLine_tenantId_billed_idx`, so the predicate has index candidates — **which is not a
+> claim of index coverage**: the tables are empty on this tree and no `EXPLAIN` at volume was
+> run, so the planner's actual choice is unmeasured.
+>
+> Everything below is the original finding, left as the record of how it was reproduced.
 
 Found by Gate-5 QA of T-042 (F-2) by running the nightly job twice, and **re-reproduced
 independently at that task's Gate-3 rework** before being written here. Nothing in the shipped
@@ -2340,3 +2546,197 @@ late row's `billed` and the invoice's `totalAmount` both moved. And it must be c
 against the current early return first — on this tree that is `billed=f` and `0.120000`, the two
 values measured above.
 
+
+---
+
+## S-46 · An integration test over an RLS-enabled table cannot isolate the application-layer tenant predicate — RLS silently supplies the same answer — **LOW, open**
+
+**Scope of the title, stated up front.** "Cannot" is measured on `absorbLateUsage` over
+`"Invoice"`, with the masking mechanism then probed directly on `"UsageLine"` and `"Event"` as
+well. It is *not* measured on the other five RLS-enabled tables; for those it is inference from
+the policy shape, and it is labelled as such below.
+
+`.claude/rules/tenant-isolation.md` requires **both** layers on every tenant-scoped query: an
+explicit `tenantId` predicate **and** `withTenant`, "belt and braces — neither alone". The two
+layers work. What no behavioural test in this repository can do is tell them apart: remove the
+application predicate and the RLS policy returns the identical row set, so the suite stays green.
+This is the evidentiary consequence of the rule, not an argument against it.
+
+Minted at S-45's Gate-4 review, from billing's `InvoiceRepository.absorbLateUsage`, and scoped
+**platform-wide** because the mechanism is the policy, not the method.
+
+### Measured, on billing's absorb path
+
+Each mutation applied to `src/`, **both** suites run, then reverted, and every touched file
+re-`md5sum`ed to the value it held **immediately before that mutation**. A pre-versus-post
+comparison rather than a recorded digest, deliberately: the *procedure* records no constant, so
+there is nothing for a later commit to invalidate. (The paragraph below does record two digests —
+that is the evidence for why the procedure changed, not part of the procedure.)
+
+That wording is a fix, not a preference. An earlier revision of this paragraph pinned the
+whole-tree form —
+`find apps/billing-service/{src,tests} -name '*.ts' | sort | xargs md5sum | md5sum` back to
+`b66221646429f79536053b3a13210ee2` — **not re-derivable, because that tree was never
+committed** — which was this entry's own tree when it was written at
+Gate 4 and was already wrong by Gate 5, because the LOW-1/LOW-2/LOW-3 fixes to
+`tests/integration.constants.ts` and `src/constants.ts` landed in between. Filed by QA as **D-1**.
+At the Gate-3 rework it was `bd2e4678666dd45ecca842ad6f65a78e`, and at round 3 of that rework —
+two documentation-only edits later, a dead test constant deleted and one comment's stale count
+re-measured — it is `1abc56428c270909884b3ac1f5170727`. **Neither is re-derivable once this
+change is committed with anything else on top of it, and neither is asserted here as a live
+invariant**; they are recorded as the history of a constant that moved three times inside one
+task. QA ran the command before and after its own mutations and got the same value both times,
+and every individual file matched its pre-mutation `md5sum`, so nothing
+leaked — the defect was the recorded constant, not a dirty tree. The whole-tree digest is what goes
+stale: it moves whenever any `.ts` under `apps/billing-service/{src,tests}` changes, mutation or
+not — including a comment, which is what moved it the third time. That is **S-33**'s shape inside the file that records S-33, and S-33's fix direction names
+re-runnable commands as the target, so this is that direction applied rather than restated.
+
+Suites named because the first pass ran only the
+integration one and drew a general conclusion from it — the defect this entry exists to describe,
+committed while describing it.
+
+Counts are against the **shipped** tree, 30 integration cases and 27 in the repository unit file.
+The first three rows were also measured before `BI27` existed, at 29 and 27, with one fewer
+integration failure in rows 2 and 3; re-measured after it landed rather than carried forward.
+
+| Mutation | `billing.integration.test.ts` | `invoice.repository.unit.test.ts` |
+|---|---|---|
+| **A · Remove the tenant predicate entirely** — resolve with `findFirst({ where: { periodStart, periodEnd } })`, address the `update` by the id it returned | **30 passed / 0 failed** | 4 failed / 23 passed, but **mechanically** — `tx.invoice.findFirst is not a function`, the Prisma double having no `findFirst`. Not evidence. |
+| **B · Reintroduce an `invoiceId` parameter**, write line items via `tx.invoiceLineItem.create({ data: { invoiceId: input.invoiceId, … } })` | 28 passed / 2 failed — `BI25` and `BI27`, both of which call the repository directly and no longer type-match. **`BI24` green** | **`BU99` red** — 1 failed / 26 passed |
+| **C · Reintroduce it and address the *invoice* by it** — `findUniqueOrThrow`/`update` on `{ id: input.invoiceId }` | 28 passed / 2 failed (`BI25`, `BI27` again). **`BI24` green** | **`BU98` red** — `AssertionError: expected { id: undefined } to deeply equal { …(1) }`, the expected object being `tenantId_periodStart_periodEnd` |
+| **D · Drop the tenant from the *write* only** — read stays on the compound unique, `update` addresses `{ id: existing.id }`. Same Prisma call surface, so the double answers and the unit red is genuine | **30 passed / 0 failed** | **`BU98` red** — `expected { Object (id) } to deeply equal { …(1) }`, 1 failed / 26 passed |
+
+`BI24` is the two-tenant isolation case — two tenants holding invoices for the same period, one
+absorbing. It is green under **all four**.
+
+### Why: probed directly as `telemetry_app`
+
+`pg_roles` first, because a passing RLS test proves nothing as a superuser: `telemetry_app` is
+`rolsuper = f, rolbypassrls = f`. `pg_class` on `"Invoice"`: `relrowsecurity = t`,
+`relforcerowsecurity = t`, one policy `invoice_tenant_isolation` (`polcmd = *`). Two invoices
+seeded through `DIRECT_DATABASE_URL` sharing one period, one per tenant, then read back on a
+`telemetry_app` connection:
+
+```
+ctx = tenant B, predicate on the period only  -> s46-probe-b   (B's row, and only B's)
+ctx = tenant B, predicate incl. the tenant    -> s46-probe-b   (identical)
+ctx = tenant A, predicate on the period only  -> s46-probe-a   (A's row, and only A's)
+no tenant context, predicate on the period    -> (no rows)
+ctx = tenant B, naming A's row by primary key -> (no rows)
+```
+
+The untenanted predicate and the tenanted one return the same row, under each tenant's context.
+So the application predicate is **unobservable** through any query issued inside `withTenant` on
+this table. Probe rows deleted by explicit id; `Invoice` back to 0.
+
+**Three tables, not one — because a claim about "RLS-enabled tables" measured on one table is a
+claim about one table.** The same probe was repeated on `"UsageLine"` (policy
+`usage_line_tenant_isolation`, plus `usageline_worker_definer_read` from `v1_7`) and on `"Event"`,
+seeded the same way through `DIRECT_DATABASE_URL`:
+
+```
+UsageLine  ctx = B, predicate on metricKey only  -> s46-ul-b   (B's row, and only B's)
+UsageLine  ctx = B, predicate incl. the tenant   -> s46-ul-b   (identical)
+UsageLine  ctx = A, predicate on metricKey only  -> s46-ul-a
+UsageLine  no tenant context                     -> (no rows)
+Event      ctx = B, predicate on eventType only  -> s46-ev-b
+```
+
+Rows deleted by explicit id afterwards; `Event` and `UsageLine` back to 0. The remaining five
+RLS-enabled tables were **not** probed, and the extension to them is inference from the policy
+shape — every one of the eight carries a single `current_setting('app.tenant_id')` policy — not
+measurement. Say "measured on `Invoice`, `UsageLine` and `Event`" if the distinction matters.
+
+### What *does* catch it, and this is the entry's whole value
+
+The hazard is "**integration cannot isolate it**", not "nothing catches it". Stated as measured:
+
+- **The realistic regressions are caught, by named unit cases.** `BU98` pins the *address*
+  (compound unique carrying the bound tenant) and `BU99` pins the *route* (nested `create`, never
+  `tx.invoiceLineItem.create`). Both went red above, on the mutations that reintroduce a
+  caller-supplied `invoiceId` — which is the shape a real regression takes, because a foreign
+  invoice has to be *named* from somewhere.
+- **A predicate deletion that keeps the Prisma call surface is caught by `BU98`, and that was
+  measured rather than assumed** — mutation D above, where the double answers normally and `BU98`
+  fails on its own `where` assertion while the integration suite is 30/0. But it is a *shape*
+  assertion, the same category as `U51` in S-28: it pins that the compound unique with the bound
+  tenant is what gets sent, which is not the same as observing that sending anything else would
+  reach another tenant's row.
+- **Mutation A is caught by nothing behavioural.** Its unit reds were a missing double method,
+  not an assertion.
+
+So: **keep the predicate.** Do not delete one on the evidence that deleting it is green, and do
+not read a green isolation suite as proof that the application layer is doing anything.
+
+### Why this is neither S-10 nor S-28
+
+Both checked by re-reading the entries at Gate 4, not from memory.
+
+- **Not S-10.** S-10 is RLS `FORCE`d but never `ENABLE`d on `"RefreshToken"` — and, it notes,
+  `"InvoiceLineItem"` has the same shape — so the policies there are *inert* and the application
+  predicate is the **only** control. That is the opposite direction on different tables: this
+  entry is about RLS being **enabled** and therefore **masking** the predicate.
+  `pg_class.relrowsecurity` over `public`: `t` for `Event`, `ExportAudit`, `Invoice`, `Meter`,
+  `MetricRollup`, `Tenant`, `UsageLine`, `User`; `f` for exactly `InvoiceLineItem` and
+  `RefreshToken`, which are S-10's two.
+- **Not S-28.** Its title is literally scoped to `UsageLine`, and folding a platform-wide entry
+  under it would make that title false — the same objection this file records for keeping S-32
+  out of S-29. The *causes* also differ: S-28's predicate is untestable because `UsageLine.eventId`
+  is globally `@unique`, so the cross-tenant address is unrepresentable **under the schema**; here
+  the address is perfectly representable and the policy is what hides its absence. S-28's own
+  fix direction ("revisit if `eventId` loses its global `@unique`") does not apply.
+
+Closest relative is **S-21**, whose title is that the S-18 regression suite *does not isolate the
+fix it was written for*: two independent guards, either sufficient, so reverting one left that
+suite 17/17 green. Same shape — a guard whose removal a suite cannot see — but a different
+mechanism and a different suite, so it is a relation, not the same finding.
+
+### Platform-wide, and it grows with each new repository
+
+Eight of the ten application tables have RLS enabled (list above), and
+`grep -rn "extends TenantScopedRepository" apps/*/src --include=*.ts`, filtered to lines beginning
+`export class`, returns **four** subclasses: `UsageRepository`, `EventRepository`,
+`MeterRepository`, `InvoiceRepository`. On the mechanism above, every query any of them issues
+inside `withTenant` against one of those eight tables has this property — measured on three of the
+eight, inferred for the rest. **Any future tenant-scoped repository test inherits it on the day it
+is written**, which is the reason to record it once here rather than per service. Note the
+unfiltered grep returns **9** lines and the `export class` filter leaves **4**; the other 5 are
+docstring examples inside each copy of `base.repository.ts` (S-19 records the same trap, and the
+same counts).
+
+### Severity: LOW, argued
+
+**Nothing is wrong today**, on the evidence available. RLS is genuinely enforcing — the role is
+`NOSUPERUSER NOBYPASSRLS`, verified above rather than assumed, which is what
+`.claude/rules/tenant-isolation.md` insists on — and on the path this entry was found from, the
+predicate is present and the realistic regression shapes *are* caught by unit cases. Note what
+that does **not** say: no audit of every tenant-scoped query on the platform was run here, and by
+this entry's own argument an integration suite could not have told you if one were missing. So
+"every query carries its predicate" is exactly the claim this entry says you cannot get from the
+tests; it is not asserted.
+
+The cost is evidentiary: a reviewer or an agent can take a green isolation suite as proof of a
+layer it never exercised. Stated precisely, because mutation D refutes the blanket version — a
+change that drops a predicate ships green **through the integration suite** (30/0 under mutations
+A and D; B and C were 28/2, and both of those failures are direct repository callers failing to
+type-match, not isolation outcomes), and whether anything catches it at all depends on whether a
+unit *shape* case happens to cover the call it changed. Two do here (`BU98`, `BU99`); a repository
+without them would have nothing.
+
+**What would make it MEDIUM** — any of these, and none holds today: a tenant-scoped query issued
+**outside** `withTenant` (auth-service's two pre-auth resolvers already do this, per S-19, though
+they take no tenant-scoped predicate); a connection pooler that loses the transaction-local
+`set_config`; a service connecting as a `BYPASSRLS` or table-owning role; or a new tenant-scoped
+table shipped with RLS inert, which is S-10's shape and would leave the unobservable predicate as
+the only control. Re-rate it if one lands.
+
+**Fix direction.** There is no behavioural fix — the masking is the design working. What is
+available is a **structural** test: assert the emitted SQL or the Prisma call shape carries the
+tenant, as `BU98` does, rather than asserting an outcome. Concretely, when a tenant-scoped
+repository gets an isolation case, pair it with a shape case, and say in the integration case's
+comment that it pins the *outcome* and cannot pin the predicate. A stronger option, if anyone
+wants a real behavioural guard: run one test as a role that is exempt from the policy — the
+migration owner through `DIRECT_DATABASE_URL` — where the predicate becomes the only control and
+its removal is observable. That was **not** built or attempted here; it is a suggestion, and it
+would need care not to become a test that exercises a connection production never uses.

@@ -68,9 +68,27 @@ export const BILLING_RESPONSES = {
   // Raised inside the write transaction when the billed `updateMany` touches fewer rows than
   // were priced, which means another writer moved them between the read and the write. It is
   // a detector, not a lock: throwing rolls the invoice and its line items back with it.
+  //
+  // The wording is **path-neutral** since S-45. `markUsageLinesBilled` is shared by
+  // `createDraftInvoice` and `absorbLateUsage`, so this message is now read by an operator in
+  // two situations: a draft that was never created, and an existing invoice that was left
+  // exactly as it was. It previously ended "no invoice was created", which misdescribes the
+  // second -- on the absorb path no invoice is created *or* modified. `BI27` is the case that
+  // drives the absorb side of it (review LOW-2).
   CODE_USAGE_LINES_CHANGED: "USAGE_LINES_CHANGED",
   MESSAGE_USAGE_LINES_CHANGED:
-    "Usage lines changed between pricing and invoicing; no invoice was created"
+    "Usage lines changed between pricing and invoicing; nothing was written",
+  // S-45 D1/D3: late usage may only be absorbed into a `DRAFT` invoice; any other status is
+  // refused and nothing is written. The **name** is taken from T-048's declaration in
+  // `docs/epics/epic-8-billing-service.md` § *T-048* (heading at `:140`), whose **Error
+  // response** line declares it, rather than minted fresh, so the platform ends
+  // with one code for "you may not mutate a non-DRAFT invoice" instead of two. The epic gives
+  // that error a body of `{ code, invoiceId, currentStatus }`; every error this service emits
+  // is `{ code, message }`, so the envelope is kept, the status is named in the message and
+  // both values go to billing's own log line (divergence E1 in the plan). `409` reuses
+  // `HTTP_STATUS_CONFLICT`, which already exists above.
+  CODE_INVOICE_IMMUTABLE: "INVOICE_IMMUTABLE",
+  MESSAGE_INVOICE_IMMUTABLE: "Invoice is not a draft and cannot absorb late usage"
 } as const;
 
 /**

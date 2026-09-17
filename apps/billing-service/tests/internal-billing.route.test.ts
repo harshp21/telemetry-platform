@@ -44,7 +44,7 @@ describe(`POST ${BILLING_ROUTES.INTERNAL_BILLING_GENERATE}`, () => {
     app = buildBillingServiceApp();
     generateInvoice = vi
       .spyOn(app.container.billingService, "generateInvoice")
-      .mockResolvedValue({ invoiceId: INVOICE_ID, created: true });
+      .mockResolvedValue({ invoiceId: INVOICE_ID, created: true, absorbed: false });
   });
 
   afterEach(async () => {
@@ -115,7 +115,7 @@ describe(`POST ${BILLING_ROUTES.INTERNAL_BILLING_GENERATE}`, () => {
     });
 
     expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_CREATED);
-    expect(response.json()).toEqual({ data: { invoiceId: INVOICE_ID } });
+    expect(response.json()).toEqual({ data: { invoiceId: INVOICE_ID, absorbed: false } });
     expect(generateInvoice).toHaveBeenCalledWith({
       tenantId: TENANT_ID_A,
       periodStart: validBody.periodStart,
@@ -124,7 +124,11 @@ describe(`POST ${BILLING_ROUTES.INTERNAL_BILLING_GENERATE}`, () => {
   });
 
   it("BU66 - answers 200 for an idempotent hit and for no billable usage", async () => {
-    generateInvoice.mockResolvedValueOnce({ invoiceId: INVOICE_ID, created: false });
+    generateInvoice.mockResolvedValueOnce({
+      invoiceId: INVOICE_ID,
+      created: false,
+      absorbed: false
+    });
     const idempotent = await app.inject({
       method: "POST",
       url: BILLING_ROUTES.INTERNAL_BILLING_GENERATE,
@@ -132,7 +136,11 @@ describe(`POST ${BILLING_ROUTES.INTERNAL_BILLING_GENERATE}`, () => {
       payload: validBody
     });
 
-    generateInvoice.mockResolvedValueOnce({ invoiceId: null, created: false });
+    generateInvoice.mockResolvedValueOnce({
+      invoiceId: null,
+      created: false,
+      absorbed: false
+    });
     const noUsage = await app.inject({
       method: "POST",
       url: BILLING_ROUTES.INTERNAL_BILLING_GENERATE,
@@ -141,9 +149,9 @@ describe(`POST ${BILLING_ROUTES.INTERNAL_BILLING_GENERATE}`, () => {
     });
 
     expect(idempotent.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
-    expect(idempotent.json()).toEqual({ data: { invoiceId: INVOICE_ID } });
+    expect(idempotent.json()).toEqual({ data: { invoiceId: INVOICE_ID, absorbed: false } });
     expect(noUsage.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
-    expect(noUsage.json()).toEqual({ data: { invoiceId: null } });
+    expect(noUsage.json()).toEqual({ data: { invoiceId: null, absorbed: false } });
   });
 
   it("BU67 - answers 400 VALIDATION_ERROR for an authenticated request with an invalid body", async () => {

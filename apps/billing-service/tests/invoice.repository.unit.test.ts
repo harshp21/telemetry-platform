@@ -3,9 +3,17 @@ import { Prisma } from "@prisma/client";
 import type { PrismaClient } from "@prisma/client";
 import type { TenantId } from "@telemetry/shared-types";
 import { InvoiceRepository } from "../src/repositories/invoice.repository";
-import type { CreateDraftInvoiceInput } from "../src/repositories/invoice.repository";
-import { UsageLinesChangedError } from "../src/errors";
-import { BILLING_DATABASE, BILLING_INVOICE_LIST, BILLING_METERING } from "../src/constants";
+import type {
+  AbsorbLateUsageInput,
+  CreateDraftInvoiceInput
+} from "../src/repositories/invoice.repository";
+import { InvoiceImmutableError, UsageLinesChangedError } from "../src/errors";
+import {
+  BILLING_DATABASE,
+  BILLING_INVOICE_LIST,
+  BILLING_METERING,
+  BILLING_RESPONSES
+} from "../src/constants";
 import { InvoiceStatus } from "@prisma/client";
 
 const TENANT_ID = "11111111-1111-4111-8111-111111111111" as TenantId;
@@ -16,6 +24,9 @@ const PERIOD_END = new Date("2026-02-01T00:00:00.000Z");
 
 const INVOICE_ID = "33333333-3333-4333-8333-333333333333";
 const USAGE_LINE_IDS = ["line-a", "line-b"] as const;
+/** What the absorbed invoice's total reads after the increment, in the shape the driver hands over. */
+const ABSORBED_TOTAL_AMOUNT = "14.500000";
+const ABSORBED_DELTA = "2.000000";
 const METRIC_API = "api.request";
 const METRIC_STORAGE = "storage.gb";
 const CURRENCY_USD = "USD";
@@ -53,6 +64,10 @@ interface PrismaMockOptions {
   /** Raw list rows, spelled the way the driver hands them over: `Prisma.Decimal` and `Date`. */
   listRows?: readonly Record<string, unknown>[];
   listTotal?: number;
+  /** What `invoice.findUniqueOrThrow` answers on the absorb path, or an error to raise. */
+  invoiceForAbsorb?: { id: string; status: InvoiceStatus } | Error;
+  /** The post-increment total the `update` reports, as the driver would: a `Prisma.Decimal`. */
+  absorbedTotalAmount?: string;
 }
 
 /**
@@ -78,6 +93,17 @@ const createPrismaMock = (options: PrismaMockOptions = {}) => {
     return result;
   });
   const invoiceLineItemCreate = vi.fn(async () => ({ id: "unused" }));
+  const invoiceFindUniqueOrThrow = vi.fn(async () => {
+    const result = options.invoiceForAbsorb ?? { id: INVOICE_ID, status: InvoiceStatus.DRAFT };
+    if (result instanceof Error) {
+      throw result;
+    }
+    return result;
+  });
+  const invoiceUpdate = vi.fn(async () => ({
+    id: INVOICE_ID,
+    totalAmount: new Prisma.Decimal(options.absorbedTotalAmount ?? ABSORBED_TOTAL_AMOUNT)
+  }));
   const invoiceFindMany = vi.fn(async () => options.listRows ?? []);
   const invoiceCount = vi.fn(async () => options.listTotal ?? 0);
   let updateManyCall = 0;
@@ -96,7 +122,9 @@ const createPrismaMock = (options: PrismaMockOptions = {}) => {
     tenant: { count: tenantCount },
     invoice: {
       findUnique: invoiceFindUnique,
+      findUniqueOrThrow: invoiceFindUniqueOrThrow,
       create: invoiceCreate,
+      update: invoiceUpdate,
       findMany: invoiceFindMany,
       count: invoiceCount
     },
@@ -116,7 +144,9 @@ const createPrismaMock = (options: PrismaMockOptions = {}) => {
     queryRaw,
     tenantCount,
     invoiceFindUnique,
+    invoiceFindUniqueOrThrow,
     invoiceCreate,
+    invoiceUpdate,
     invoiceFindMany,
     invoiceCount,
     invoiceLineItemCreate,
@@ -149,6 +179,17 @@ const uniqueViolation = (): Prisma.PrismaClientKnownRequestError =>
 const decimalRow = (metricKey: string, quantity: string) => ({
   metricKey,
   _sum: { quantity: new Prisma.Decimal(quantity) }
+});
+
+const absorbInput = (
+  overrides: Partial<AbsorbLateUsageInput> = {}
+): AbsorbLateUsageInput => ({
+  periodStart: PERIOD_START,
+  periodEnd: PERIOD_END,
+  totalAmountDelta: ABSORBED_DELTA,
+  lineItems: [{ metricKey: METRIC_API, quantity: "200", unitPrice: "0.01", amount: "2" }],
+  usageLineIds: [...USAGE_LINE_IDS],
+  ...overrides
 });
 
 describe("InvoiceRepository.tenantExists", () => {
@@ -423,6 +464,133 @@ describe("InvoiceRepository.createDraftInvoice", () => {
     // The error object carries no usable `meta.target`, so a P2002 that is not the period
     // constraint must not be reported as an idempotent hit.
     await expect(mock.repository.createDraftInvoice(draftInput())).rejects.toBe(violation);
+  });
+});
+
+describe("InvoiceRepository.absorbLateUsage", () => {
+  it("BU98 - addresses the invoice by the compound unique with the bound tenant, and raises the total with increment", async () => {
+    const mock = createPrismaMock();
+
+    const result = await mock.repository.absorbLateUsage(absorbInput());
+
+    const args = firstArg(mock.invoiceUpdate, "invoice.update");
+    // The compound unique, never a bare id: the emitted `UPDATE` then carries the tenant in
+    // its own `WHERE`, which is the only reason the nested line-item insert below is addressed
+    // to an invoice this tenant owns (S-10 -- the line-item table has no RLS of its own).
+    expect(args.where).toEqual({
+      tenantId_periodStart_periodEnd: {
+        tenantId: TENANT_ID,
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END
+      }
+    });
+
+    // `increment`, never `set`. A read-modify-write would put a `Decimal(18,6)` value through
+    // JavaScript and would also race a concurrent absorber; `increment` compiles to a SQL
+    // addition on the column and does neither (D4).
+    const data = args.data as Record<string, unknown>;
+    expect(data.totalAmount).toEqual({ increment: ABSORBED_DELTA });
+    expect(data.totalAmount).not.toHaveProperty("set");
+    expect(JSON.stringify(args)).not.toContain(OTHER_TENANT_ID);
+
+    // Both statements inside one transaction whose first statement sets the RLS context.
+    expect(mock.transaction).toHaveBeenCalledTimes(1);
+    expect(String(mock.queryRaw.mock.calls[0]?.[0])).toContain(TENANT_SETTING_NAME);
+    expect(mock.queryRaw.mock.calls[0]).toContain(TENANT_ID);
+
+    // And nothing that reads like a `Prisma.Decimal` leaves the repository (D5).
+    expect(result.invoiceId).toBe(INVOICE_ID);
+    expect(typeof result.totalAmount).toBe("string");
+    expect(result.totalAmount).not.toBeInstanceOf(Prisma.Decimal);
+    expect(result.totalAmount).toBe(new Prisma.Decimal(ABSORBED_TOTAL_AMOUNT).toString());
+  });
+
+  it("BU99 - appends line items through the nested create on that update, never tx.invoiceLineItem.create", async () => {
+    // A **shape** assertion, and stated as what it is: it pins the call the repository builds,
+    // not an isolation outcome. The outcome case is BI24, against a live database with two
+    // tenants holding invoices for the same period. Both are needed -- `"InvoiceLineItem"` has
+    // `relrowsecurity = f` and no policy (S-10), so the nested create is the entire control and
+    // a standalone create addressing an `invoiceId` would have no tenant predicate at all.
+    const lineItems = [
+      { metricKey: METRIC_API, quantity: "200", unitPrice: "0.01", amount: "2" },
+      { metricKey: METRIC_STORAGE, quantity: "1", unitPrice: "0.5", amount: "0.5" }
+    ];
+    const mock = createPrismaMock();
+
+    await mock.repository.absorbLateUsage(absorbInput({ lineItems }));
+
+    const data = firstArg(mock.invoiceUpdate, "invoice.update").data as Record<string, unknown>;
+    expect(data.lineItems).toEqual({ create: lineItems });
+    expect(mock.invoiceLineItemCreate).not.toHaveBeenCalled();
+    // Append, never merge (D2): no read of the existing line items precedes the write.
+    expect(mock.invoiceFindMany).not.toHaveBeenCalled();
+  });
+
+  it("BU100 - refuses a non-DRAFT invoice with InvoiceImmutableError before any write", async () => {
+    const mock = createPrismaMock({
+      invoiceForAbsorb: { id: INVOICE_ID, status: InvoiceStatus.FINALIZED }
+    });
+
+    const error = await mock.repository
+      .absorbLateUsage(absorbInput())
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(InvoiceImmutableError);
+    expect((error as InvoiceImmutableError).invoiceId).toBe(INVOICE_ID);
+    expect((error as InvoiceImmutableError).currentStatus).toBe(InvoiceStatus.FINALIZED);
+    expect((error as InvoiceImmutableError).statusCode).toBe(
+      BILLING_RESPONSES.HTTP_STATUS_CONFLICT
+    );
+    expect((error as InvoiceImmutableError).code).toBe(
+      BILLING_RESPONSES.CODE_INVOICE_IMMUTABLE
+    );
+    expect((error as InvoiceImmutableError).message).toContain(InvoiceStatus.FINALIZED);
+
+    // Nothing written, which is the half that matters: the refusal must precede the update and
+    // the billed flags, not undo them.
+    expect(mock.invoiceUpdate).not.toHaveBeenCalled();
+    expect(mock.usageLineUpdateMany).not.toHaveBeenCalled();
+    expect(mock.invoiceLineItemCreate).not.toHaveBeenCalled();
+  });
+
+  it("BU101 - chunks the billed update and compares the summed count against the whole set", async () => {
+    // The same bound and the same assertion as `createDraftInvoice`, because it is literally
+    // the same helper (`markUsageLinesBilled`) -- which is why the extraction was its own slice.
+    // A per-chunk comparison would report the wrong numbers here exactly as it would there.
+    const chunk = BILLING_METERING.BILLED_UPDATE_CHUNK_SIZE;
+    const ids = Array.from({ length: chunk + 1 }, (_, i) => `line-${i}`);
+
+    const happy = createPrismaMock();
+    await happy.repository.absorbLateUsage(absorbInput({ usageLineIds: ids }));
+
+    expect(happy.usageLineUpdateMany).toHaveBeenCalledTimes(2);
+    const addressed = happy.usageLineUpdateMany.mock.calls.flatMap(
+      (call) => (call[0] as { where: { id: { in: string[] } } }).where.id.in
+    );
+    expect(addressed).toEqual(ids);
+    expect(firstArg(happy.usageLineUpdateMany, "usageLine.updateMany").where).toMatchObject({
+      tenantId: TENANT_ID,
+      billed: false
+    });
+
+    const short = createPrismaMock({ updatedCounts: [chunk, 0] });
+    const error = await short.repository
+      .absorbLateUsage(absorbInput({ usageLineIds: ids }))
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(UsageLinesChangedError);
+    expect((error as UsageLinesChangedError).expected).toBe(chunk + 1);
+    expect((error as UsageLinesChangedError).actual).toBe(chunk);
+    // The throw escapes the `$transaction` callback, which is what a real transaction turns
+    // into a rollback of the increment and the appended line items. This case pins that the
+    // repository **raises** rather than logs; the rollback itself is asserted live by `BI27`,
+    // which drives a mid-absorb failure against a real transaction and reads the three values
+    // back. (An earlier revision of this comment credited `BI23` with the live rollback. It
+    // cannot: `BI23` is the `FINALIZED` refusal, which throws *before* any write -- `BU100`
+    // asserts exactly that, and there is nothing to roll back on that path.)
+    await expect(short.transaction.mock.results[0]?.value).rejects.toBeInstanceOf(
+      UsageLinesChangedError
+    );
   });
 });
 

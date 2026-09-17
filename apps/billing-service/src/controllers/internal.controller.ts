@@ -12,9 +12,12 @@ import { BILLING_RESPONSES } from "../constants";
  *
  * 1. validate the body -- `400 VALIDATION_ERROR` with the issues joined into `message`;
  * 2. delegate to `BillingService`;
- * 3. one envelope on every success path, `{ data: { invoiceId } }`, with `201` when this call
- *    created the invoice and `200` when it did not (an existing invoice, or no billable usage
- *    at all, which reads `invoiceId: null`);
+ * 3. one envelope on every success path, `{ data: { invoiceId, absorbed } }`, with `201` when
+ *    this call created the invoice and `200` when it did not (an existing invoice, or no
+ *    billable usage at all, which reads `invoiceId: null`). `absorbed` (S-45) is `true` only
+ *    when late usage was added to an invoice that already existed -- both that and a genuine
+ *    no-op are `200` with the same `invoiceId`, so it is the only thing that tells them apart.
+ *    The number of lines absorbed is deliberately not here: it goes to billing's log line (D5);
  * 4. `AppError` keeps its own status and code; anything else is a `500` whose body says nothing
  *    about the failure.
  *
@@ -50,7 +53,7 @@ export class InternalController {
             ? BILLING_RESPONSES.HTTP_STATUS_CREATED
             : BILLING_RESPONSES.HTTP_STATUS_OK
         )
-        .send({ data: { invoiceId: result.invoiceId } });
+        .send({ data: { invoiceId: result.invoiceId, absorbed: result.absorbed } });
     } catch (error) {
       if (error instanceof AppError) {
         response.status(error.statusCode).send({

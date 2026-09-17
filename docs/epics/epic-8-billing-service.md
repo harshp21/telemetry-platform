@@ -141,6 +141,19 @@ interface InvoiceHeader {
 
 **File**: `apps/billing-service/src/repositories/invoice.repository.ts`
 
+> **Forward reference (added by S-45, which shipped before this task).** `generate` already
+> refuses a non-`DRAFT` invoice: when an invoice exists for the period and unbilled usage
+> remains, `InvoiceRepository.absorbLateUsage` throws `InvoiceImmutableError` and writes
+> nothing, surfaced as `409 INVOICE_IMMUTABLE`. That reuses **this section's** declared code
+> name deliberately, so the platform ends with one code for "you may not mutate a non-`DRAFT`
+> invoice" rather than two. T-048 **either adopts that behaviour or overrides it**, and must
+> say which. Two things to check against the code before planning: the error body this service
+> emits is `{ code, message }` and not the `{ code, invoiceId, currentStatus }` written below
+> (the two values go to billing's log line); and the snippet's `findById(id, tenantId)` /
+> `update({ where: { id } })` signatures are refused by this repository's shape — no method
+> takes a bare `invoiceId` or a caller-supplied tenant, because `"InvoiceLineItem"` RLS is
+> inert (S-10) and the application route is the only tenant control on that write.
+
 **Story**: `FINALIZED` and `PAID` invoices must never be mutated. Enforce at the repository layer — not just controllers — so no code path can accidentally modify a finalized invoice.
 
 ```ts

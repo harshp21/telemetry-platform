@@ -21,6 +21,7 @@ import {
   INTEGRATION_FIXTURE,
   INTEGRATION_ID_PREFIX,
   INTEGRATION_INVOICE_LIST,
+  INTEGRATION_LATE_USAGE,
   INTEGRATION_SESSION_TIME_ZONE,
   INTEGRATION_TENANT
 } from "./integration.constants";
@@ -272,7 +273,9 @@ describe("POST /v1/internal/billing/generate (integration)", () => {
     const response = await generate(periodBody(TENANT_A));
 
     expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
-    expect(response.json()).toEqual({ data: { invoiceId: null } });
+    // `absorbed: false` added at S-45: nothing existed to absorb into, which is a different
+    // outcome from an absorption that added nothing, and both are `200`.
+    expect(response.json()).toEqual({ data: { invoiceId: null, absorbed: false } });
     expect(await fixtures.readInvoices(SUITE_TENANT_IDS)).toHaveLength(0);
   });
 
@@ -475,13 +478,15 @@ describe("POST /v1/internal/billing/generate (integration)", () => {
     const response = await generate(periodBody(TENANT_A));
 
     expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_CREATED);
-    // The response envelope carries only the invoice id (D3), so there is no amount in it to
-    // leak -- asserted by exact key set rather than assumed, because a future field would
-    // change that and a `toMatchObject` would not notice.
-    const body = response.json() as { data: { invoiceId: string } };
+    // The response envelope carries the invoice id and the `absorbed` flag and nothing else, so
+    // there is no amount in it to leak -- asserted by exact key set rather than assumed,
+    // because a future field would change that and a `toMatchObject` would not notice. The key
+    // set is what S-45 widened, deliberately: `absorbed` is a boolean and carries no money.
+    const body = response.json() as { data: { invoiceId: string; absorbed: boolean } };
     expect(Object.keys(body)).toEqual(["data"]);
-    expect(Object.keys(body.data)).toEqual(["invoiceId"]);
+    expect(Object.keys(body.data).sort()).toEqual(["absorbed", "invoiceId"]);
     expect(typeof body.data.invoiceId).toBe("string");
+    expect(typeof body.data.absorbed).toBe("boolean");
 
     const invoices = await fixtures.readInvoices(SUITE_TENANT_IDS);
     // 1234567.123456 x 0.000001 = 1.234567123456, stored into Decimal(18,6) as 1.234567.
@@ -711,6 +716,436 @@ describe("POST /v1/internal/billing/generate (integration)", () => {
     // Rolled back: the transaction that got as far as the assertion wrote nothing.
     expect(await fixtures.readInvoices(SUITE_TENANT_IDS)).toHaveLength(0);
     expect(await fixtures.countUsageLines(SUITE_TENANT_IDS, true)).toBe(0);
+  });
+
+  /**
+   * Locates one seeded usage line by id, throwing rather than passing vacuously when the row
+   * is not there (`.claude/rules/testing.md`). A `find` that returns `undefined` would make
+   * every assertion below it read `undefined` and quietly satisfy a `not.toBe(true)`.
+   */
+  const lineById = async (usageLineId: string) => {
+    const row = (await fixtures.readUsageLines(SUITE_TENANT_IDS)).find(
+      (line) => line.id === usageLineId
+    );
+    if (row === undefined) {
+      throw new Error(`Expected usage line ${usageLineId} to exist`);
+    }
+    return row;
+  };
+
+  /** The one seeded invoice for a tenant, or a throw. Same reason as `lineById`. */
+  const invoiceFor = async (tenantId: string) => {
+    const row = (await fixtures.readInvoices(SUITE_TENANT_IDS)).find(
+      (invoice) => invoice.tenantId === tenantId
+    );
+    if (row === undefined) {
+      throw new Error(`Expected an invoice for tenant ${tenantId}`);
+    }
+    return row;
+  };
+
+  /** Seeds one late `api.request` row into the already-invoiced window. */
+  const seedLateApiLine = async (
+    tenantId: string,
+    quantity: string = INTEGRATION_LATE_USAGE.LATE_QUANTITY_API,
+    instant: string = INTEGRATION_LATE_USAGE.INSTANT
+  ): Promise<string> => {
+    const [id] = await fixtures.seedUsageLines([
+      {
+        tenantId,
+        metricKey: INTEGRATION_FIXTURE.METRIC_API,
+        quantity,
+        periodStart: instant
+      }
+    ]);
+    if (id === undefined) {
+      throw new Error("Expected the late usage line to be seeded");
+    }
+    return id;
+  };
+
+  it("BI22 - usage landing after the period's invoice exists is absorbed into that invoice", async () => {
+    // **The S-45 case.** The shipped ordering returns at `findByPeriod` before
+    // `sumUnbilledByMetricKey` runs, so a row that arrives in a window whose invoice already
+    // exists is never enumerated again: it stays `billed = false` for good, the nightly job
+    // reads a different window the next night, and every observable an operator has says the
+    // run succeeded.
+    //
+    // **Four things that would make this case vacuous, all measured at Gate 1 as identical with
+    // and without the defect**: the status (`200` either way), the returned `invoiceId` (the
+    // same id either way), the job summary, and the invoice *count*. The load-bearing
+    // assertions are therefore `UsageLine.billed` and `Invoice.totalAmount`, read back from the
+    // database through the owner connection.
+    await seedTwoMetricPeriod();
+
+    const first = await generate(periodBody(TENANT_A));
+    expect(first.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_CREATED);
+    const invoiceId = (first.json() as { data: { invoiceId: string } }).data.invoiceId;
+
+    // **The fixture order is forced.** Seeding this row before the first call would let that
+    // call bill it, and the ordering under test would never run (plan section 4.1).
+    const lateLineId = await seedLateApiLine(TENANT_A);
+    expect((await lineById(lateLineId)).billed).toBe(false);
+
+    const second = await generate(periodBody(TENANT_A));
+
+    // **The two assertions the defect cannot satisfy, asserted first on purpose.** Against the
+    // unfixed code these read `billed = false` and `12.5`; the `absorbed` flag below is new, so
+    // it is red either way and would short-circuit the run before the money was ever checked.
+    expect((await lineById(lateLineId)).billed).toBe(true);
+    expect(asDecimalString((await invoiceFor(TENANT_A)).totalAmount)).toBe(
+      asDecimalString(INTEGRATION_LATE_USAGE.EXPECTED_TOTAL_AFTER_ABSORB)
+    );
+
+    expect(second.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
+    const body = second.json() as { data: { invoiceId: string; absorbed: boolean } };
+    expect(body.data.invoiceId).toBe(invoiceId);
+    expect(body.data.absorbed).toBe(true);
+
+    // Still one invoice: an absorption raises the existing document, it does not write a
+    // supplementary one -- which the live unique index would refuse in any case (D1, probe A).
+    expect(await fixtures.readInvoices(SUITE_TENANT_IDS)).toHaveLength(1);
+
+    // Appended, never merged (D2): the late `api.request` tranche is its own row.
+    const lineItems = await fixtures.readLineItems(SUITE_TENANT_IDS);
+    expect(lineItems).toHaveLength(INTEGRATION_LATE_USAGE.EXPECTED_LINE_ITEMS_AFTER_ABSORB);
+    expect(lineItems.every((item) => item.invoiceId === invoiceId)).toBe(true);
+  });
+
+  it("BI23 - a non-DRAFT invoice refuses the absorption with 409 INVOICE_IMMUTABLE and writes nothing", async () => {
+    // The invoice is seeded `FINALIZED` **through the owner connection** because the platform
+    // cannot produce that status: `createDraftInvoice` writes `DRAFT` and is the only statement
+    // anywhere that sets `Invoice.status`. So until T-048 ships, this case is the only thing
+    // standing behind the `INVOICE_IMMUTABLE` branch -- it is not redundant with a production
+    // path, it is the production path's stand-in.
+    //
+    // The fixture is **not** passing on the status alone: deleting the DRAFT guard from
+    // `absorbLateUsage` reddens this case as well as `BU100`, and nothing else -- measured
+    // package-wide, 2 failed of 181. That is what makes the owner-connection seed load-bearing
+    // rather than decoration. The red *set* is the durable half; the passed-count that used to
+    // be written here went stale the moment `BI27` landed (S-33's shape), so re-run the
+    // mutation rather than adjusting the numeral.
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    await fixtures.seedMeters([
+      {
+        tenantId: TENANT_A,
+        metricKey: INTEGRATION_FIXTURE.METRIC_API,
+        unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_API
+      }
+    ]);
+    await fixtures.seedInvoices([
+      {
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_FIXTURE.PERIOD_START,
+        periodEnd: INTEGRATION_FIXTURE.PERIOD_END,
+        status: InvoiceStatus.FINALIZED,
+        totalAmount: INTEGRATION_LATE_USAGE.FINALIZED_TOTAL
+      }
+    ]);
+    const lateLineId = await seedLateApiLine(TENANT_A);
+
+    const response = await generate(periodBody(TENANT_A));
+
+    expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_CONFLICT);
+    const body = response.json() as { code: string; message: string };
+    expect(body.code).toBe(BILLING_RESPONSES.CODE_INVOICE_IMMUTABLE);
+    // The status is named in the message rather than in a top-level field, because every error
+    // this service emits is `{ code, message }` (plan divergence E1).
+    expect(body.message).toContain(InvoiceStatus.FINALIZED);
+
+    // Nothing written, all three halves: no line item, no change to the total, no billed flag.
+    expect(await fixtures.readLineItems(SUITE_TENANT_IDS)).toHaveLength(0);
+    expect(asDecimalString((await invoiceFor(TENANT_A)).totalAmount)).toBe(
+      asDecimalString(INTEGRATION_LATE_USAGE.FINALIZED_TOTAL)
+    );
+    expect((await lineById(lateLineId)).billed).toBe(false);
+  });
+
+  it("BI24 - absorbing for one tenant leaves the other tenant's invoice, line items and late row untouched", async () => {
+    // **The isolation case, and the fixture is deliberately the hard one**: *both* tenants hold
+    // an invoice for the *same* period, and both have a late unbilled row. A shape where only
+    // one tenant had an invoice could not distinguish a correct absorb from one that resolved
+    // the invoice without a tenant predicate, because the wrong row would not exist.
+    //
+    // This matters here more than it would elsewhere: `"InvoiceLineItem"` has
+    // `relrowsecurity = f`, zero policies and no `tenantId` column (S-10). Measured at Gate 1
+    // as `telemetry_app` under another tenant's context, `UPDATE "Invoice"` matched 0 rows but
+    // an `INSERT` into `"InvoiceLineItem"` against a foreign `invoiceId` **succeeded**. So the
+    // application route -- no `invoiceId` parameter, compound-unique resolution, nested create
+    // -- is the entire control on that write.
+    //
+    // **What this case does and does not guard, measured rather than assumed.** S-45's plan
+    // predicted that giving `absorbLateUsage` an `invoiceId` parameter and addressing the line
+    // items by it would redden this case. **It does not**, and two mutations were run at Gate 3
+    // on this fixture to establish it:
+    //
+    // - *the parameter mutation* (add `invoiceId: string`, insert line items with
+    //   `tx.invoiceLineItem.create({ data: { invoiceId: input.invoiceId, … } })`, service
+    //   passes its own `existingInvoiceId`): **28 passed, 1 failed**, and the one failure was
+    //   BI25, which calls the repository directly and no longer type-matched. BI24 green.
+    // - *the tenant-predicate mutation* (resolve the invoice with
+    //   `findFirst({ where: { periodStart, periodEnd } })` -- no tenant at all -- and address
+    //   the line items by whatever it found): **29 passed, 0 failed**. BI24 green.
+    //
+    // The second one is the interesting result and the reason is the database, not the suite:
+    // the read runs inside `withTenant`, and `"Invoice"` RLS **is** enabled, so an untenanted
+    // predicate still only sees the bound tenant's row. Probed directly, two invoices sharing
+    // one period: under tenant B's context an untenanted `findFirst` returned `…-inv-b` and an
+    // untenanted `findMany` returned exactly `["…-inv-b"]`; with no tenant context at all the
+    // same `findMany` returned `[]`. Belt and braces working as designed -- and it means no
+    // behavioural case here can distinguish the application predicate from the RLS policy.
+    //
+    // So: **this case pins the outcome** (one tenant's absorption writes nothing of another
+    // tenant's) and it is worth having. What it is *not* is a guard against reintroducing a
+    // caller-supplied `invoiceId` -- but two named unit cases are, and both were measured
+    // against the unit suite as well as this one: adding the parameter and addressing the line
+    // items by it reddens `BU99`, adding it and addressing the *invoice* by it reddens `BU98`,
+    // and this case stays green under both (integration 28/2 either way, the failures being
+    // `BI25` and `BI27`, which call the repository directly). What no behavioural case catches
+    // is the **tenant predicate**: removing it from the resolution entirely is 30/0 here, because
+    // `"Invoice"` RLS answers identically. Recorded as S-46; same family as S-28, which records
+    // a tenant predicate whose removal is green for a schema reason and is kept anyway.
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    await fixtures.seedMeters([
+      {
+        tenantId: TENANT_A,
+        metricKey: INTEGRATION_FIXTURE.METRIC_API,
+        unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_API
+      },
+      {
+        tenantId: TENANT_B,
+        metricKey: INTEGRATION_FIXTURE.METRIC_API,
+        unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_API
+      }
+    ]);
+    await fixtures.seedUsageLines([
+      {
+        tenantId: TENANT_A,
+        metricKey: INTEGRATION_FIXTURE.METRIC_API,
+        quantity: INTEGRATION_FIXTURE.QUANTITY_API,
+        periodStart: INTEGRATION_FIXTURE.USAGE_INSTANT_EARLY
+      },
+      {
+        tenantId: TENANT_B,
+        metricKey: INTEGRATION_FIXTURE.METRIC_API,
+        quantity: INTEGRATION_LATE_USAGE.TENANT_B_QUANTITY_API,
+        periodStart: INTEGRATION_FIXTURE.USAGE_INSTANT_EARLY
+      }
+    ]);
+
+    // Both tenants invoice the same period, then both receive a late row.
+    expect((await generate(periodBody(TENANT_A))).statusCode).toBe(
+      BILLING_RESPONSES.HTTP_STATUS_CREATED
+    );
+    expect((await generate(periodBody(TENANT_B))).statusCode).toBe(
+      BILLING_RESPONSES.HTTP_STATUS_CREATED
+    );
+    const lateForA = await seedLateApiLine(TENANT_A);
+    const lateForB = await seedLateApiLine(TENANT_B);
+
+    const invoiceA = await invoiceFor(TENANT_A);
+    const invoiceB = await invoiceFor(TENANT_B);
+    const lineItemsForA = (await fixtures.readLineItems(SUITE_TENANT_IDS)).filter(
+      (item) => item.invoiceId === invoiceA.id
+    );
+
+    // Only tenant B absorbs.
+    const response = await generate(periodBody(TENANT_B));
+    expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
+    expect((response.json() as { data: { absorbed: boolean } }).data.absorbed).toBe(true);
+
+    // B's own side moved, so the case is not passing because nothing happened at all.
+    expect(asDecimalString((await invoiceFor(TENANT_B)).totalAmount)).toBe(
+      asDecimalString(INTEGRATION_LATE_USAGE.TENANT_B_EXPECTED_TOTAL_AFTER_ABSORB)
+    );
+    expect((await lineById(lateForB)).billed).toBe(true);
+
+    // **A's side is untouched, in all three places an absorption writes.**
+    expect(asDecimalString((await invoiceFor(TENANT_A)).totalAmount)).toBe(
+      asDecimalString(INTEGRATION_FIXTURE.EXPECTED_AMOUNT_API)
+    );
+    const lineItemsForAAfter = (await fixtures.readLineItems(SUITE_TENANT_IDS)).filter(
+      (item) => item.invoiceId === invoiceA.id
+    );
+    expect(lineItemsForAAfter).toHaveLength(lineItemsForA.length);
+    expect((await lineById(lateForA)).billed).toBe(false);
+
+    // And no line item of B's landed on A's invoice, nor the reverse -- the negative that a
+    // count alone would not catch if one row moved each way.
+    const allLineItems = await fixtures.readLineItems(SUITE_TENANT_IDS);
+    expect(allLineItems.filter((item) => item.invoiceId === invoiceB.id)).toHaveLength(2);
+    expect(new Set(allLineItems.map((item) => item.invoiceId))).toEqual(
+      new Set([invoiceA.id, invoiceB.id])
+    );
+  });
+
+  it("BI25 - Decimal(18,6) survives an absorption exactly, asserted below the HTTP boundary", async () => {
+    // Asserted on the repository's **return value** and on the database row, never on a
+    // response body: `Prisma.Decimal` defines `toJSON`, so a leaked Decimal serialises to the
+    // right-looking string and a route-level assertion passes either way (the BU75/BI18
+    // precedent). The response envelope carries no amount at all, so it could not catch this.
+    //
+    // The invoice is seeded at the full `Decimal(18,6)` width through the owner connection and
+    // the absorbed delta is one unit in the last place.
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    await fixtures.seedMeters([
+      {
+        tenantId: TENANT_A,
+        metricKey: INTEGRATION_FIXTURE.METRIC_API,
+        unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_PRECISE
+      }
+    ]);
+    await fixtures.seedInvoices([
+      {
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_FIXTURE.PERIOD_START,
+        periodEnd: INTEGRATION_FIXTURE.PERIOD_END,
+        status: InvoiceStatus.DRAFT,
+        totalAmount: INTEGRATION_LATE_USAGE.SEED_TOTAL_PRECISE
+      }
+    ]);
+    const lateLineId = await seedLateApiLine(TENANT_A, INTEGRATION_FIXTURE.BULK_QUANTITY);
+
+    const repository = new InvoiceRepository(app.container.prisma, TENANT_A);
+    const result = await repository.absorbLateUsage({
+      periodStart: new Date(INTEGRATION_FIXTURE.PERIOD_START),
+      periodEnd: new Date(INTEGRATION_FIXTURE.PERIOD_END),
+      totalAmountDelta: INTEGRATION_LATE_USAGE.EXPECTED_DELTA_PRECISE,
+      lineItems: [
+        {
+          metricKey: INTEGRATION_FIXTURE.METRIC_API,
+          quantity: INTEGRATION_FIXTURE.BULK_QUANTITY,
+          unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_PRECISE,
+          amount: INTEGRATION_LATE_USAGE.EXPECTED_DELTA_PRECISE
+        }
+      ],
+      usageLineIds: [lateLineId]
+    });
+
+    // Below HTTP: the repository's own return value, typed and valued.
+    expect(typeof result.totalAmount).toBe("string");
+    expect(result.totalAmount).not.toBeInstanceOf(Prisma.Decimal);
+    expect(asDecimalString(result.totalAmount)).toBe(
+      asDecimalString(INTEGRATION_LATE_USAGE.EXPECTED_TOTAL_PRECISE_AFTER_ABSORB)
+    );
+
+    // And the persisted row, which is what the addition actually happened to. The arithmetic is
+    // a SQL `numeric` addition on the column (`{ increment }`), not a read-modify-write.
+    expect(asDecimalString((await invoiceFor(TENANT_A)).totalAmount)).toBe(
+      asDecimalString(INTEGRATION_LATE_USAGE.EXPECTED_TOTAL_PRECISE_AFTER_ABSORB)
+    );
+    expect((await lineById(lateLineId)).billed).toBe(true);
+  });
+
+  it("BI26 - absorbing a metric the invoice already carries appends a second line item, never merging", async () => {
+    // D2: append, never merge. Each absorption records one tranche, which is a faithful audit
+    // trail -- and merging would need a read of a table with no index on `invoiceId` at all
+    // (`"InvoiceLineItem"` has a primary-key index and nothing else, measured at Gate 1).
+    //
+    // **T-047 inherits this**: `GET /v1/billing/invoices/:id` is the first thing on the platform
+    // to return line items, and it has to decide whether two tranches of one `metricKey` render
+    // as two lines or are grouped for display.
+    await seedTwoMetricPeriod();
+    await generate(periodBody(TENANT_A));
+    await seedLateApiLine(TENANT_A);
+
+    const response = await generate(periodBody(TENANT_A));
+    expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_OK);
+
+    const lineItems = await fixtures.readLineItems(SUITE_TENANT_IDS);
+    const apiLines = lineItems.filter(
+      (item) => item.metricKey === INTEGRATION_FIXTURE.METRIC_API
+    );
+    expect(apiLines).toHaveLength(2);
+    // Two tranches, same rate, different quantities -- not one row rewritten.
+    expect(apiLines.map((item) => asDecimalString(item.quantity)).sort()).toEqual(
+      [
+        asDecimalString(INTEGRATION_FIXTURE.QUANTITY_API),
+        asDecimalString(INTEGRATION_LATE_USAGE.LATE_QUANTITY_API)
+      ].sort()
+    );
+    for (const item of apiLines) {
+      expect(asDecimalString(item.unitPrice)).toBe(
+        asDecimalString(INTEGRATION_FIXTURE.UNIT_PRICE_API)
+      );
+    }
+
+    // The line amounts sum to the invoice total, which is what makes the appended row an
+    // accounting record rather than a duplicate.
+    const summed = lineItems.reduce(
+      (running, item) => running.add(new Prisma.Decimal(String(item.amount))),
+      new Prisma.Decimal(0)
+    );
+    expect(summed.toString()).toBe(
+      asDecimalString(INTEGRATION_LATE_USAGE.EXPECTED_TOTAL_AFTER_ABSORB)
+    );
+    expect(asDecimalString((await invoiceFor(TENANT_A)).totalAmount)).toBe(summed.toString());
+  });
+
+  it("BI27 - a mid-absorb failure rolls back the increment, the appended line items and the billed flags", async () => {
+    // **AC2's money invariant, against a real transaction.** Steps 3 and 4 of `absorbLateUsage`
+    // both write: the `update` raises the total and nests the line-item `create`, then
+    // `markUsageLinesBilled` flags the rows. A partial absorb -- rows marked billed without
+    // their charges, or charges added without the rows being marked -- would destroy the only
+    // record that the money was owed, which is worse than the gap this task closes. Nothing
+    // asserted that live until this case: `BU100` and `BU101` are doubles, and `BI23` refuses
+    // **before** any write, so it has nothing to roll back (it was miscredited with this in an
+    // earlier revision of `BU101`'s comment).
+    //
+    // The failure is induced the way `BI10` induces it on the create path, because it is the
+    // real race rather than a contrived throw: a concurrent writer bills one of the two priced
+    // rows through the **owner** connection, between the read and the write. The count
+    // assertion then sees 1 of 2 and raises at step 4, after the increment and the nested
+    // create have already run in the same transaction.
+    await seedTwoMetricPeriod();
+    await generate(periodBody(TENANT_A));
+
+    const lateFirst = await seedLateApiLine(TENANT_A);
+    const lateSecond = await seedLateApiLine(
+      TENANT_A,
+      INTEGRATION_LATE_USAGE.LATE_QUANTITY_API,
+      INTEGRATION_LATE_USAGE.INSTANT_SECOND
+    );
+    const lineItemsBefore = await fixtures.readLineItems(SUITE_TENANT_IDS);
+
+    await fixtures.admin.usageLine.update({
+      where: { id: lateFirst },
+      data: { billed: true }
+    });
+
+    const repository = new InvoiceRepository(app.container.prisma, TENANT_A);
+    await expect(
+      repository.absorbLateUsage({
+        periodStart: new Date(INTEGRATION_FIXTURE.PERIOD_START),
+        periodEnd: new Date(INTEGRATION_FIXTURE.PERIOD_END),
+        totalAmountDelta: INTEGRATION_LATE_USAGE.ROLLBACK_DELTA,
+        lineItems: [
+          {
+            metricKey: INTEGRATION_FIXTURE.METRIC_API,
+            quantity: INTEGRATION_LATE_USAGE.ROLLBACK_LINE_QUANTITY,
+            unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_API,
+            amount: INTEGRATION_LATE_USAGE.ROLLBACK_DELTA
+          }
+        ],
+        usageLineIds: [lateFirst, lateSecond]
+      })
+    ).rejects.toBeInstanceOf(UsageLinesChangedError);
+
+    // **The three values, read back through the owner connection.** Rolled back by PostgreSQL,
+    // not merely raised -- each of these is a separate write that the transaction undid.
+    //
+    // 1. the total is the pre-absorb figure, not that figure plus `ROLLBACK_DELTA`;
+    expect(asDecimalString((await invoiceFor(TENANT_A)).totalAmount)).toBe(
+      asDecimalString(INTEGRATION_FIXTURE.EXPECTED_TOTAL)
+    );
+    // 2. no line item was appended -- asserted against the count taken before the call, so it
+    //    fails whether the nested create survived or the invoice lost rows;
+    expect(await fixtures.readLineItems(SUITE_TENANT_IDS)).toHaveLength(lineItemsBefore.length);
+    // 3. the row the transaction itself marked is unbilled again, so the next run will still
+    //    find it. The row the *concurrent writer* billed stays billed: that write was outside
+    //    this transaction and must not be undone by it.
+    expect((await lineById(lateSecond)).billed).toBe(false);
+    expect((await lineById(lateFirst)).billed).toBe(true);
   });
 
   it("BI10 - a short billed count rolls the invoice and its line items back", async () => {

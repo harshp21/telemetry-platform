@@ -1,6 +1,6 @@
-import type { InvoiceStatus } from "@prisma/client";
+import type { InvoiceStatus, Prisma } from "@prisma/client";
 import { BILLING_DATABASE, BILLING_INVOICE_LIST, BILLING_METERING } from "../constants";
-import { UsageLinesChangedError } from "../errors";
+import { InvoiceImmutableError, UsageLinesChangedError } from "../errors";
 import { TenantScopedRepository } from "./base.repository";
 
 /** One metric's unbilled total for the period, already normalised out of `Prisma.Decimal` (D8). */
@@ -35,6 +35,41 @@ export interface CreateDraftInvoiceInput {
   readonly totalAmount: string;
   readonly lineItems: readonly DraftInvoiceLineItemInput[];
   readonly usageLineIds: readonly string[];
+}
+
+/**
+ * What an absorption adds to an invoice that already exists (S-45).
+ *
+ * **There is no `invoiceId` field, and that is the design rather than an omission.** The
+ * invoice is resolved here from `tenantId_periodStart_periodEnd`, with the tenant from
+ * `this.where({})` -- so a caller cannot name a foreign invoice, because there is no parameter
+ * through which to name one. `"InvoiceLineItem"` has `relrowsecurity = f` and no policy (S-10)
+ * and no `tenantId` column, so the application route is the **entire** tenant control on the
+ * line-item write; see `absorbLateUsage`'s own docblock for the measurement.
+ *
+ * `totalAmountDelta` is what the invoice total goes **up by**, not what it becomes: the column
+ * is raised by a SQL addition, never read into JavaScript and written back (D4). No `currency`
+ * field either -- the invoice already has one, and this method does not overwrite it.
+ */
+export interface AbsorbLateUsageInput {
+  readonly periodStart: Date;
+  readonly periodEnd: Date;
+  readonly totalAmountDelta: string;
+  readonly lineItems: readonly DraftInvoiceLineItemInput[];
+  readonly usageLineIds: readonly string[];
+}
+
+/**
+ * The outcome of an absorption: the invoice that took it, and its total **after** the increment.
+ *
+ * `totalAmount` is a string, like every other amount that crosses this boundary (D5). It is
+ * returned so a caller -- and `BI25` -- can assert the persisted value below the HTTP layer:
+ * `Prisma.Decimal` defines `toJSON`, so a leaked Decimal is invisible in a response body and a
+ * route-level assertion would pass either way.
+ */
+export interface AbsorbLateUsageResult {
+  readonly invoiceId: string;
+  readonly totalAmount: string;
 }
 
 /**
@@ -180,15 +215,20 @@ const toIsoString = (value: Date): string => value.toISOString();
  *    constructor-bound context -- and no method has a `tenantId` parameter through which a
  *    caller could supply a different one.
  * 3. **No method here takes a bare `invoiceId`** -- checkable, and checked:
- *    `grep -n "^  async" invoice.repository.ts` lists five signatures and none has one, and
- *    every `invoiceId` in the file is a local binding, a returned field or a comment -- never a
- *    parameter. (Re-run at T-046 Gate 3 rework: `tenantExists`, `findByPeriod`,
- *    `sumUnbilledByMetricKey`, `createDraftInvoice`, `listInvoices`. T-046 added the fifth and
- *    the count said four until this line was corrected -- so re-run it rather than trusting the
- *    numeral, which is the S-33 failure this comment is itself an instance of.) This is a
+ *    `grep -n "^  async" invoice.repository.ts` lists six signatures and none has one, and
+ *    every `invoiceId` in the file is a local binding, a returned interface field or a comment
+ *    -- never a parameter. (Re-run at S-45 Gate 3: `tenantExists`, `findByPeriod`,
+ *    `sumUnbilledByMetricKey`, `createDraftInvoice`, `absorbLateUsage`, `listInvoices`. T-046
+ *    added the fifth and the count said four until that was corrected; S-45 added the sixth.
+ *    Re-run it rather than trusting the numeral, which is the S-33 failure this comment is
+ *    itself an instance of. Note the grep is anchored to `^  async` and so **excludes** the
+ *    private `markUsageLinesBilled`, which is `private async` -- `grep -nE "^  (private )?async"`
+ *    returns seven. Neither takes an `invoiceId` either.) This is a
  *    property of the shape as shipped, not something the type system forbids: nothing stops a
  *    later method adding the parameter, which is why it is written down here. Line items are
- *    written through Prisma's nested `create` on the invoice, and this task reads none. That
+ *    written through Prisma's nested `create` on the invoice -- by `createDraftInvoice` and,
+ *    since S-45, by `absorbLateUsage`, which are the only two writers on this tree -- and no
+ *    method here reads them. That
  *    matters more here than it would elsewhere: `"InvoiceLineItem"` has `relrowsecurity = f`
  *    and no policy (S-10), and no `tenantId` column to write one against, so the join through
  *    `"Invoice"` is its *only* tenant control. Measured at Gate 1 inside the transaction this code writes in: after
@@ -278,6 +318,51 @@ export class InvoiceRepository extends TenantScopedRepository {
   }
 
   /**
+   * Marks exactly `usageLineIds` billed, chunked, with one count assertion over the whole set.
+   *
+   * **Extracted rather than copied** (S-45 slice S3). `createDraftInvoice` and
+   * `absorbLateUsage` need the identical bound and the identical assertion, and two copies of
+   * a correctness bound is how they drift -- `.claude/rules/constants.md`'s DRY gate applied to
+   * logic rather than to literals. The extraction is behaviour-preserving and that is what
+   * `BU24`, `BU24b`, `BU26`, `BU27b`, `BI11` and `BI12` are for: all six pin the existing
+   * chunking and all six stayed green across it.
+   *
+   * Chunked because Prisma expands `id: { in: [...] }` to one bind variable per id and
+   * PostgreSQL caps a prepared statement at 32 767 of them -- measured, 32 764 ids pass and
+   * 32 765 raise `P2035`. See `BILLING_METERING.BILLED_UPDATE_CHUNK_SIZE` for the full
+   * measurement and for why the chunk is 1 000 rather than nearer the ceiling.
+   *
+   * The count assertion is unchanged in meaning and deliberately so: the counts are summed
+   * across every chunk and compared against the **whole** id set, never per chunk. A per-chunk
+   * comparison would be a different, weaker guard -- it would still catch a concurrent writer,
+   * but it would report the wrong numbers and would stop being the property BU24 and BU26 pin.
+   * BU27b is the case that goes red if the sum is dropped.
+   *
+   * The caller must already be inside `withTenant`: the throw is what rolls the caller's
+   * invoice write back with it, which is the property BI10 asserts against a live database.
+   */
+  private async markUsageLinesBilled(
+    tx: Prisma.TransactionClient,
+    usageLineIds: readonly string[]
+  ): Promise<void> {
+    const expectedCount = usageLineIds.length;
+    let markedCount = 0;
+
+    for (let offset = 0; offset < expectedCount; offset += CHUNK_SIZE) {
+      const chunk = usageLineIds.slice(offset, offset + CHUNK_SIZE);
+      const marked = await tx.usageLine.updateMany({
+        where: this.where({ id: { in: [...chunk] }, billed: false }),
+        data: { billed: true }
+      });
+      markedCount += marked.count;
+    }
+
+    if (markedCount !== expectedCount) {
+      throw new UsageLinesChangedError(expectedCount, markedCount);
+    }
+  }
+
+  /**
    * Writes the draft invoice, its line items and the billed flags in one transaction (step 8).
    *
    * The `updateMany` count assertion is a **detector of a concurrent writer, not a weaker
@@ -293,8 +378,6 @@ export class InvoiceRepository extends TenantScopedRepository {
    * periodEnd])` does, and the loser lands in the catch below.
    */
   async createDraftInvoice(input: CreateDraftInvoiceInput): Promise<DraftInvoiceResult> {
-    const expectedCount = input.usageLineIds.length;
-
     try {
       const invoiceId = await this.withTenant(async (tx) => {
         const invoice = await tx.invoice.create({
@@ -319,29 +402,7 @@ export class InvoiceRepository extends TenantScopedRepository {
           select: { id: true }
         });
 
-        // Chunked because Prisma expands `id: { in: [...] }` to one bind variable per id and
-        // PostgreSQL caps a prepared statement at 32 767 of them -- measured, 32 764 ids pass
-        // and 32 765 raise `P2035`. See `BILLING_METERING.BILLED_UPDATE_CHUNK_SIZE` for the
-        // full measurement and for why the chunk is 1 000 rather than nearer the ceiling.
-        //
-        // The count assertion is unchanged in meaning and deliberately so: the counts are
-        // summed across every chunk and compared against the **whole** id set, never per chunk.
-        // A per-chunk comparison would be a different, weaker guard -- it would still catch a
-        // concurrent writer, but it would report the wrong numbers and would stop being the
-        // property BU24 and BU26 pin. BU27b is the case that goes red if the sum is dropped.
-        let markedCount = 0;
-        for (let offset = 0; offset < expectedCount; offset += CHUNK_SIZE) {
-          const chunk = input.usageLineIds.slice(offset, offset + CHUNK_SIZE);
-          const marked = await tx.usageLine.updateMany({
-            where: this.where({ id: { in: [...chunk] }, billed: false }),
-            data: { billed: true }
-          });
-          markedCount += marked.count;
-        }
-
-        if (markedCount !== expectedCount) {
-          throw new UsageLinesChangedError(expectedCount, markedCount);
-        }
+        await this.markUsageLinesBilled(tx, input.usageLineIds);
 
         return invoice.id;
       });
@@ -367,6 +428,143 @@ export class InvoiceRepository extends TenantScopedRepository {
 
       return { invoiceId: existingInvoiceId, created: false };
     }
+  }
+
+  /**
+   * Adds late usage to the invoice that already covers this period, in one transaction (S-45).
+   *
+   * Four steps, in this order, and any throw at any of them rolls back all of it -- no line
+   * items, no total change, no billed flags. A partial absorb that marked rows billed without
+   * adding their charges would destroy the only record that the money was owed, which is worse
+   * than the gap this method closes.
+   *
+   * 1. resolve the invoice from the compound unique, reading `id` and `status`;
+   * 2. refuse anything that is not `DRAFT` -- `InvoiceImmutableError`, before any write;
+   * 3. one `update`: `totalAmount: { increment }` **plus** nested `lineItems: { create }`;
+   * 4. the chunked billed update, through the same helper `createDraftInvoice` uses.
+   *
+   * **Tenant isolation, stated exactly as it was measured (S-10, plan probe F).** As
+   * `telemetry_app` under another tenant's context, `UPDATE "Invoice" … WHERE id = <foreign>`
+   * matched **0 rows** -- RLS holds for step 3's target -- but a `SELECT` on
+   * `"InvoiceLineItem"` returned the foreign row and an `INSERT` against the foreign
+   * `invoiceId` **succeeded**. `relrowsecurity = f`, zero policies, no `tenantId` column. So
+   * **do not read this as "RLS protects the line-item write": it does not.** The controls that
+   * do exist are, in order:
+   *
+   * - this method takes **no `invoiceId` parameter**, so a foreign invoice cannot be named at
+   *   the call site. That is a property of the shape as shipped -- checkable by grep, not
+   *   enforced by the type system, which is why it is written down;
+   * - the invoice is addressed by `tenantId_periodStart_periodEnd` with the tenant from
+   *   `this.where({})`, and the emitted `UPDATE` carries that tenant in its own `WHERE`;
+   * - the line items are created **only** through the nested `create` on that resolved
+   *   invoice, never `tx.invoiceLineItem.create`, so the `invoiceId` Prisma binds is one this
+   *   statement just resolved under the tenant predicate.
+   *
+   * **What guards each of those, measured -- and the measurement was run against *both* suites,
+   * because an earlier revision of this paragraph ran only the integration one and concluded
+   * from it that nothing guarded the parameter.** Each mutation was applied to `src/`, both
+   * suites run, then reverted and the tree re-checksummed:
+   *
+   * - `BU98` (`tests/invoice.repository.unit.test.ts`) pins the **address**: `invoice.update`'s
+   *   `where` is `tenantId_periodStart_periodEnd` carrying the bound tenant. Adding an
+   *   `invoiceId` parameter and addressing `findUniqueOrThrow`/`update` by `{ id }` reddens it
+   *   -- `AssertionError: expected { id: undefined } to deeply equal { ...(1) }`, unit 1 failed
+   *   / 26 passed. Dropping the tenant from the **write** alone (read still on the compound
+   *   unique, `update` on `{ id: existing.id }`) reddens it too, and that mutation keeps the
+   *   Prisma call surface so the red is a real assertion failure rather than a missing double.
+   * - `BU99` pins the **route**: the nested `create`, with `tx.invoiceLineItem.create` never
+   *   called. Adding the parameter and writing the line items through
+   *   `tx.invoiceLineItem.create({ data: { invoiceId: input.invoiceId, ... } })` reddens it --
+   *   unit 1 failed / 26 passed.
+   * - `BI24` pins the **outcome** against a live database with two tenants holding invoices for
+   *   the same period. It is green under **every** one of those mutations; the integration
+   *   failures are only `BI25` and `BI27` (28 passed / 2 failed), which call the repository
+   *   directly and so no longer type-match. So the *structural* property is guarded by two named
+   *   unit cases, not by grep alone -- but not by any behavioural one.
+   *
+   * **What no behavioural case catches is the tenant predicate itself.** Removing it from the
+   * resolution entirely -- `findFirst({ where: { periodStart, periodEnd } })`, update addressed
+   * by the id it found -- is **30 passed / 0 failed** on the integration suite, because the read
+   * runs inside `withTenant` and `"Invoice"` RLS is enabled, so an untenanted predicate still
+   * sees only the bound tenant's row. Probed directly as `telemetry_app` with two invoices
+   * sharing one period: under tenant B's context the untenanted predicate returned exactly B's
+   * row, the tenanted one returned the same row, tenant A's context returned exactly A's, and
+   * no context at all returned none. That mutation does turn four unit cases red, but
+   * **mechanically** -- `tx.invoice.findFirst is not a function`, the Prisma double having no
+   * `findFirst` -- so it is not evidence of coverage. Recorded as S-46; keep the predicate
+   * regardless, per `.claude/rules/tenant-isolation.md`.
+   *
+   * **`findUniqueOrThrow` raises `P2025` if the invoice vanished** between the service's
+   * `findByPeriod` and this transaction. No production path deletes an invoice: a grep for
+   * `invoice.delete` and `invoice.deleteMany` across every service's `src` returns nothing but
+   * this sentence, which matches itself -- the S-33 self-match, named here so a future reader
+   * re-running it is not misled by the single hit.
+   * That is a statement about today's writers, not about reachability -- the integration
+   * fixtures delete invoices in teardown, and an unset tenant context would produce the same
+   * `null` through RLS. It surfaces as a `500`, which is the right answer for "the world changed
+   * underneath a transaction in a way nothing is supposed to do".
+   *
+   * **Appended, never merged (D2).** Each absorption inserts its own rows; existing line items
+   * are neither read nor rewritten. A period whose `api.request` was billed twice therefore
+   * carries **two** rows with that key, which is a faithful audit trail of two tranches.
+   * **T-047 (`GET /v1/billing/invoices/:id`) inherits that** and must decide whether to render
+   * them as two lines or group them for display -- it is the first thing on the platform to
+   * return line items at all. Merging was rejected partly because `"InvoiceLineItem"` has a
+   * primary-key index and nothing else, not even one on `invoiceId`.
+   *
+   * **`DRAFT`-only mutation is a decision T-048 inherits.** T-048 is the declared invoice
+   * immutability guard (`docs/epics/epic-8-billing-service.md:140`); S-45 pre-commits what
+   * *generate* does with a non-`DRAFT` invoice and nothing else -- no `update` method and no
+   * repository-wide guard. T-048 either adopts this or overrides it deliberately, and it reuses
+   * the code name declared in that same section so the platform ends with one
+   * `INVOICE_IMMUTABLE`.
+   */
+  async absorbLateUsage(input: AbsorbLateUsageInput): Promise<AbsorbLateUsageResult> {
+    const { tenantId } = this.where({});
+    const periodKey = {
+      tenantId_periodStart_periodEnd: {
+        tenantId,
+        periodStart: input.periodStart,
+        periodEnd: input.periodEnd
+      }
+    };
+
+    return this.withTenant(async (tx) => {
+      const existing = await tx.invoice.findUniqueOrThrow({
+        where: periodKey,
+        select: { id: true, status: true }
+      });
+
+      if (existing.status !== BILLING_METERING.INVOICE_STATUS_DRAFT) {
+        throw new InvoiceImmutableError(existing.id, existing.status);
+      }
+
+      const invoice = await tx.invoice.update({
+        where: periodKey,
+        data: {
+          // A SQL addition on the column -- `SET "totalAmount" = ("totalAmount" + $1)`,
+          // measured -- so the arithmetic happens in PostgreSQL `numeric` at the column's own
+          // precision and does not race a concurrent absorber. A read-modify-write would put a
+          // `Decimal(18,6)` value through JavaScript and lose that.
+          totalAmount: { increment: input.totalAmountDelta },
+          // Nested, so the line items are created against the invoice this statement resolved
+          // under the tenant predicate and never against an `invoiceId` from anywhere else.
+          lineItems: {
+            create: input.lineItems.map((item) => ({
+              metricKey: item.metricKey,
+              quantity: item.quantity,
+              unitPrice: item.unitPrice,
+              amount: item.amount
+            }))
+          }
+        },
+        select: { id: true, totalAmount: true }
+      });
+
+      await this.markUsageLinesBilled(tx, input.usageLineIds);
+
+      return { invoiceId: invoice.id, totalAmount: toAmountString(invoice.totalAmount) };
+    });
   }
 
   /**

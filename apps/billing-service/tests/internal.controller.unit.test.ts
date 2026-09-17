@@ -3,7 +3,9 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Logger } from "pino";
 import { InternalController } from "../src/controllers/internal.controller";
 import type { BillingService } from "../src/services/billing.service";
+import { InvoiceStatus } from "@prisma/client";
 import {
+  InvoiceImmutableError,
   MeterNotFoundError,
   TenantNotFoundError,
   UsageLinesChangedError
@@ -47,7 +49,11 @@ describe("InternalController.generate", () => {
   let reply: FastifyReply;
 
   beforeEach(() => {
-    generateInvoice = vi.fn(async () => ({ invoiceId: INVOICE_ID, created: true }));
+    generateInvoice = vi.fn(async () => ({
+      invoiceId: INVOICE_ID,
+      created: true,
+      absorbed: false
+    }));
     logger = { error: vi.fn() };
     controller = new InternalController(
       { generateInvoice } as unknown as BillingService,
@@ -80,24 +86,32 @@ describe("InternalController.generate", () => {
     expect(generateInvoice).not.toHaveBeenCalled();
   });
 
-  it("BU54 - answers 201 { data: { invoiceId } } when an invoice was created", async () => {
+  it("BU54 - answers 201 { data: { invoiceId, absorbed } } when an invoice was created", async () => {
     await controller.generate(buildRequest(validBody), reply);
 
     expect(reply.status).toHaveBeenCalledWith(BILLING_RESPONSES.HTTP_STATUS_CREATED);
-    expect(sentBody(reply)).toEqual({ data: { invoiceId: INVOICE_ID } });
+    expect(sentBody(reply)).toEqual({ data: { invoiceId: INVOICE_ID, absorbed: false } });
   });
 
   it("BU55 - answers 200 with the same envelope on an idempotent hit", async () => {
-    generateInvoice.mockResolvedValueOnce({ invoiceId: INVOICE_ID, created: false });
+    generateInvoice.mockResolvedValueOnce({
+      invoiceId: INVOICE_ID,
+      created: false,
+      absorbed: false
+    });
 
     await controller.generate(buildRequest(validBody), reply);
 
     expect(reply.status).toHaveBeenCalledWith(BILLING_RESPONSES.HTTP_STATUS_OK);
-    expect(sentBody(reply)).toEqual({ data: { invoiceId: INVOICE_ID } });
+    expect(sentBody(reply)).toEqual({ data: { invoiceId: INVOICE_ID, absorbed: false } });
   });
 
   it("BU56 - answers 200 { data: { invoiceId: null } } when there is no billable usage", async () => {
-    generateInvoice.mockResolvedValueOnce({ invoiceId: null, created: false });
+    generateInvoice.mockResolvedValueOnce({
+      invoiceId: null,
+      created: false,
+      absorbed: false
+    });
 
     await controller.generate(buildRequest(validBody), reply);
 
@@ -105,7 +119,46 @@ describe("InternalController.generate", () => {
     // dropped: `invoiceId === null` already distinguishes this case, and a `message` field in a
     // success body appears nowhere else in this repository.
     expect(reply.status).toHaveBeenCalledWith(BILLING_RESPONSES.HTTP_STATUS_OK);
-    expect(sentBody(reply)).toEqual({ data: { invoiceId: null } });
+    expect(sentBody(reply)).toEqual({ data: { invoiceId: null, absorbed: false } });
+  });
+
+  it("BU102 - carries absorbed into the envelope at 200, without moving the status to 201", async () => {
+    // S-45. An absorption and a no-op are both `200` with the same `invoiceId`, so this flag is
+    // the only thing in the response that tells an operator the platform just retro-billed.
+    // `201` still means, and only means, that the call inserted the invoice -- asserted
+    // negatively, because "absorbed therefore created" is the plausible wrong mapping.
+    generateInvoice.mockResolvedValueOnce({
+      invoiceId: INVOICE_ID,
+      created: false,
+      absorbed: true
+    });
+
+    await controller.generate(buildRequest(validBody), reply);
+
+    expect(reply.status).toHaveBeenCalledWith(BILLING_RESPONSES.HTTP_STATUS_OK);
+    expect(reply.status).not.toHaveBeenCalledWith(BILLING_RESPONSES.HTTP_STATUS_CREATED);
+    expect(sentBody(reply)).toEqual({ data: { invoiceId: INVOICE_ID, absorbed: true } });
+  });
+
+  it("BU102b - surfaces a 409 INVOICE_IMMUTABLE refusal with the status named in the message", async () => {
+    // The epic declares this error as `{ code, invoiceId, currentStatus }` (`epic-8` § *T-048*,
+    // heading `:140`); every
+    // error this service emits is `{ code, message }`, so the envelope is kept and the two
+    // values go to billing's log line instead (divergence E1). Asserted as a key set, not a
+    // `toMatchObject`, because the point is that the extra fields are *absent*.
+    generateInvoice.mockRejectedValueOnce(
+      new InvoiceImmutableError(INVOICE_ID, InvoiceStatus.FINALIZED)
+    );
+
+    await controller.generate(buildRequest(validBody), reply);
+
+    expect(reply.status).toHaveBeenCalledWith(BILLING_RESPONSES.HTTP_STATUS_CONFLICT);
+    const body = sentBody(reply) as { code: string; message: string };
+    expect(Object.keys(body).sort()).toEqual(["code", "message"]);
+    expect(body.code).toBe(BILLING_RESPONSES.CODE_INVOICE_IMMUTABLE);
+    expect(body.message).toContain(InvoiceStatus.FINALIZED);
+    // It travels the AppError arm, so nothing is logged as an unexpected failure.
+    expect(logger.error).not.toHaveBeenCalled();
   });
 
   it("BU57 - surfaces an AppError with its own status, code and message", async () => {

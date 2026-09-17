@@ -118,3 +118,42 @@ export class UsageLinesChangedError extends AppError {
     );
   }
 }
+
+/**
+ * S-45 D1: generate found an invoice for the period, late usage to absorb into it, and a
+ * status other than `DRAFT`.
+ *
+ * `409`, matching `UsageLinesChangedError`: the request was well-formed, the server wrote
+ * nothing, and the condition is about the state of a resource rather than about the caller's
+ * input. The refusal is the safe direction -- the alternative is mutating a document that has
+ * been issued, and the usage stays `billed = false` and absorbable if the status ever moves
+ * back or a supplementary process claims it.
+ *
+ * **No writer in this repository produces the state this refuses.** A grep for `FINALIZED`,
+ * `PAID` and `finalizedAt` across every service's `src/` and `prisma/` returns declarations,
+ * reads and comments only; `createDraftInvoice` writes `BILLING_METERING.INVOICE_STATUS_DRAFT`
+ * and is the only statement that sets `Invoice.status` at all (measured at Gate 1, plan
+ * appendix A.6). So until T-048 ships, `BI23` -- which seeds `FINALIZED` through the owner
+ * connection -- is the only thing standing behind this branch. Stated as what that grep shows
+ * about today's writers, **not** as a claim the status is unrepresentable: the fixtures reach
+ * it, which is exactly how `BI23` works.
+ *
+ * `invoiceId` and `currentStatus` are retained as fields and read by `BillingService`'s log
+ * line. They are deliberately **not** in the response body: the epic declares
+ * `{ code, invoiceId, currentStatus }` (`epic-8` § *T-048*, heading `:140`) and every error
+ * this service emits is
+ * `{ code, message }`, so the status is named in the message and both values go where an
+ * operator reads them (plan divergence E1).
+ */
+export class InvoiceImmutableError extends AppError {
+  constructor(
+    public readonly invoiceId: string,
+    public readonly currentStatus: string
+  ) {
+    super(
+      BILLING_RESPONSES.CODE_INVOICE_IMMUTABLE,
+      BILLING_RESPONSES.HTTP_STATUS_CONFLICT,
+      `${BILLING_RESPONSES.MESSAGE_INVOICE_IMMUTABLE} (status ${currentStatus})`
+    );
+  }
+}

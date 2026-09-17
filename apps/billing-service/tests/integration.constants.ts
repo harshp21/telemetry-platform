@@ -184,3 +184,83 @@ export const INTEGRATION_INVOICE_LIST = {
   /** A tenant that exists but owns no invoice: the empty-list case must be 200, not 404. */
   EXPECTED_EMPTY_TOTAL: 0
 } as const;
+
+/**
+ * Fixture vocabulary for the late-usage absorption cases (S-45, BI22-BI26).
+ *
+ * The defining property of a "late" row is **when it is seeded**, not what it contains: every
+ * case below inserts it *after* the period's invoice already exists, because seeding it first
+ * lets the first generate bill it and the ordering under test never runs (plan section 4.1).
+ * The instant itself is ordinary -- inside `[PERIOD_START, PERIOD_END)`, exactly like any other
+ * usage row. That is the point: worker stamps a `UsageLine` with the event's own instant
+ * (`apps/worker-service/src/validators/stream-message.validator.ts`), so processing lag alone
+ * puts a row behind a closed window.
+ *
+ * Amounts are derived from `INTEGRATION_FIXTURE`'s rates rather than restated: the late row is
+ * `LATE_QUANTITY_API` at `UNIT_PRICE_API`, and `EXPECTED_TOTAL_AFTER_ABSORB` is
+ * `EXPECTED_TOTAL` plus that. They are written out because the assertion must be able to fail
+ * -- a test that recomputes the production arithmetic asserts nothing.
+ */
+export const INTEGRATION_LATE_USAGE = {
+  /** Inside the window, and seeded after the invoice for that window exists. */
+  INSTANT: "2026-01-25T09:00:00.000Z",
+  /**
+   * A second late instant, inside the same window, so a case can seed **two** distinct late
+   * rows. Used by `BI27`, whose rollback needs one row the transaction marks billed and one
+   * the concurrent writer already marked, at instants a reader can tell apart.
+   *
+   * Its original comment said "for the case that absorbs twice". No such case exists, and none
+   * was ever written -- corrected at Gate 4 (review LOW-1) rather than left describing a test a
+   * reader would go looking for.
+   */
+  INSTANT_SECOND: "2026-01-26T09:00:00.000Z",
+  LATE_QUANTITY_API: "200.000000",
+  /** 12.5 + 2 */
+  EXPECTED_TOTAL_AFTER_ABSORB: "14.5",
+  /** The two lines the first generate wrote, plus the one the absorption appended (D2). */
+  EXPECTED_LINE_ITEMS_AFTER_ABSORB: 3,
+  /** Tenant B's own usage in the same window, so BI24 has two invoices to confuse. */
+  TENANT_B_QUANTITY_API: "300.000000",
+  /** 3 + 2 */
+  TENANT_B_EXPECTED_TOTAL_AFTER_ABSORB: "5",
+  /**
+   * BI23's refusal fixture: an invoice this platform cannot produce.
+   *
+   * `createDraftInvoice` writes `DRAFT` and is the only statement that sets `Invoice.status`
+   * anywhere, so `FINALIZED` has no HTTP spelling and the row must be seeded through the owner
+   * connection. Until T-048 ships, that fixture is the only thing standing behind the
+   * `INVOICE_IMMUTABLE` branch.
+   */
+  FINALIZED_TOTAL: "7.000000",
+  /**
+   * BI25's precision pair, measured at Gate 1 through the real client (plan probe I):
+   * `1234567.123456 + 0.000001` persists as `1234567.123457`. The addition happens in
+   * PostgreSQL `numeric`, because Prisma's `{ increment }` compiles to
+   * `SET "totalAmount" = ("totalAmount" + $1)`.
+   *
+   * **This pair does not refute a JavaScript addition, and saying it did would be wrong.**
+   * Measured here: `String(Number("1234567.123456") + Number("0.000001"))` is
+   * `"1234567.123457"` -- the same string. What BI25 pins is that the value survives the
+   * absorption exactly at the `Decimal(18,6)` boundary and that no `Prisma.Decimal` leaves the
+   * repository; the reason to keep the arithmetic in SQL is that it does not race a concurrent
+   * absorber (D4), not that this particular sum drifts. (A value that *does* drift, if a later
+   * case wants one: `String(Number("123456789012.123456") + Number("0.000001"))` is
+   * `"123456789012.12346"`, six digits short -- which is why `INTEGRATION_INVOICE_LIST` picked
+   * that width for its own read round trip.)
+   */
+  SEED_TOTAL_PRECISE: "1234567.123456",
+  EXPECTED_TOTAL_PRECISE_AFTER_ABSORB: "1234567.123457",
+  /** `BULK_QUANTITY` (1) x `UNIT_PRICE_PRECISE` (0.000001). */
+  EXPECTED_DELTA_PRECISE: "0.000001",
+  /**
+   * `BI27`'s rollback fixture: **two** late `api.request` rows at `LATE_QUANTITY_API`, so one
+   * can be billed by a concurrent writer while the other must be observed rolling back to
+   * `billed = false`. 2 x 200 x `UNIT_PRICE_API` (0.01).
+   *
+   * Written out rather than recomputed, for the reason this block's docblock gives: a test that
+   * re-derives the production arithmetic cannot fail.
+   */
+  ROLLBACK_DELTA: "4",
+  /** 2 x `LATE_QUANTITY_API`, the quantity the single appended line item would have carried. */
+  ROLLBACK_LINE_QUANTITY: "400.000000"
+} as const;
