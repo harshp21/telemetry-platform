@@ -207,4 +207,73 @@ describe(`POST ${BILLING_ROUTES.INTERNAL_BILLING_GENERATE}`, () => {
     expect(body).not.toHaveProperty("status");
     expect(body).not.toHaveProperty("workflow");
   });
+
+  // S-8 / AC5. **The guard runs before the body is parsed, and this is the case that notices if
+  // it stops.**
+  //
+  // The guard was an `app.register`-scoped `preHandler`, which runs *after* fastify's
+  // content-type parser. Measured against this real route with no credential at all, before the
+  // promotion:
+  //
+  //   valid JSON body                -> 401 {"code":"UNAUTHORIZED"}
+  //   well-formed, schema-invalid    -> 401 {"code":"UNAUTHORIZED"}
+  //   malformed JSON                 -> 500 {"code":"INTERNAL_ERROR","message":"Body is not valid
+  //                                         JSON but content-type is set to 'application/json'"}
+  //
+  // Two notes, because the plan predicted a third row that this route does not have. Body
+  // validation here is the controller's `safeParse`, not a fastify route schema, so a
+  // schema-invalid body never produces a `FST_ERR_VALIDATION` naming the failing field -- the
+  // `preHandler` short-circuits first. What *did* leak was the malformed-JSON row, and it leaked
+  // as a `500` rather than the `400 FST_ERR_CTP_INVALID_JSON_BODY` the lifecycle produces
+  // unadorned, because `registerGlobalErrorHandler` maps the parser's failure and passes its
+  // message through. So an unauthenticated caller could distinguish two states and read the body
+  // parser's diagnostic off an endpoint it cannot call.
+  //
+  // At `onRequest` both rows collapse to `401`. **Moving the hook back to `preHandler` in
+  // `src/app.ts` reddens this case** -- that is what it is for.
+  it("BU71 - an unauthenticated caller cannot tell body shapes apart", async () => {
+    const malformed = await app.inject({
+      method: "POST",
+      url: BILLING_ROUTES.INTERNAL_BILLING_GENERATE,
+      headers: { "content-type": "application/json" },
+      payload: "{not json"
+    });
+    const valid = await app.inject({
+      method: "POST",
+      url: BILLING_ROUTES.INTERNAL_BILLING_GENERATE,
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify(validBody)
+    });
+    const schemaInvalid = await app.inject({
+      method: "POST",
+      url: BILLING_ROUTES.INTERNAL_BILLING_GENERATE,
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ unrelated: true })
+    });
+
+    for (const response of [malformed, valid, schemaInvalid]) {
+      expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
+      expect(response.json()).toEqual({ code: BILLING_RESPONSES.CODE_UNAUTHORIZED });
+    }
+
+    // The bodies must be byte-identical too, not merely the same status: a difference anywhere in
+    // the response is a signal, and the whole point is that the three are indistinguishable.
+    expect(malformed.body).toBe(valid.body);
+    expect(schemaInvalid.body).toBe(valid.body);
+  });
+
+  // The other half of BU71, and the reason BU71 is not satisfied by a service that simply
+  // answers 401 to everything: with a valid credential, malformed JSON must still be diagnosed.
+  // The guard moved earlier; it did not swallow the parser.
+  it("BU72 - an authenticated caller still gets the body parser's diagnosis", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: BILLING_ROUTES.INTERNAL_BILLING_GENERATE,
+      headers: { ...authorizedHeaders(), "content-type": "application/json" },
+      payload: "{not json"
+    });
+
+    expect(response.statusCode).not.toBe(BILLING_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
+    expect(generateInvoice).not.toHaveBeenCalled();
+  });
 });

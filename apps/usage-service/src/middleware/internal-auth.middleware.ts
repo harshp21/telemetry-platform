@@ -1,29 +1,8 @@
-import { createHash, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { secretsMatch } from "@telemetry/shared-utils";
 import { InternalAuthRequiredError } from "../errors";
 import { USAGE_SERVICE_HEADERS } from "../constants";
 import { isPublicRoute } from "./public-routes";
-
-/**
- * Constant-time equality for two secrets of unknown length.
- *
- * `===` on strings short-circuits at the first differing byte, so response latency leaks how
- * many leading bytes a guess got right -- enough to recover a secret byte by byte from a
- * network-reachable endpoint.
- *
- * `crypto.timingSafeEqual` fixes that but *throws* on unequal buffer lengths, and guarding it
- * with a length check reintroduces an early-exit oracle for the secret's length. Hashing both
- * sides to a fixed-width SHA-256 digest first removes the precondition without branching on the
- * secret: both digests are always 32 bytes, so the comparison never throws and takes the same
- * time regardless of the candidate's length or content. SHA-256's collision resistance makes
- * digest equality equivalent to string equality here.
- */
-const secretsMatch = (provided: string, expected: string): boolean => {
-  const digest = (value: string): Buffer =>
-    createHash("sha256").update(value, "utf8").digest();
-
-  return timingSafeEqual(digest(provided), digest(expected));
-};
 
 /**
  * Fastify `onRequest` hook enforcing service-to-service auth (S-4).
@@ -34,8 +13,18 @@ const secretsMatch = (provided: string, expected: string): boolean => {
  * Registered before the tenant-context hook so an unauthenticated caller never causes tenant
  * context to be derived, logged, or traced.
  *
- * @param expectedSecret - The configured `INTERNAL_API_SECRET`. Validated non-empty and at least
- *   `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH` long by the env schema at module load.
+ * The comparison is `secretsMatch` from `@telemetry/shared-utils` -- the one timing-safe
+ * comparison all three services' guards use since S-8. It lived in this file until then;
+ * billing's and worker's guards each wrote `!==`.
+ *
+ * @param expectedSecret - The configured `INTERNAL_API_SECRET`, as parsed by
+ *   `internalApiSecretSchema` at module load: trimmed, at least
+ *   `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH` characters, printable ASCII only. Stated that way
+ *   deliberately. This docblock used to say "validated non-empty and at least ... long", which was
+ *   true on its own words and misleading in effect: under the untrimmed `.min()` this service
+ *   declared before S-8, a string of 32 spaces satisfied it, and the property a reader takes from
+ *   "non-empty" is *not blank*. S-8's own text required whichever task added the trim to reword
+ *   this line, so it is reworded here rather than left for the next reader.
  */
 export const buildUsageInternalAuthHandler = (expectedSecret: string) => {
   return async (request: FastifyRequest, _reply: FastifyReply): Promise<void> => {

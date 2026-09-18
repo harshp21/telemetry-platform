@@ -58,7 +58,26 @@ export const buildBillingServiceApp = (
   app.register(async (internalRoutes) => {
     const internalAuth = buildInternalAuthMiddleware(internalApiSecret);
 
-    internalRoutes.addHook("preHandler", internalAuth);
+    // `onRequest`, not `preHandler` (S-8). `preHandler` runs *after* fastify's content-type
+    // parser, so an unauthenticated caller's body was parsed before it was rejected -- and the
+    // parser's failure was observable. Measured against this real route with no credential:
+    // malformed JSON answered `500 INTERNAL_ERROR` carrying "Body is not valid JSON but
+    // content-type is set to 'application/json'", and a body with no content-type answered `500
+    // INTERNAL_ERROR` "Unsupported Media Type", while a valid body, a well-formed but
+    // schema-invalid one, a `text/plain` body and no body at all all answered `401`. (No
+    // `FST_ERR_VALIDATION` row: this route validates in the controller, not through a fastify
+    // route schema.) Three distinguishable states for a caller holding no secret -- an earlier
+    // revision of this comment said two and omitted the no-content-type row, corrected at the
+    // Gate-5 rework (QA F-1) by re-performing the revert here and in worker-service in one run,
+    // where the same six shapes answered identically on both. At `onRequest` they collapse to one.
+    // `tests/internal-billing.route.test.ts` BU71 is the case that reddens if this moves back.
+    //
+    // This scope registers **no** tenant-context hook -- it holds this guard and
+    // `registerInternalBillingRoutes` only, which is T-045's contract that internal routes derive
+    // no tenant context -- so the promotion cannot disturb the hook ordering
+    // `.claude/rules/tenant-isolation.md` § *Forbidden* is about. The tenant-facing scope below
+    // was already `onRequest` on both hooks and is not re-ordered here; BU79 re-asserts it.
+    internalRoutes.addHook("onRequest", internalAuth);
 
     // Registered inside this `app.register` callback, so the guard above covers it. Moving
     // the call outside the callback is what would put an unauthenticated invoice generator on
@@ -86,9 +105,13 @@ export const buildBillingServiceApp = (
   // correctly. So the choice among the three correct pairings is stylistic; only crossing the
   // phases the wrong way is an error.
   //
-  // `buildInternalAuthMiddleware` is reused unedited. Its un-`return`ed `reply.status(401)
-  // .send(...)` short-circuits later `onRequest` hooks as well as later `preHandler` ones, so
-  // promoting the phase needs no change to that file -- which keeps S-8 whole and out of scope.
+  // `buildInternalAuthMiddleware` is the same factory the internal scope registers, and since
+  // S-8 both registrations are `onRequest`. The observation that made this comment read as it
+  // did still holds and was re-measured: an un-`return`ed `reply.status().send()` inside an
+  // `onRequest` hook short-circuits later hooks identically to the returned and thrown forms. So
+  // the `return` S-8 added to that file is a statement of intent, not a behaviour change -- and
+  // the phase promotion in the internal scope above was not about the short-circuit at all, but
+  // about the body being parsed before the guard ran.
   //
   // There is no public-route allowlist because there is nothing to exempt: `/health` and the
   // internal scope are structurally outside this callback. BU83 is the case that notices if

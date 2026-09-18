@@ -36,137 +36,6 @@ production code reads it. The enforced cap is a hard-coded `BATCH_SIZE_MAX: 100`
 
 ---
 
-## S-8 · the three internal-auth guards still diverge, and their four secret schemas disagree — **MEDIUM, open**
-
-Found while fixing S-4, and deliberately not folded into it: changing two other services'
-startup contracts inside a usage-service security fix breaks the one-task-per-commit rule.
-
-`apps/billing-service/src/middleware/internal-auth.middleware.ts:9` and
-`apps/worker-service/src/middleware/internal-auth.middleware.ts:9` are the same file, and both
-differ from `apps/usage-service/src/middleware/internal-auth.middleware.ts` in three ways
-(items 1 and 3 apply to both; item 2 no longer applies to either — T-037 declared the field for
-worker-service and T-044 for billing-service, so what is left of item 2 is **usage-service's and
-gateway's**, and it is a different defect from the one originally recorded):
-
-**Counts, because the two differ and the title used to conflate them.** There are **three**
-guards — `ls apps/*/src/middleware/internal-auth.middleware.ts` returns billing, usage and worker
-— and **four** schemas declaring the secret, `grep -rln "INTERNAL_API_SECRET" apps/*/src/config/env.ts`
-adding gateway. Gateway has a schema and no guard because it is the *caller*
-(`docs/reviewer-checklist.md:28` says so), which is why item 2 reaches four services and items 1
-and 3 reach three. An earlier revision of this title said "the four internal-auth guards";
-corrected at T-044's Gate-4 review (M-1).
-
-1. **`!==`, not a timing-safe comparison.** String comparison short-circuits at the first
-   differing byte, so response latency leaks how many leading bytes a guess got right. See the
-   `secretsMatch` helper in usage-service for the SHA-256 + `timingSafeEqual` form.
-2. **~~The secret bypasses the env schema~~ — closed for billing and worker; what remains is
-   usage-service's **and gateway's** untrimmed `.min()`.**
-   T-037 declared `INTERNAL_API_SECRET` in worker-service's `EnvSchema` with
-   `.trim().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)`; T-044 did the same for
-   billing-service. Both parse at module load and both read the parsed value in `app.ts`
-   (`apps/worker-service/src/app.ts:27`, `apps/billing-service/src/app.ts:26`). Before T-044,
-   billing built its app with `process.env.INTERNAL_API_SECRET ?? ""`: reproduced at Gate 3 on
-   `961d222` through `app.inject`, `INTERNAL_API_SECRET=short` (5 characters) booted and returned
-   `200` on `POST /v1/internal/billing/generate`. On the fixed tree the same 5-character value,
-   and 33 spaces, both fail at module load with
-   `Invalid environment configuration for INTERNAL_API_SECRET: String must contain at least 32 character(s)`.
-
-   **Still open:** `apps/usage-service/src/config/env.ts:15` and `apps/gateway/src/config/env.ts:14`
-   are `.min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)` with no `.trim()`. Measured against
-   usage-service's real schema field (`EnvSchema.shape.INTERNAL_API_SECRET.safeParse`, zod
-   3.25.76): 32 spaces → `success: true`, parsed length 32; 32 tabs → likewise; a 31-character
-   core padded to 35 → `success: true`, parsed length 35; a bare 31-character value → rejected.
-   So the *length* minimum is enforced and the *whitespace* hole is not. usage-service also has
-   no blank-secret guard in `app.ts` — it passes `env.INTERNAL_API_SECRET` straight to
-   `registerUsageInternalAuthMiddleware` (`apps/usage-service/src/app.ts:27`) — where billing and
-   worker both throw `InternalApiSecretMissingError` on a blank value. Note the docblock at
-   `apps/usage-service/src/middleware/internal-auth.middleware.ts:37-38` says the secret is
-   "Validated non-empty and at least `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH` long by the env
-   schema". Stated precisely: a 32-space string **is** literally non-empty, so the comment is not
-   false on its own words — it is misleading, because the property a reader takes from it is
-   *not blank*, and that is what an untrimmed `.min()` does not give. It should be reworded by
-   whichever task adds the `.trim()`. T-044 left usage-service alone deliberately
-   (decision D1-A in `docs/plans/t-044-billing-service-env-schema.md`): reaching into the live
-   ingestion service's startup contract from a billing env task is the move this gap twice
-   declined.
-3. **`preHandler`, not `onRequest`, and `reply.send(...)` is not returned.** (worker's
-   registration is now at `apps/worker-service/src/app.ts:59`.) An unauthenticated
-   caller still gets its body parsed and validated before rejection, and the un-`return`ed
-   `reply.status(401).send(...)` inside an async hook relies on Fastify's `reply.sent` check
-   rather than stating the short-circuit. **The cost of this grew at T-045**: measured, a wrong
-   secret gives `401` with the route handler never running (`handlerRan = 0`), but
-   `bodyParsed = 1` — so an unauthenticated caller's body is now parsed and validated against a
-   real schema rather than an empty stub.
-4. **billing picks the first value of a duplicated header where usage-service rejects it.**
-   `apps/billing-service/src/middleware/internal-auth.middleware.ts:7` does
-   `Array.isArray(provided) ? provided[0] : provided`; usage-service (`:50`) treats any
-   non-string as smuggling and rejects. **Measured at T-045's Gate 1 before being called a
-   hole, and it is not one:** over a real `net`/`http` socket *and* via `app.inject`, a
-   duplicated `x-internal-secret` arrives **joined** as `"good-secret, evil"` — type `string`,
-   never an array — so the `provided[0]` arm is unreachable through HTTP at fastify 5.10.0, and
-   the joined value fails the comparison into a `401`. Scope of that: this header, this version,
-   two transports; `set-cookie` is the documented array-valued exception and was **not** probed.
-   Listed because it is a real divergence between two guards that should be identical, not
-   because it is exploitable. T-045's plan §10 said it should be listed here and it was not —
-   caught at that task's Gate-6 review (R2-LOW-3).
-
-**Fix direction:** add `.trim()` before `.min(...)` in usage-service's and gateway's
-`EnvSchema`, so all **four secret schemas** declare the field identically. Note that is
-*schemas*, not services: gateway has a schema and no guard, so items 1 and 3 reach only the
-three services that have `internal-auth.middleware.ts`. An earlier revision said "so all four
-services end up identical", which the counts above refute. Order is load-bearing, not decoration, and
-the two wrong forms fail differently — measured against billing's real schema at Gate 3 of
-T-044 by mutating the declaration and re-running
-`apps/billing-service/tests/env.schema.unit.test.ts`:
-
-
-| Declaration | 32 spaces | 31-char core padded to 35 | Named tests red |
-|---|---|---|---|
-| `.trim().min(32)` (shipped) | rejected | rejected | none |
-| `.min(32)` (usage, gateway today) | accepted, parses to 32 spaces | accepted, parses to 35 | `rejects an all-whitespace …`, `rejects an INTERNAL_API_SECRET that reaches the minimum only by its padding`, `strips surrounding whitespace …` |
-| `.min(32).trim()` | accepted, parses to `""` | accepted, parses to 31 | the first two of those three |
-
-Note the third row: `.min(32).trim()` reads like a fix, passes the "strips surrounding
-whitespace" case, and still admits a 31-character secret. A suite that only asserts the trimmed
-*output* does not distinguish it.
-
-**Addendum — `.trim()` is narrower than it reads, and this applies to worker-service too
-(T-044 Gate 5).** `String.prototype.trim` strips the **ECMAScript `WhiteSpace` + `LineTerminator`
-set**: every `Zs`, plus TAB/VT/FF/CR/LF, plus U+2028/U+2029, **plus U+FEFF specifically**. It is
-*not* "all `Zs`, no `Cf`" — U+FEFF is `Cf` and **is** stripped, while U+00AD (also `Cf`) is not.
-Measured across 17 characters against billing's real schema (`z.string().trim().min(32)`, 32
-repetitions of each):
-
-| Stripped, so rejected | Not stripped, so **accepted as a 32-character secret** |
-|---|---|
-| U+0020, U+00A0, U+2000, U+3000 (`Zs`) · U+0009, U+000A, U+000B, U+000C, U+000D · U+2028, U+2029 · **U+FEFF (`Cf`)** | **U+200B, U+2060, U+180E, U+200C, U+00AD** — all `Cf` |
-
-So the guard the `.trim()` adds is "not made of whitespace **as ECMAScript defines it**", not "not
-made of invisible characters". An earlier revision of this addendum said `trim()` strips `Zs` and
-not `Cf`; that was generalised from a single `Cf` probe (U+200B) without trying the one that
-refutes it, and was corrected at T-044's Gate-6 review (H-1) after re-measuring the whole set.
-
-Severity is LOW and it **fails closed**: such a secret is accepted by the schema, but the caller
-must then send byte-identical invisible characters in `X-Internal-Secret` for the comparison to
-succeed, so the failure mode is a service that refuses every request rather than one that accepts
-a weak credential. It is recorded here rather than fixed because the fix belongs with the rest of
-this entry: worker-service has the identical `.trim().min(...)` form and the identical gap, so
-tightening one service's declaration and not the other would add a fourth strictness to an entry
-whose whole subject is that four already disagree. Whoever closes items 1-3 should decide the
-normalisation once, for all of them.
-
-Then promote the guard to `onRequest` in both, share one timing-safe comparison helper rather
-than keeping three copies of the middleware, and adopt each service's
-`HTTP_STATUS_UNAUTHORIZED` constant instead of the literal `401` at
-`internal-auth.middleware.ts:10` — worker-service and billing-service both now define
-`HTTP_STATUS_OK` / `HTTP_STATUS_UNAUTHORIZED` (`apps/worker-service/src/constants.ts:39-40`,
-`apps/billing-service/src/constants.ts:28` and `:31` (T-045 inserted six status constants
-between them, so they are no longer contiguous and the old `:25-26` range was wrong twice over),
-both added so their env suites could assert
-statuses without literals) and both middlewares still write the literal.
-
----
-
 ## S-9 · analytics-service has no service-to-service auth and no `INTERNAL_API_SECRET` — **LOW, open**
 
 `apps/analytics-service/src/app.ts` registers `/health` and nothing else, and
@@ -450,6 +319,19 @@ declarations, one import and four call sites, the import and all four call sites
 No production caller anywhere. (Aside, not part of this gap: the two `dist` declarations
 disagree with each other and with the source — `dist/src/index.d.ts:3` declares a fourth
 `source: string` parameter that `src/index.ts` does not have.)
+
+**`packages/shared-validation` has acquired the same shape, and a sweep should cover both.** S-8
+moved that package's `rootDir` to `../..`, so `tsc` now emits to
+`packages/shared-validation/dist/packages/shared-validation/src/`, and the pre-change emit at
+`packages/shared-validation/dist/src/index.js` is simply left behind. Measured:
+`grep -c internalApiSecretSchema` returns **0** against the old path and **1** against the new
+one, so the stale copy predates the schema it is missing. It is unreachable — all six
+`packages/shared-*/package.json` declare `"main": "src/index.ts"` (`grep -H '"main"'`), and
+`git check-ignore -v packages/shared-validation/dist/src/index.js` reports `.gitignore:4:dist`,
+so a clean checkout has neither copy. Recorded here rather than as a new id because it is a second
+instance of the class this aside already names. S-8's plan said a sweep should cover both packages
+and, until this sentence, said it **only** in `docs/plans/`, which `CLAUDE.md` forbids reading as
+a record; folded in at S-8's Gate-6 rework (review LOW-2).
 `apps/usage-service/src/services/ingestion.service.ts:114-116` derives a plaintext
 `<eventType>:<sourceId ?? "unknown">:<occurredAt>` instead. Note the derived key omits the tenant
 **deliberately** — `DeduplicationService` owns that segment since S-1 — so a fix must not
@@ -777,7 +659,8 @@ routed through that one helper. Nothing in the type system stops a future bare
 `redis.flushdb()` in the same file, so this is a chokepoint, not an impossibility.
 
 Found while verifying T-038's own Redis hygiene. Not fixed there: it edits an unrelated
-service's test harness, which is the same reason S-8 was not folded into S-4.
+service's test harness, which is the same reason S-8 was not folded into S-4. (S-8 is closed
+and its id retired; the record is `docs/plans/s-008-timing-safe-internal-auth.md`.)
 
 **Fix direction:** give auth-service a reserved logical database as usage-service and
 worker-service have — `redis://localhost:6379/13`, say — and route every `FLUSHDB` through a
@@ -833,7 +716,8 @@ Second, smaller consequence: `WORKER_STREAM_CONSTANTS`' docblock
 reaches". That is true for an *absent* variable and false for an empty one. T-038 corrected the
 copy of this claim it had introduced in `src/events/stream.consumer.ts`; the T-037 docblock
 still carries it, and was left alone deliberately — editing a T-037 comment inside a T-038
-commit is the same one-task-per-commit objection that kept S-8 out of S-4.
+commit is the same one-task-per-commit objection that kept S-8 out of S-4. (S-8 is closed and
+its id retired; the record is `docs/plans/s-008-timing-safe-internal-auth.md`.)
 
 Found at T-038's Gate-4 review. Not fixed there: adding `.min(1)` changes another service's
 startup contract inside a worker-service task, and would need its own schema tests.
@@ -1783,7 +1667,8 @@ carry the same value today — checked, byte-identical.
 
 **Why they were left.** Rewiring gateway and usage-service inside a billing-service feature task
 puts two other services' constants in that task's diff, which is the same one-task-per-commit
-objection that kept S-8 out of S-4 and out of T-037. The promotion itself was the part that could
+objection that kept S-8 out of S-4 and out of T-037 — S-8 is closed and its id retired, and the
+record is `docs/plans/s-008-timing-safe-internal-auth.md`. The promotion itself was the part that could
 not wait, because the rule's threshold is about the *third* copy and T-046 was it.
 
 **Why it is LOW rather than ignorable.** This is a header name the gateway **writes** and
@@ -1953,9 +1838,11 @@ operator-supplied value through schemas of different strictness"*. Weaker here t
 `page` is a per-request client value each service handles independently, not one operator value
 two services must agree on, so the consequence is an inconsistent API rather than a
 producer/consumer disagreement. Fixing both puts usage-service's constants and validator inside a
-billing feature commit, which is the objection **S-8** records for not having been folded into
+billing feature commit, which is the objection **S-8** recorded for not having been folded into
 S-4 — *"changing two other services' startup contracts inside a usage-service security fix breaks
-the one-task-per-commit rule."* Both entries were re-read on this tree before being cited.
+the one-task-per-commit rule."* Both entries were re-read on this tree before being cited. S-8 has
+since been closed and its id retired, so that quotation is no longer checkable against this file;
+it is quoted verbatim in `docs/plans/s-008-timing-safe-internal-auth.md`, which is the record.
 
 ### Fix direction
 
@@ -2563,9 +2450,11 @@ contains; it is only incomplete.
 
 The fix is **billing-service's** step-2 early return, or a product decision about supplementary
 invoices. Changing another service's behaviour inside a worker-service feature task is the
-objection S-8 states in its own words — "changing two other services' startup contracts inside a
+objection S-8 stated in its own words — "changing two other services' startup contracts inside a
 usage-service security fix breaks the one-task-per-commit rule" — and which this file cites as
-precedent at S-22 ("the same reason S-8 was not folded into S-4"), S-23, S-39 and S-40. T-042's
+precedent at S-22 ("the same reason S-8 was not folded into S-4"), S-23, S-39 and S-40. S-8 has
+since been closed and its id retired, so that quotation is no longer checkable against this file;
+it is quoted verbatim in `docs/plans/s-008-timing-safe-internal-auth.md`, which is the record. T-042's
 own §3 non-goals already list S-38 (billing's `P2002` re-read) on the same grounds, and note that
 T-042 *increases* how often that path is reached without closing it. This is the same shape.
 
@@ -3449,3 +3338,177 @@ optimistic `updateMany` whose `where` carries `status: DRAFT` and whose `count` 
 refusal. The second needs no raw SQL and no lock ordering, and is worth costing first. Decide it
 with whichever task builds finalization, not before: a lock added now guards an interleaving
 nothing can currently produce.
+
+---
+
+## S-53 · `docs/epics/epic-9-analytics-service.md`'s rollup snippet applies `AT TIME ZONE 'UTC'` to the column, which is the mistake `CLAUDE.md` names — **LOW, open**
+
+Filed by S-8, which found it while checking that its own change touched no timestamp path. Same
+class as S-17, S-29, S-32, S-35, S-42, S-47 and S-50 — an epic snippet that diverges from what the
+code must do — and recorded here rather than by editing the epic, matching that precedent.
+
+`docs/epics/epic-9-analytics-service.md:59` specifies:
+
+```sql
+DATE_TRUNC('day', period_start AT TIME ZONE 'UTC') AS bucket_start
+```
+
+`CLAUDE.md` § *Raw SQL and timestamps* is explicit that `AT TIME ZONE 'UTC'` on a bound
+**parameter** is correct, and on the **column** produces a `timestamptz` and shifts every bucket
+boundary by the server offset. This snippet writes the column form.
+
+**Verified live on this host's PostgreSQL 16**, through `DIRECT_DATABASE_URL`, session zone set
+with `options=-c timezone=…`. No table was touched; the probe evaluates literals. One naive
+`timestamp(3)` value, `2026-01-01 03:00:00`, truncated to the day:
+
+| Session `TimeZone` | `DATE_TRUNC('day', col AT TIME ZONE 'UTC')` | `DATE_TRUNC('day', col)` |
+|---|---|---|
+| `UTC` | `2026-01-01 00:00:00+00` | `2026-01-01 00:00:00` |
+| `Asia/Kolkata` | `2026-01-01 00:00:00+05:30` | `2026-01-01 00:00:00` |
+| `America/New_York` | **`2025-12-31 00:00:00-05`** | `2026-01-01 00:00:00` |
+
+So under `America/New_York` the snippet's expression buckets that row into the **previous day**,
+while the bare column is stable across all three zones tried. Scope of the measurement: three
+session zones, one value, this host's PostgreSQL 16. Not measured: other zones, DST boundaries, or
+any granularity other than `day`.
+
+**Why this is worth an id rather than a note.** T-051 is the task that builds analytics' rollups,
+and this snippet is what it will be built from. A bucket-boundary error of this shape is silent —
+every query succeeds, every total is plausible, and the only symptom is that a customer's usage
+appears on the wrong day. It is also **not** caught by CI: `postgres:16-alpine` defaults `TimeZone`
+to `UTC`, where the two expressions above are identical. That is the same reason S-18's regression
+suite has to pin its own non-UTC session.
+
+**Two further defects in the same snippet**, found while verifying it and recorded so T-051 does
+not copy them either.
+
+**Every identifier in it is snake_case, and nothing in this database is.** The snippet writes
+`metric_key`, `period_start`, `period_end`, `tenant_id` and `FROM usage_lines`. `grep -n "@@map\|@map"
+prisma/schema.prisma` returns **nothing**, so Prisma emits the model names and field names
+verbatim as quoted identifiers; `information_schema.tables` for `table_schema='public'` lists
+`UsageLine`, not `usage_lines`, and the real columns are `metricKey`, `periodStart`, `periodEnd`,
+`tenantId` and `billed` (`prisma/schema.prisma`, `model UsageLine`). Unquoted `usage_lines` and
+`period_start` would be folded to lower case by PostgreSQL and match nothing, so the snippet
+raises rather than returning wrong rows — the loud failure, which is why this half is a
+copy-and-fix nuisance rather than a hazard. `bucketStart` is `MetricRollup`'s column, and that
+model has no `@@map` either.
+
+**The `$2`/`$3` predicate is S-18 on the other side of the same query.** `periodStart` and
+`periodEnd` are naive `timestamp(3)` columns like every other application timestamp on this
+platform, so `AND period_start >= $2` with a bound JS `Date` resolves through the session zone.
+`CLAUDE.md` § *Raw SQL and timestamps* covers this and analytics-service's
+`base.repository.ts` does **not** carry the `set_config('TimeZone','UTC',true)` pin that
+usage-service's does (S-19). So a T-051 built from this snippet inherits the hazard twice: once in
+the projection, which this entry is about, and once in the predicate.
+
+**Fix direction:** decide contract-first — correct the epic snippet to `DATE_TRUNC('day',
+"periodStart")` with the real column names, or, if a different projection is intended, say what it
+is and why. Whichever T-051 does, the guard it needs is a test that pins its own non-UTC session,
+because a UTC-only fixture asserts nothing here. Do not "fix" this by moving `AT TIME ZONE` to the
+bound parameter and leaving the column expression — the bound side is already correct and is not
+what this entry is about.
+
+
+---
+
+## S-54 · `internalApiSecretSchema` has no maximum length, so an over-long secret starts every service and then fails in traffic — **LOW, open**
+
+Filed by S-8's Gate-5 QA (F-4) and re-measured at that task's Gate-3 rework rather than inherited.
+**This is the only `INTERNAL_API_SECRET` failure class QA found that shows up in request traffic
+rather than at startup**, which matters because moving every other class to startup is the property
+S-8 exists to establish. Stated as what was searched, not as a proof of exhaustiveness: the
+evidence is S-8's Gate-5 sweep of 400 random printable-ASCII candidates of length 32-200, every one
+accepted by the fragment, every one round-tripping byte-identically through the real proxy with
+`round-trip mismatches: 0` and `non-200 statuses: 0`. That sweep's own length band tops out at 200,
+so it could not have found this one; what else it could not have found has not been established,
+and nobody has run a mutation that would produce a second in-traffic class. It is not a regression — the pre-S-8 `.min(32)` had no ceiling either — and no value
+configured in this repository is anywhere near it.
+
+**Where the missing bound is.** `internalApiSecretSchema` in `packages/shared-validation/src/index.ts`
+is `.trim().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH).regex(SECRET_PATTERN, …)` — no `.max()`.
+All four services derive their `INTERNAL_API_SECRET` field from that one object
+(`grep -n 'INTERNAL_API_SECRET:' apps/gateway/src/config/env.ts apps/usage-service/src/config/env.ts apps/worker-service/src/config/env.ts apps/billing-service/src/config/env.ts`
+→ four hits, all `internalApiSecretSchema`), so a ceiling added there is inherited by all four and
+nowhere else needs editing.
+
+**Measured, this host, Node 22.22.2, fastify 5.10.0, against the real billing guard behind a real
+`node:http` client.** Secrets are `"a".repeat(n)`, i.e. printable ASCII, so every one of them is
+accepted by the shipped fragment:
+
+```
+node http.maxHeaderSize = 16384
+len=    32  fragment=ACCEPT  status=200  upstreamSaw=len 32    roundTrips=true
+len=  8192  fragment=ACCEPT  status=200  upstreamSaw=len 8192  roundTrips=true
+len= 16384  fragment=ACCEPT  status=431  upstreamSaw=NOTHING   roundTrips=false
+len= 65536  fragment=ACCEPT  status=431  upstreamSaw=NOTHING   roundTrips=false
+```
+
+And the services do start on such a value — driven against the four **real** env modules with
+`INTERNAL_API_SECRET` set to `"a".repeat(16384)` (gateway through `loadEnv()`, which is where it
+parses):
+
+```
+gateway  BOOT  parsedLen=16384
+usage    BOOT  parsedLen=16384
+worker   BOOT  parsedLen=16384
+billing  BOOT  parsedLen=16384
+```
+
+So: healthy-looking services, and `431 Request Header Fields Too Large` on every request that
+carries the header.
+
+**Two refinements on the QA figure, both from a grid scan rather than a single length.** Each cell
+is the client-visible outcome for a secret of that length, with an additional `x-filler` header of
+the stated size:
+
+```
+filler=    0   32:200  4096:200  8192:200  12288:200  15360:200  16000:200  16384:431  32768:ECONNRESET
+filler= 1024   32:200  4096:200  8192:200  12288:200  15360:431  16000:ECONNRESET  16384:431  32768:ECONNRESET
+filler= 4096   32:200  4096:200  8192:200  12288:431  15360:ECONNRESET  16000:431  16384:ECONNRESET  32768:431
+```
+
+1. **The budget is the whole header block, not this one field.** A 12 288-byte secret returns `200`
+   with no other header and `431` alongside a 4 KiB sibling. So no per-field ceiling can be derived
+   from `maxHeaderSize` alone; it has to leave headroom for everything else on the request, which on
+   a proxied path includes `x-tenant-id`, `x-user-id`, `x-user-role`, tracing headers and whatever
+   the client sent.
+2. **The failure is not always `431`.** Above the threshold the client sometimes sees the connection
+   reset (`ECONNRESET`) with no HTTP response at all. Both mean the upstream never sees the request;
+   they are not the same thing to observe. A bisection over this boundary was run first and was
+   **not** monotone — `16276 → 200`, and `16277 → 200` after the search had already concluded — so
+   do not quote a single exact threshold from this host. The grid is what is claimed.
+
+**What a defensible ceiling would be, and why it is a decision rather than an obvious number.**
+Node's default `http.maxHeaderSize` is 16 384 bytes on this host (`node -p "require('node:http').maxHeaderSize"`),
+and it is the *total* block budget, so a per-field `.max()` wants to be well under it — something in
+the 512–1 024 range covers every credential anyone would actually issue (`openssl rand -base64 48 |
+tr -d '\n'`, the release note's generator, produces 64 characters) with room to spare. It is still a
+judgement call: the number is not derivable from a measurement, the real ceiling depends on every
+hop in front of the service, and picking it wrong turns a working deployment's secret into a
+refusal-to-start — which is the *same* operator hazard S-8's own newly-breaking classes carry.
+
+**What it would cost.** The `.max()` is one line in the shared fragment. The test cost is an
+accept-at-the-ceiling and a reject-above-it case in **five** suites, because each one asserts the
+boundary independently:
+
+```
+apps/gateway/tests/env.schema.unit.test.ts
+apps/usage-service/tests/env.schema.unit.test.ts
+apps/worker-service/tests/env.schema.unit.test.ts
+apps/billing-service/tests/env.schema.unit.test.ts
+packages/shared-validation/tests/unit.test.ts
+```
+
+Plus a new message constant beside `SECRET_PATTERN_MESSAGE` in
+`packages/shared-types/src/index.ts`, since the env parser reports only `issues[0]` and a bare zod
+maximum-length message would not name the rule.
+
+**Why it was not fixed in S-8.** S-8's scope was convergence — one declaration of what a valid
+secret is, replacing two rules across four schemas — and adding a *new* constraint no service had
+before is new production behaviour with its own newly-breaking class, inside a change whose whole
+argument is that a stricter secret rule needs its operator story written first. The Gate-3 rework
+that filed this entry was explicitly text-only. Recorded rather than done, on the S-16 precedent: a
+missing guard that a test written from the spec would fail is a separate task, not a side effect.
+
+**Do not close this by raising `maxHeaderSize`.** That moves the threshold and keeps the shape: a
+secret with no declared upper bound, failing somewhere in traffic rather than at startup.

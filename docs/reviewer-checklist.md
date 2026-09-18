@@ -25,10 +25,10 @@ Current compliance (keep this table honest; the open items are in `.claude/rules
 
 | Service | `X-Internal-Secret` guard | Fails fast on missing secret | Timing-safe |
 |---|---|---|---|
-| gateway | n/a — it is the caller; injects the header on every proxied request | yes (env schema) | n/a |
-| usage-service | yes, `onRequest`, `/health` exempt | yes (env schema) | yes |
-| billing-service | yes, but `preHandler` on the internal route group only | yes (env schema, T-044) | no (S-8) |
-| worker-service | as billing-service (S-8) | yes (env schema, T-037) | no (S-8) |
+| gateway | n/a — it is the caller; injects the header on every proxied request | yes (env schema, shared fragment) | n/a |
+| usage-service | yes, `onRequest`, `/health` exempt | yes (env schema, shared fragment) | yes (shared `secretsMatch`) |
+| billing-service | yes, `onRequest` on both the internal and the tenant-facing scope; `/health` outside both | yes (env schema, shared fragment) | yes (shared `secretsMatch`) |
+| worker-service | yes, `onRequest` on the internal scope; `/health` outside it | yes (env schema, shared fragment) | yes (shared `secretsMatch`) |
 | analytics-service | no — `/health` only today (S-9) | no (S-9) | n/a |
 | auth-service | n/a — deliberately public (`/v1/auth/register\|login\|refresh`) | n/a | n/a |
 

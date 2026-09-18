@@ -9,6 +9,7 @@ import {
   generateIdempotencyKey,
   registerGlobalErrorHandler,
   retryWithBackoff,
+  secretsMatch,
   sleep
 } from "../src";
 
@@ -234,5 +235,78 @@ describe("shared-utils", () => {
     expect(response.json()).toEqual({
       code: ERROR_RESPONSES.CODE_INTERNAL_ERROR
     });
+  });
+});
+
+/**
+ * `secretsMatch` -- the one timing-safe comparison the three internal-auth guards share (S-8).
+ *
+ * **What these cases prove, and what they do not.** They prove *behavioural equivalence*: the
+ * digest comparison accepts and rejects exactly what the `!==` it replaced accepted and rejected,
+ * across equal, first-byte-different, last-byte-different, prefix, superstring, empty and
+ * unequal-length inputs. They prove nothing about timing. A timing assertion over SHA-256 plus
+ * `crypto.timingSafeEqual` is not reliably measurable in a vitest process on a shared runner --
+ * the measurement noise exceeds the effect -- so a threshold that passed here would be a flake on
+ * CI. The constant-time property rests on `crypto.timingSafeEqual`'s documented contract and on
+ * the fixed-width-digest argument in this function's docblock, **not** on a green run of this
+ * describe block. Do not read it as evidence of one.
+ *
+ * The unequal-length cases are the ones with teeth beyond equivalence: `timingSafeEqual` throws
+ * on buffers of different lengths, so a future edit that dropped the hashing step and compared
+ * raw bytes would turn them from `false` into a thrown `RangeError`.
+ */
+describe("secretsMatch", () => {
+  const SECRET = "s-008-shared-internal-secret-at-least-32-chars";
+
+  it("matches two identical secrets", () => {
+    expect(secretsMatch(SECRET, SECRET)).toBe(true);
+    // A separately-constructed equal string, so the case cannot pass on reference identity.
+    expect(secretsMatch(`${SECRET}`.slice(0), SECRET)).toBe(true);
+  });
+
+  it("rejects a secret differing only in its first character", () => {
+    const differingFirst = `Z${SECRET.slice(1)}`;
+
+    expect(differingFirst).toHaveLength(SECRET.length);
+    expect(secretsMatch(differingFirst, SECRET)).toBe(false);
+  });
+
+  it("rejects a secret differing only in its last character", () => {
+    const differingLast = `${SECRET.slice(0, -1)}Z`;
+
+    expect(differingLast).toHaveLength(SECRET.length);
+    expect(secretsMatch(differingLast, SECRET)).toBe(false);
+  });
+
+  it("rejects a proper prefix of the expected secret without throwing", () => {
+    expect(secretsMatch(SECRET.slice(0, -1), SECRET)).toBe(false);
+    expect(secretsMatch("", SECRET)).toBe(false);
+  });
+
+  it("rejects a superstring of the expected secret without throwing", () => {
+    expect(secretsMatch(`${SECRET}Z`, SECRET)).toBe(false);
+  });
+
+  it("matches two empty strings", () => {
+    // Not a supported configuration -- every env schema rejects a blank secret -- but the
+    // function must still be total, and this is where a naive length guard would branch.
+    expect(secretsMatch("", "")).toBe(true);
+  });
+
+  it("compares secrets of different lengths without throwing", () => {
+    // `timingSafeEqual` raises on unequal buffer lengths. Hashing both sides first is what makes
+    // this a `false` rather than a `RangeError`, and it is also what keeps the length off the
+    // early-exit path. A run of one character against a run of a hundred is the widest gap.
+    expect(() => secretsMatch("a", "b".repeat(100))).not.toThrow();
+    expect(secretsMatch("a", "b".repeat(100))).toBe(false);
+  });
+
+  it("compares non-ASCII secrets without throwing", () => {
+    // Not reachable through the env schema since S-8 (`internalApiSecretSchema` is
+    // printable-ASCII only), but the header side is caller-controlled and is not filtered, so a
+    // multi-byte candidate reaches this function. UTF-8 encoding widens the buffer before the
+    // digest; the digest is 32 bytes either way.
+    expect(secretsMatch("\u00e9\u00e9\u00e9", SECRET)).toBe(false);
+    expect(secretsMatch("\u00e9\u00e9\u00e9", "\u00e9\u00e9\u00e9")).toBe(true);
   });
 });

@@ -56,7 +56,22 @@ export const buildWorkerServiceApp = (
   app.register(async (internalRoutes) => {
     const internalAuth = buildInternalAuthMiddleware(internalApiSecret);
 
-    internalRoutes.addHook("preHandler", internalAuth);
+    // `onRequest`, not `preHandler` (S-8). `preHandler` runs *after* fastify's content-type
+    // parser, so an unauthenticated caller's body was parsed before it was rejected -- and the
+    // parser's failure was observable. Measured against this real route with no credential:
+    // malformed JSON answered `500 INTERNAL_ERROR` carrying "Body is not valid JSON but
+    // content-type is set to 'application/json'", and a body with no content-type answered `500
+    // INTERNAL_ERROR` "Unsupported Media Type", while a valid body, a well-formed but
+    // schema-invalid one, a `text/plain` body and no body at all all answered `401`. Three
+    // distinguishable states for a caller holding no secret -- re-performed at the Gate-5 rework
+    // alongside billing-service, whose count was two and is corrected (QA F-1); the same six
+    // shapes answered identically on both. At `onRequest` they collapse to one.
+    // `tests/internal-auth.middleware.unit.test.ts` W12 is the case that reddens if this moves
+    // back.
+    //
+    // This service registers no tenant-context hook anywhere, so the promotion cannot disturb
+    // the hook ordering `.claude/rules/tenant-isolation.md` § *Forbidden* is about.
+    internalRoutes.addHook("onRequest", internalAuth);
 
     internalRoutes.post(WORKER_ROUTES.INTERNAL_WORKER_REPLAY, async () => {
       return {

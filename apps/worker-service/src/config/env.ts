@@ -1,5 +1,5 @@
 import { parseEnv } from "@telemetry/shared-config";
-import { INTERNAL_AUTH_CONSTANTS } from "@telemetry/shared-types";
+import { internalApiSecretSchema } from "@telemetry/shared-validation";
 import { z } from "zod";
 import { WORKER_STREAM_CONSTANTS } from "../constants";
 import { WORKER_SERVICE_STARTUP } from "../startup.constants";
@@ -33,23 +33,28 @@ export const EnvSchema = z.object({
   // is the divergence S-23 and S-39 are about. Pinned in `tests/env.schema.unit.test.ts`.
   BILLING_SERVICE_URL: z.string().url(),
   LOG_LEVEL: z.string().default("info"),
-  // Service-to-service auth (S-8 item 2). Required with no default: `parseEnv` throws at module
-  // load, so a worker-service that cannot authenticate its callers never reaches `app.listen`,
-  // and the shared 32-character minimum is enforced before the DI container is built.
-  // `.trim()` runs before `.min(...)`, so length is measured on the trimmed value: a secret of
-  // SECRET_MIN_LENGTH spaces is rejected here rather than parsing and emptying later. It also
-  // transforms the parsed value, which is the string `buildInternalAuthMiddleware` compares
-  // against the inbound header. Probed against a real Fastify server on a socket: header
-  // values sent with leading spaces, trailing spaces, both, and surrounding tabs all arrived
-  // stripped -- over a raw socket and over `fetch` alike. SP and HTAB are the only OWS the
-  // HTTP parser removes; VT and FF are rejected as 400. Whitespace that `String.trim()` removes
-  // but HTTP does not -- U+00A0 in particular -- survives the wire intact, so the trim does
-  // narrow what the middleware accepts rather than being a no-op. Fail-closed either way.
-  // (`app.inject` does *not*
-  // strip; it bypasses the HTTP parser. That is why the test asserts the schema's output
-  // rather than inferring the transform from an injected request.)
-  // Both halves are pinned in `tests/env.schema.unit.test.ts`.
-  INTERNAL_API_SECRET: z.string().trim().min(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH),
+  // Service-to-service auth. **Derived from one shared fragment, never re-declared** (S-8):
+  // `internalApiSecretSchema` in `@telemetry/shared-validation` is the single definition of what
+  // a valid `INTERNAL_API_SECRET` is -- trimmed, at least
+  // `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH` long, printable ASCII only. Four services used to
+  // write this rule out separately and two of them had drifted, which is not a tidiness problem:
+  // both HTTP clients in this stack strip leading and trailing SP/HTAB from a header value in
+  // transit, so one stray space in a platform-wide secret made the two trimming services answer
+  // `200` and the two untrimmed ones answer `401` for the same configuration. Re-derived over a
+  // real socket against the real guard factories at S-8:
+  //     gateway sends padded -> usage   (untrimmed expected): 401
+  //     gateway sends padded -> billing (trimmed   expected): 200
+  //
+  // What the fragment adds over the `.trim().min(...)` this service used to declare is the
+  // printable-ASCII rule. The trim was never a guard against invisible characters -- it strips
+  // the ECMAScript WhiteSpace + LineTerminator set and nothing else -- so a secret of 32 x U+00AD
+  // parsed cleanly here, transmitted intact, and authenticated `200` through the real proxy.
+  //
+  // Do not re-inline the rule here even with an identical spelling -- this service's env suite
+  // asserts this field **is** the shared object, so a local copy reddens rather than drifting.
+  // Required with no default: `parseEnv` throws at module load, so a service that cannot
+  // authenticate its callers never reaches `app.listen`.
+  INTERNAL_API_SECRET: internalApiSecretSchema,
   // Redis Streams consumer configuration (T-037). Nothing reads these yet: they will be read by
   // T-038's `XGROUP CREATE` and T-039's `XREADGROUP`. See `WORKER_STREAM_CONSTANTS` for why the
   // stream-name default is load-bearing and why the batch-size ceiling is a policy choice

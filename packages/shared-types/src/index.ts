@@ -119,7 +119,65 @@ export const INTERNAL_AUTH_RESPONSES = {
  * ("before adding a third copy of a literal, promote it").
  */
 export const INTERNAL_AUTH_CONSTANTS = {
-	SECRET_MIN_LENGTH: 32
+	SECRET_MIN_LENGTH: 32,
+	/**
+	 * The characters an `INTERNAL_API_SECRET` may contain, checked **after** `.trim()` and
+	 * therefore about the secret's interior, not its edges.
+	 *
+	 * `\x20` (SPACE) is deliberately **inside** the range. Excluding it would be the more obvious
+	 * rule and would silently break a passphrase-style secret: measured over a real socket at
+	 * fastify 5.10.0, an internal single space and an internal double space both arrive
+	 * byte-identical and uncollapsed, so internal **spaces** are transmissible and are a legal
+	 * secret. What the trim removes is the *edge* whitespace the HTTP parser removes too.
+	 *
+	 * **TAB is a different case and this rule refuses it.** `\x09` is below `\x20`, so a secret
+	 * containing an internal TAB fails this pattern -- and it is the one newly-refused class that
+	 * is not invisible-character garbage. Re-measured at the Gate-5 rework against the real
+	 * billing guard over a real `node:http` socket, a 33-character ASCII secret whose sixteenth
+	 * byte is `0x09`: it arrives byte-identical (sent and received both `…61 09 61 61…`),
+	 * authenticated `200`, and was accepted by **both** pre-S-8 declarations -- gateway's and
+	 * usage-service's `.min(32)` and worker's and billing's `.trim().min(32)`, since `trim()`
+	 * strips edges only. So an operator may have deployed one, and it will now refuse to start on
+	 * all four services; `docs/releases/s-008-timing-safe-internal-auth.md` names it for that
+	 * reason. Excluded anyway, deliberately (decision D-1 on the Gate-5 report): a TAB inside a
+	 * secret is invisible in every config UI and every `echo`, which is the property that produced
+	 * the silent four-way split S-8 exists to end. An earlier revision of this paragraph cited
+	 * internal TAB as *evidence* that internal whitespace is legal, which contradicted the rule it
+	 * was justifying (QA F-2).
+	 *
+	 * Why a character class at all, rather than length alone. Node encodes an outbound header
+	 * value as latin-1, and the two behaviours that straddles are both bad and neither was
+	 * previously refused:
+	 *
+	 * - at or below U+00FF a non-printable secret transmits intact and **authenticates**. Three
+	 *   code points were driven end to end -- U+0085, U+00AD, and the boundary itself, U+00FF.
+	 *   All three were accepted by the previous `.trim().min(32)`, all three arrived at the
+	 *   upstream byte-identical to what was sent, and all three returned `200` through the real
+	 *   `@fastify/http-proxy`. The boundary character is not merely a marker: it authenticates
+	 *   like the other two;
+	 * - above U+00FF the client refuses to encode the header before sending, so the gateway
+	 *   answers `500` on every proxied request and the upstream never sees one. Seven code points
+	 *   measured -- U+0100, U+034F, U+180E, U+200B, U+200C, U+200D, U+2060. The refusal differs by
+	 *   client: `node:http` throws `ERR_INVALID_CHAR`, the `undici` package's `request()` throws
+	 *   `UND_ERR_INVALID_ARG`, and Node's global `fetch` throws a bare `TypeError` carrying no
+	 *   `code` at all.
+	 *
+	 * **Two probes, two widths** -- kept apart because an earlier revision of this comment
+	 * attached one probe's width to the other's result. The `.trim()` classification ran over
+	 * **20** code points; **10** went through transit and the real proxy plugin, plus a
+	 * 32-character ASCII control that returned `200`. Scope of the whole measurement: those code
+	 * points, `node:http`, `undici` 7.29.0, Node 22.22.2's global `fetch`, fastify 5.10.0 and the
+	 * proxy plugin as `apps/gateway/src/plugins/proxy.plugin.ts` configures it. No browser,
+	 * forward proxy, load balancer or managed ingress was in the path of any of it.
+	 */
+	SECRET_PATTERN: /^[\x20-\x7E]+$/,
+	/**
+	 * zod's default message for a failed `.regex()` is the bare string `"Invalid"`, which
+	 * `parseEnv` surfaces as `Invalid environment configuration for INTERNAL_API_SECRET: Invalid`
+	 * and tells an operator nothing. This is the message they get instead, so it is operator-
+	 * facing text rather than decoration.
+	 */
+	SECRET_PATTERN_MESSAGE: "must contain only printable ASCII characters (U+0020-U+007E)"
 } as const;
 
 /**

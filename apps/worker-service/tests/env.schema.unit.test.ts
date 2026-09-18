@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { hostname } from "node:os";
 import { EVENT_STREAM_CONSTANTS, INTERNAL_AUTH_CONSTANTS } from "@telemetry/shared-types";
+import { internalApiSecretSchema } from "@telemetry/shared-validation";
 import { buildWorkerServiceApp } from "../src/app";
 import { InternalApiSecretMissingError } from "../src/errors";
 import { EnvSchema, env } from "../src/config/env";
@@ -34,6 +35,25 @@ import { WORKER_SERVICE_STARTUP } from "../src/startup.constants";
  * name unique per instance.
  */
 const EXPECTED_DEFAULT_CONSUMER_NAME = `${hostname()}-${process.pid}`;
+
+
+/**
+ * The top of `INTERNAL_AUTH_CONSTANTS.SECRET_PATTERN`'s accepted range, and the code point one
+ * above it.
+ *
+ * A *boundary* rather than a character picked from deep inside the rejected space: a pattern that
+ * was accidentally one character too wide would still reject U+200B, so a case built on that
+ * would pass while the rule it guards was wrong. Written as a char code and derived with `+ 1`
+ * rather than as an escape, so the relationship is stated in the source and no invisible
+ * character lives in this file.
+ *
+ * The exhaustive character-class table -- U+001F, U+007F, U+00AD, U+200B, U+0085, U+034F -- lives
+ * once, in `packages/shared-validation/tests/unit.test.ts`, against the fragment itself. What
+ * each service asserts is that its own field **is** that fragment, plus this one end-to-end
+ * rejection proving the field is reached through the whole-object parse.
+ */
+const PRINTABLE_ASCII_RANGE_END = 0x7e;
+const JUST_ABOVE_PRINTABLE_ASCII = String.fromCharCode(PRINTABLE_ASCII_RANGE_END + 1);
 
 const VALID_INTERNAL_API_SECRET = "t-037-worker-internal-secret-at-least-32-chars";
 const OTHER_VALID_INTERNAL_API_SECRET = "t-037-worker-other-secret-at-least-32-chars";
@@ -895,6 +915,67 @@ describe("worker-service env schema", () => {
         expect(rejected.statusCode).toBe(WORKER_RESPONSES.HTTP_STATUS_UNAUTHORIZED);
       } finally {
         await app.close();
+      }
+    });
+  });
+
+  // S-8. All four services that declare `INTERNAL_API_SECRET` now derive the field from one
+  // fragment in `@telemetry/shared-validation`, rather than each writing the rule out. They used
+  // to write it out and had drifted into two rules: worker-service and billing-service trimmed,
+  // gateway and usage-service did not. Because both HTTP clients in this stack strip leading and
+  // trailing SP/HTAB from a header value in transit, one stray space in a platform-wide secret
+  // made this service and billing answer `200` while usage-service answered `401` -- measured
+  // end-to-end over a real socket against the real guard factories before this change was
+  // written. The behaviour table for the fragment lives beside the fragment; what this block
+  // asserts is the derivation, plus one rejection driven through the whole-object parse.
+  describe("INTERNAL_API_SECRET derives from the shared fragment", () => {
+    // **worker's `EnvSchema` is a `ZodEffects`, not a `ZodObject`** -- `.superRefine(...)` at
+    // `src/config/env.ts` wraps it -- so it has no `.shape` (S-23 records this trap, and
+    // measured `"shape" in EnvSchema` as `false`). The other three suites reach the field with
+    // `EnvSchema.shape.INTERNAL_API_SECRET`; here it has to be `innerType()` first. A helper
+    // copied from billing's suite would read `undefined.INTERNAL_API_SECRET` and throw rather
+    // than assert nothing, which is the right direction to fail in -- but the point of writing
+    // it out is that the reader should not have to discover that.
+    it("declares INTERNAL_API_SECRET as internalApiSecretSchema itself", () => {
+      expect(EnvSchema.innerType().shape.INTERNAL_API_SECRET).toBe(internalApiSecretSchema);
+    });
+
+    // Self-check on the boundary constant, so the derivation cannot quietly point at a code point
+    // the pattern accepts and turn the rejection below into a tautology.
+    it("pins the printable-ASCII boundary the rejection case is built from", () => {
+      expect(
+        INTERNAL_AUTH_CONSTANTS.SECRET_PATTERN.test(String.fromCharCode(PRINTABLE_ASCII_RANGE_END))
+      ).toBe(true);
+      expect(INTERNAL_AUTH_CONSTANTS.SECRET_PATTERN.test(JUST_ABOVE_PRINTABLE_ASCII)).toBe(false);
+    });
+
+    // Red before the repoint: `.trim().min(...)` accepted every non-ASCII secret measured,
+    // including 32 x U+00AD, which transmits intact and authenticates. The trim was never a guard
+    // against invisible characters -- it strips the ECMAScript WhiteSpace set and nothing else.
+    it("rejects an INTERNAL_API_SECRET carrying a character just outside printable ASCII", () => {
+      expectIssueOn(
+        EnvSchema.safeParse({
+          ...buildBaseEnv(),
+          INTERNAL_API_SECRET: `${VALID_INTERNAL_API_SECRET}${JUST_ABOVE_PRINTABLE_ASCII}`
+        }),
+        "INTERNAL_API_SECRET"
+      );
+    });
+
+    // The non-obvious half of the rule: U+0020 is *inside* `SECRET_PATTERN`, and the pattern runs
+    // after the trim, so edge whitespace goes and internal spaces stay. Excluding U+0020 would
+    // have been the more obvious rule and would have broken a passphrase-style secret silently.
+    it("accepts an INTERNAL_API_SECRET with internal spaces", () => {
+      const passphrase = `${VALID_INTERNAL_API_SECRET.slice(0, 20)} ${VALID_INTERNAL_API_SECRET.slice(20)}`;
+
+      expect(passphrase.length).toBeGreaterThan(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH);
+
+      const parsed = EnvSchema.safeParse({ ...buildBaseEnv(), INTERNAL_API_SECRET: passphrase });
+
+      expect(parsed.success).toBe(true);
+
+      if (parsed.success) {
+        expect(parsed.data.INTERNAL_API_SECRET).toBe(passphrase);
       }
     });
   });

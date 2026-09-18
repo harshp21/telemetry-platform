@@ -6,9 +6,27 @@ Multi-tenant data separation is the platform's core security invariant. Four lay
    and re-injects them from verified JWT context and its own configuration
    (`apps/gateway/src/middleware/guards.middleware.ts`,
    `apps/gateway/src/plugins/proxy.plugin.ts`).
-2. **`internal-auth.middleware`** — usage-service rejects any request that does not carry the
-   shared `X-Internal-Secret`, before tenant context is derived. `/health` is exempt. The
-   comparison is timing-safe (SHA-256 digests + `crypto.timingSafeEqual`), never `===`.
+2. **`internal-auth.middleware`** — usage-service, billing-service and worker-service each
+   reject any request that does not carry the shared `X-Internal-Secret`, before tenant context
+   is derived. `/health` is exempt in all three — by allowlist in usage-service, structurally in
+   the other two, whose guards are registered on encapsulated `app.register` scopes that
+   `/health` is outside of. **All three guards are `onRequest` hooks, and all three compare with
+   the shared `secretsMatch`** (`packages/shared-utils`): SHA-256 digests plus
+   `crypto.timingSafeEqual`, never `===` or `!==`. Any non-string header value is rejected rather
+   than normalized. Until S-8 closed, billing and worker used `!==` at `preHandler`, which both
+   leaked comparison timing and let an unauthenticated caller's body be parsed before rejection.
+
+   The *phase* is part of the contract, not a detail: at `preHandler` fastify has already run the
+   content-type parser, so a caller holding no secret could distinguish body shapes from the
+   error it got back. Measured against both services' real internal routes before the fix —
+   malformed JSON answered `500 INTERNAL_ERROR` naming the body parser while a valid body
+   answered `401`. A new guard goes at `onRequest`.
+
+   The secret itself is declared once, as `internalApiSecretSchema` in
+   `@telemetry/shared-validation`, and all four services that hold an `INTERNAL_API_SECRET`
+   — gateway (the caller) plus those three — derive their env field from that object rather than
+   restating the rule. They restated it until S-8 and two had drifted, which split the platform's
+   authentication on a whitespace-padded secret.
 3. **`tenant-context.middleware`** validates `X-Tenant-Id` as a **UUID** and attaches tenant
    context per request. Any non-empty string is *not* good enough: `Tenant.id` is
    `String @default(uuid())`, and a tenant id containing `:` would make
@@ -121,10 +139,13 @@ nothing at all, which is the trap S-11 documents. Revoke explicitly anyway, gran
 
 ## Known gaps
 
-Read `.claude/rules/known-gaps.md` (S-5, S-6, S-8, S-9, S-10, S-11) before relying on any of
+Read `.claude/rules/known-gaps.md` (S-5, S-6, S-9, S-10, S-11) before relying on any of
 these layers.
-Note that only usage-service currently has the layer-2 guard in the strong form described above
-(S-8, S-9).
+Note that **analytics-service still has no layer-2 guard at all** and no `INTERNAL_API_SECRET`
+(S-9), even though gateway already proxies `/v1/analytics` to it and sends the header. Its guard
+must land before its first tenant-scoped route, not after. The other three services all carry the
+strong form described above since S-8, whose id is retired; the record is
+`docs/plans/s-008-timing-safe-internal-auth.md`.
 Do not treat a passing RLS test as evidence unless it runs as a `NOSUPERUSER NOBYPASSRLS`
 role — and unless its fixtures were seeded through a *different* connection, or the test is
 asserting against data it could not have created.
