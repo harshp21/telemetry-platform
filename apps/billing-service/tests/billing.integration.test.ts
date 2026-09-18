@@ -814,11 +814,17 @@ describe("POST /v1/internal/billing/generate (integration)", () => {
   });
 
   it("BI23 - a non-DRAFT invoice refuses the absorption with 409 INVOICE_IMMUTABLE and writes nothing", async () => {
-    // The invoice is seeded `FINALIZED` **through the owner connection** because the platform
-    // cannot produce that status: `createDraftInvoice` writes `DRAFT` and is the only statement
-    // anywhere that sets `Invoice.status`. So until T-048 ships, this case is the only thing
-    // standing behind the `INVOICE_IMMUTABLE` branch -- it is not redundant with a production
-    // path, it is the production path's stand-in.
+    // The invoice is seeded `FINALIZED` **through the owner connection** because no production
+    // path produces that status: within `src/` and `prisma/`, `createDraftInvoice` writes
+    // `DRAFT` and no other statement sets `Invoice.status`. That scope is the grep's, not the
+    // repository's -- `tests/` does set it, six times, every one of them a `seedInvoices` call
+    // on the owner connection, including this test's own fixture block below. An earlier
+    // revision of this comment said `createDraftInvoice` was "the only statement anywhere that
+    // sets `Invoice.status`", which those six refute (T-048 Gate 4 Round 2, MEDIUM-3).
+    //
+    // This case and `BI34` -- its `PAID` sibling, added by T-048 -- are what stands behind the
+    // `INVOICE_IMMUTABLE` branch at the integration layer. Neither is redundant with a
+    // production path; both are the production path's stand-in.
     //
     // The fixture is **not** passing on the status alone: deleting the DRAFT guard from
     // `absorbLateUsage` reddens this case as well as `BU100`, and nothing else -- measured
@@ -858,6 +864,69 @@ describe("POST /v1/internal/billing/generate (integration)", () => {
     expect(await fixtures.readLineItems(SUITE_TENANT_IDS)).toHaveLength(0);
     expect(asDecimalString((await invoiceFor(TENANT_A)).totalAmount)).toBe(
       asDecimalString(INTEGRATION_LATE_USAGE.FINALIZED_TOTAL)
+    );
+    expect((await lineById(lateLineId)).billed).toBe(false);
+  });
+
+  /**
+   * `BI23`'s `PAID` sibling, and the case that closes T-049's last open line -- *"attempt to
+   * update `FINALIZED` invoice -> `409 INVOICE_IMMUTABLE`"*
+   * (`docs/epics/epic-8-billing-service.md` § *T-049*). `BI23` carries the `FINALIZED` half
+   * and is **not** re-titled: it says "a non-DRAFT invoice refuses the absorption", which
+   * remains exactly what it does. This is the case that covers the status the epic names
+   * second and that nothing had ever driven, at any layer, before T-048.
+   *
+   * **It does not prove production behaviour.** The invoice is seeded `PAID` through
+   * `DIRECT_DATABASE_URL` because no production path produces that status: within `src/` and
+   * `prisma/`, `createDraftInvoice` writes `DRAFT` and no other statement sets
+   * `Invoice.status`. That scope is the grep's, not the repository's -- it reads
+   * `apps/<svc>/src`, `packages/<pkg>/src` and `prisma`, and not `tests/`. `tests/` does set the
+   * status, six times, and every one of them is a `seedInvoices` call on the owner connection --
+   * the nearest being `BI23`'s own fixture block, the `FINALIZED` sibling of this case. Located
+   * by symbol rather than by distance, because a line offset rots the moment anything above it
+   * moves: `grep -rEn "status: InvoiceStatus\.(FINALIZED|PAID)" apps/billing-service/tests`
+   * returns 17 lines; filtered to the `seedInvoices` call sites, six -- all in this file. The
+   * other 11 are query filters and in-memory doubles, which write nothing. An earlier revision of this docblock said `createDraftInvoice`
+   * was *"the only statement anywhere that sets `Invoice.status`"*, which those six refute
+   * (Gate-4 Round 2, MEDIUM-3). The assertions below are the repository's behaviour when
+   * handed a state no production path currently reaches -- read back, though, through
+   * `telemetry_app` and the real service.
+   */
+  it("BI34 - a PAID invoice refuses the absorption with 409 INVOICE_IMMUTABLE and writes nothing", async () => {
+    await fixtures.seedTenants(SUITE_TENANT_IDS);
+    await fixtures.seedMeters([
+      {
+        tenantId: TENANT_A,
+        metricKey: INTEGRATION_FIXTURE.METRIC_API,
+        unitPrice: INTEGRATION_FIXTURE.UNIT_PRICE_API
+      }
+    ]);
+    await fixtures.seedInvoices([
+      {
+        tenantId: TENANT_A,
+        periodStart: INTEGRATION_FIXTURE.PERIOD_START,
+        periodEnd: INTEGRATION_FIXTURE.PERIOD_END,
+        status: InvoiceStatus.PAID,
+        totalAmount: INTEGRATION_LATE_USAGE.PAID_TOTAL
+      }
+    ]);
+    const lateLineId = await seedLateApiLine(TENANT_A);
+
+    const response = await generate(periodBody(TENANT_A));
+
+    expect(response.statusCode).toBe(BILLING_RESPONSES.HTTP_STATUS_CONFLICT);
+    const body = response.json() as { code: string; message: string };
+    expect(body.code).toBe(BILLING_RESPONSES.CODE_INVOICE_IMMUTABLE);
+    // The status is named in the message rather than in a top-level field, because every error
+    // this service emits is `{ code, message }` (T-048 D3, S-45 divergence E1).
+    expect(body.message).toContain(InvoiceStatus.PAID);
+
+    // Nothing written, all three halves -- the same triple `BI23` asserts for `FINALIZED`.
+    // Transactional end to end: the refusal happens inside `withTenant`, so there is no
+    // half-absorbed state to observe.
+    expect(await fixtures.readLineItems(SUITE_TENANT_IDS)).toHaveLength(0);
+    expect(asDecimalString((await invoiceFor(TENANT_A)).totalAmount)).toBe(
+      asDecimalString(INTEGRATION_LATE_USAGE.PAID_TOTAL)
     );
     expect((await lineById(lateLineId)).billed).toBe(false);
   });
@@ -1200,9 +1269,12 @@ describe("POST /v1/internal/billing/generate (integration)", () => {
  * asserts against rows the requesting tenant could not have created and could not have read
  * without the policy failing.
  *
- * The `FINALIZED` and `PAID` fixtures exist only because the platform cannot produce them:
- * `createDraftInvoice` writes `DRAFT` and never sets `finalizedAt`, so the status filter and
- * the nullable-timestamp case have no HTTP spelling to seed through.
+ * The `FINALIZED` and `PAID` fixtures exist only because the platform's own write path does not
+ * produce them: `createDraftInvoice` writes `DRAFT` and never sets `finalizedAt`, so the status
+ * filter and the nullable-timestamp case have no HTTP spelling to seed through. Scoped at T-048
+ * Gate-3 Round 4 from the unqualified "the platform cannot produce them" -- `seedInvoices`, two
+ * blocks below, is part of this platform and produces them six times on the owner connection.
+ * Same correction as the six `src/`-and-`prisma/` scopings this task made elsewhere.
  */
 describe(`GET ${BILLING_ROUTES.INVOICES} (integration)`, () => {
   const listHeaders = (

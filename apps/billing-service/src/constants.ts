@@ -110,8 +110,8 @@ export const BILLING_RESPONSES = {
   CODE_USAGE_LINES_CHANGED: "USAGE_LINES_CHANGED",
   MESSAGE_USAGE_LINES_CHANGED:
     "Usage lines changed between pricing and invoicing; nothing was written",
-  // S-45 D1/D3: late usage may only be absorbed into a `DRAFT` invoice; any other status is
-  // refused and nothing is written. The **name** is taken from T-048's declaration in
+  // S-45 D1/D3, generalised by T-048: an invoice that is not `DRAFT` refuses mutation and
+  // nothing is written. The **name** is taken from T-048's declaration in
   // `docs/epics/epic-8-billing-service.md` § *T-048* (heading at `:140`), whose **Error
   // response** line declares it, rather than minted fresh, so the platform ends
   // with one code for "you may not mutate a non-DRAFT invoice" instead of two. The epic gives
@@ -119,8 +119,24 @@ export const BILLING_RESPONSES = {
   // is `{ code, message }`, so the envelope is kept, the status is named in the message and
   // both values go to billing's own log line (divergence E1 in the plan). `409` reuses
   // `HTTP_STATUS_CONFLICT`, which already exists above.
+  //
+  // **The message is no longer absorption-specific (T-048 D6).** It read "cannot absorb late
+  // usage" while `absorbLateUsage` was the only caller. T-048 moved the status check into
+  // `InvoiceRepository`'s `draftInvoiceWriter` seam, which every write to an *existing*
+  // invoice passes through, so a message naming one caller would be wrong the first time it is
+  // quoted from another. Re-derived immediately **before** the reword:
+  // `grep -rn "cannot absorb late usage\|MESSAGE_INVOICE_IMMUTABLE"` over billing's and
+  // worker's `src` and `tests` returned exactly **two** lines, both in `src` -- this
+  // declaration and its single use, in `InvoiceImmutableError`'s `super(...)` call in
+  // `errors/index.ts` -- cited by symbol, because the line number this sentence first carried
+  // (`:156`, correct at `a87d952`) was moved by T-048's own edits to that file twice over, once
+  // by the change itself and again by the Gate-3 Round 4 rework. **No test asserted the string**;
+  // the three cases that assert the message assert `toContain(InvoiceStatus.FINALIZED)`, which
+  // the `(status ...)` suffix that use appends still satisfies. Re-running that grep *now*
+  // returns more lines, because this comment carries the pattern and matches itself -- the
+  // S-33 self-match, named so the next reader is not caught by the difference.
   CODE_INVOICE_IMMUTABLE: "INVOICE_IMMUTABLE",
-  MESSAGE_INVOICE_IMMUTABLE: "Invoice is not a draft and cannot absorb late usage",
+  MESSAGE_INVOICE_IMMUTABLE: "Invoice is not a draft and cannot be modified",
   // T-047 D3: **one** code and **one** message for both "no such invoice" and "that invoice
   // belongs to another tenant". Two spellings would be an existence oracle -- a caller could
   // enumerate ids and learn which exist on the platform from the difference. The message says

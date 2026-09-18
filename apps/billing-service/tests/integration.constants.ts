@@ -228,14 +228,28 @@ export const INTEGRATION_LATE_USAGE = {
   /** 3 + 2 */
   TENANT_B_EXPECTED_TOTAL_AFTER_ABSORB: "5",
   /**
-   * BI23's refusal fixture: an invoice this platform cannot produce.
+   * BI23's refusal fixture: a status no production path produces.
    *
-   * `createDraftInvoice` writes `DRAFT` and is the only statement that sets `Invoice.status`
-   * anywhere, so `FINALIZED` has no HTTP spelling and the row must be seeded through the owner
-   * connection. Until T-048 ships, that fixture is the only thing standing behind the
-   * `INVOICE_IMMUTABLE` branch.
+   * Within `src/` and `prisma/`, `createDraftInvoice` writes `DRAFT` and no other statement
+   * sets `Invoice.status`, so `FINALIZED` has no HTTP spelling and the row must be seeded
+   * through the owner connection. **That scope is a grep's and it does not read `tests/`**,
+   * which sets the status six times -- every one a `seedInvoices` call on the owner connection,
+   * this fixture among them. An earlier revision of this docblock said `createDraftInvoice` was
+   * "the only statement that sets `Invoice.status` anywhere", which those six refute (T-048
+   * Gate 4 Round 2, MEDIUM-3). `BI23` and `BI34` together are what stands behind the
+   * `INVOICE_IMMUTABLE` branch at the integration layer; neither proves production behaviour.
    */
   FINALIZED_TOTAL: "7.000000",
+  /**
+   * `BI34`'s refusal fixture, and the `PAID` sibling of `FINALIZED_TOTAL`.
+   *
+   * A **distinct** value from `FINALIZED_TOTAL` on purpose: the two cases seed different
+   * statuses, and a shared total would let a copy-paste error that seeded the wrong status
+   * still satisfy the unchanged-total assertion. Same owner-connection caveat as its sibling --
+   * no statement in `src/` or `prisma/` writes `PAID` either, so `BI34`'s fixture is how the
+   * state is reached here, and the case does **not** prove production behaviour.
+   */
+  PAID_TOTAL: "9.000000",
   /**
    * BI25's precision pair, measured at Gate 1 through the real client (plan probe I):
    * `1234567.123456 + 0.000001` persists as `1234567.123457`. The addition happens in

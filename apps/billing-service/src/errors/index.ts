@@ -129,14 +129,40 @@ export class UsageLinesChangedError extends AppError {
  * been issued, and the usage stays `billed = false` and absorbable if the status ever moves
  * back or a supplementary process claims it.
  *
- * **No writer in this repository produces the state this refuses.** A grep for `FINALIZED`,
+ * **No writer in `src/` or `prisma/` produces the state this refuses.** A grep for `FINALIZED`,
  * `PAID` and `finalizedAt` across every service's `src/` and `prisma/` returns declarations,
- * reads and comments only; `createDraftInvoice` writes `BILLING_METERING.INVOICE_STATUS_DRAFT`
- * and is the only statement that sets `Invoice.status` at all (measured at Gate 1, plan
- * appendix A.6). So until T-048 ships, `BI23` -- which seeds `FINALIZED` through the owner
- * connection -- is the only thing standing behind this branch. Stated as what that grep shows
- * about today's writers, **not** as a claim the status is unrepresentable: the fixtures reach
- * it, which is exactly how `BI23` works.
+ * reads, DDL and comments only. Within that scope `createDraftInvoice` writes
+ * `BILLING_METERING.INVOICE_STATUS_DRAFT` and no other statement sets `Invoice.status`.
+ * **`tests/` is outside that scope and does set it**, six times -- all through
+ * `integration.fixtures.ts`'s `seedInvoices`, on the owner connection. An earlier revision of
+ * this sentence ended "and is the only statement that sets `Invoice.status` at all", which
+ * those six refute (T-048 Gate 4 Round 2, MEDIUM-3): the grep never read `tests/`, so the
+ * evidence only ever supported the scoped claim.
+ *
+ * Re-derived over the whole match set rather than carried forward as a numeral, and re-run
+ * **after** the last edit to any file the grep reads -- the two previous derivations were each
+ * invalidated by the sentence that recorded them: **19** matching lines, **10** of them comments
+ * and **9** declarations, reads and DDL. **Zero assignments** -- no statement in that scope
+ * writes the status column or its timestamp. That is the durable half, and the only figure
+ * unchanged across all three derivations. On `a87d952` the grep returned **14**.
+ *
+ * **The added-and-removed split that used to follow that figure is gone deliberately.** It
+ * reproduced under no consistent rule: per-file deltas between the two revisions give 5 added
+ * and 0 removed, `comm` over the two normalised match sets gives 7 and 2, and the shipped
+ * sentence said 6 and 1 -- this file had three matching lines on `a87d952` and has three now,
+ * two of them reworded in place, and each arithmetic charges a reword differently. All three
+ * reach 19, which is why four derivations passed it (T-048 Gate 5 F-2, upheld at Gate 6 LOW-1).
+ * Gate 3 measured 17 matching lines and 8 comments; Gate 4 Round 2 measured 19 and 10 -- both
+ * correct when written, both stale inside the same task, which is the self-match S-33 is about.
+ * The plan's appendix A.6 recorded 12 and that figure does not reproduce.
+ *
+ * So `BI23` (`FINALIZED`) and `BI34` (`PAID`), both seeding through the owner connection, plus
+ * the `BU123`/`BU124` doubles, are what stands behind this branch -- and **none of them proves
+ * production behaviour**: they prove what the repository does when handed a state no
+ * production path currently produces. T-048 did not change that; it made the refusal a
+ * shared seam rather than a check in one method. Stated as what the grep shows about today's
+ * writers, **not** as a claim the status is unrepresentable: the fixtures reach it, which is
+ * exactly how `BI23` works.
  *
  * `invoiceId` and `currentStatus` are retained as fields and read by `BillingService`'s log
  * line. They are deliberately **not** in the response body: the epic declares

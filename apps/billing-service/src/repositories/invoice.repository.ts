@@ -7,6 +7,7 @@ import {
 } from "../constants";
 import { InvoiceImmutableError, UsageLinesChangedError } from "../errors";
 import { TenantScopedRepository } from "./base.repository";
+import type { FullTransactionClient, TransactionClient } from "./base.repository";
 
 /** One metric's unbilled total for the period, already normalised out of `Prisma.Decimal` (D8). */
 export interface UnbilledMetricTotal {
@@ -263,29 +264,33 @@ const toAmountString = (value: unknown): string => String(value ?? 0);
 const toIsoString = (value: Date): string => value.toISOString();
 
 /**
- * Tenant-scoped reads and the one write that invoice generation performs.
+ * Tenant-scoped reads and the two writes that invoice generation performs.
  *
- * Three properties hold across every method here, and they are the ones
- * `.claude/rules/tenant-isolation.md` asks for:
+ * Four properties hold across every method here. The first three are the ones
+ * `.claude/rules/tenant-isolation.md` asks for; the fourth is T-048's:
  *
  * 1. Every query runs inside `withTenant`, so the RLS policies on `"Tenant"`, `"Invoice"` and
  *    `"UsageLine"` are active.
  * 2. Every predicate carries an explicit tenant, taken from `this.where({})` -- the
  *    constructor-bound context -- and no method has a `tenantId` parameter through which a
  *    caller could supply a different one.
- * 3. **No method here takes a bare `invoiceId`** -- checkable, and checked:
- *    `grep -cE "^  async" invoice.repository.ts` returns **seven** and none of those signatures
- *    has one, and every `invoiceId` in the file is a local binding, a returned interface field
- *    or a comment -- never a parameter. (Re-run at T-047 Gate 3: `tenantExists`,
- *    `findByPeriod`, `sumUnbilledByMetricKey`, `createDraftInvoice`, `absorbLateUsage`,
- *    `listInvoices`, `findDetailById`. T-046 added the fifth and the count said four until that
- *    was corrected; S-45 added the sixth and T-047 the seventh. Re-run it rather than trusting
- *    the numeral, which is the S-33 failure this comment is itself an instance of. Note the
- *    grep is anchored to `^  async` and so **excludes** the private `markUsageLinesBilled`,
- *    which is `private async` -- `grep -nE "^  (private )?async"` returns **eight**. None of
- *    the eight takes an `invoiceId` either.) This is a
- *    property of the shape as shipped, not something the type system forbids: nothing stops a
- *    later method adding the parameter, which is why it is written down here. Line items are
+ * 3. **No method here takes a bare `invoiceId`, and none takes a tenant.** This used to be a
+ *    prose census with a grep beside it, and the planning probe for T-048 measured what that
+ *    was worth: an eighth method taking a bare `invoiceId` was added and typecheck, lint and
+ *    all 207 tests stayed green, because the claim lived in a comment (S-33). **`BU126` is now
+ *    the census**, asserted rather than asserted-about: it parses every `async` member's
+ *    parameter list out of this file and fails on a member named outside its list or on a
+ *    parameter named `invoiceId` or `tenantId`. Re-derived at T-048 Gate 3:
+ *    `grep -cE "^  async"` returns **7** (`tenantExists`, `findByPeriod`,
+ *    `sumUnbilledByMetricKey`, `createDraftInvoice`, `absorbLateUsage`, `listInvoices`,
+ *    `findDetailById`) and `grep -cE "^  ((private|protected|public|static) )?async"` returns
+ *    **9**, the two extra being the private `markUsageLinesBilled` and, since T-048, the private
+ *    `draftInvoiceWriter`. None of the nine takes either parameter. Re-run at Gate 3 Round 2:
+ *    `^  async` -> 7, `^  (private )?async` -> 9, and the modifier-inclusive form above -> 9, so
+ *    nothing is hiding under a modifier the narrower greps miss. That third form is the one to
+ *    quote: the narrower one was `BU126`'s pattern until Round 2, and a `protected` member
+ *    slipped past it into neither list. Run the greps rather than trusting the numerals;
+ *    unlike before, a stale numeral here now also reddens `BU126`. Line items are
  *    written through Prisma's nested `create` on the invoice -- by `createDraftInvoice` and,
  *    since S-45, by `absorbLateUsage`, which are the only two writers on this tree -- and the
  *    one method that *reads* them, `findDetailById` (T-047), reaches them through the nested
@@ -299,6 +304,62 @@ const toIsoString = (value: Date): string => value.toISOString();
  *    that table; `billing.integration.test.ts` cases BI9 and BI32 pin the gap as it is today so
  *    that closing S-10 turns them red rather than passing unnoticed, and `BU109` asserts that
  *    the detail read never touches `tx.invoiceLineItem` at all.
+ * 4. **Every write to an `Invoice` reaches the delegate through `invoiceDelegate`, and the two
+ *    callers that address an invoice which already exists go through `draftInvoiceWriter`,
+ *    which refuses when the row named by `key` is not `DRAFT`** (T-048). Stated that way
+ *    deliberately: the seam checks a row and returns the *whole* invoice delegate, so what is
+ *    bound to `key` is the check, not the capability -- see `draftInvoiceWriter`'s own docblock
+ *    for the measurement. `withTenant` hands the callback a `TransactionClient` whose
+ *    `invoice` delegate has had its nine write methods removed, so the naive third writer --
+ *    `tx.invoice.update({ where: { id }, ... })` -- is a compile error. Measured with
+ *    `pnpm --filter @telemetry/billing-service exec tsc --noEmit -p tsconfig.json`, which
+ *    covers `tests/**` as well as `src/**`:
+ *    `error TS2339: Property 'update' does not exist on type
+ *    'Omit<InvoiceDelegate<DefaultArgs, PrismaClientOptions>, InvoiceWriteMethod>'`.
+ *
+ *    **State that at its measured strength and no further.** The same probe written as a
+ *    deliberate cast back to the full client **compiles clean, 0 errors** -- so a bypass is
+ *    *made visible in the forms the census enumerates*, not made impossible. What catches the
+ *    deliberate form is `BU125`, which asserts that the **`as`-form spellings** of the cast
+ *    targets it lists occur exactly once across `apps/billing-service/src`, inside
+ *    `invoiceDelegate`. **Spellings, not targets** -- all four patterns are anchored on
+ *    `\bas\s+`, so the same target written as an angle-bracket type assertion walks past every
+ *    one of them; measured at Gate-3 Round 4 and recorded in the mutation list below.
+ *
+ *    **Each mutation with the suites it was run against, because an earlier revision of this
+ *    paragraph attached one measurement to the wrong edit** (the second shape S-33 records):
+ *
+ *    - *A third writer that casts `tx` back*, i.e. a new member **plus** a cast: reddens
+ *      `BU125` **and** `BU126` -- `Tests 2 failed | 35 passed (37)` against
+ *      `tests/invoice.repository.unit.test.ts` alone, `Tests 2 failed | 211 passed (213)`
+ *      against the whole package. `BU126`'s redness there comes from the **new member**, not
+ *      from the cast.
+ *    - *A second cast alone*, with no new member (`void (tx as …).invoice;` inside an existing
+ *      method): reddens `BU125` only -- `Tests 1 failed | 36 passed (37)` in the file.
+ *    - *The Gate-4 evasive writer*, a `protected` member casting the **delegate** rather than
+ *      the client: passed everything at Round 1 (typecheck 0, lint 0, `213 passed (213)`) and
+ *      reddens both after Round 2 widened the two patterns --
+ *      `Tests 2 failed | 211 passed (213)`, and each case red on its own under `vitest -t`.
+ *    - *The angle-bracket assertion* (Gate 6 LOW-3, re-run at Gate-3 Round 4): an
+ *      angle-bracket type assertion of `tx` through `unknown` to the exported full-client type,
+ *      written after the seam call in `absorbLateUsage`'s `withTenant` callback, taking the widened
+ *      delegate's `updateMany`. **0 tsc diagnostics, 0 lint findings, `37 passed (37)` against
+ *      `tests/invoice.repository.unit.test.ts`** -- `BU125` and `BU126` both green. It is the
+ *      cheapest evasion found so far, because unlike the three above it changes no target and
+ *      adds no member: it spells the census's own first identifier verbatim, and the census
+ *      still misses it because every pattern is anchored on the `as` keyword. Reverted from a
+ *      copy; the tree carries no probe.
+ *
+ *    `this.prisma.invoice.update(...)` is reached by none of this -- it added zero diagnostics
+ *    under the same typecheck -- and it is the *worse* route, because it runs outside the
+ *    transaction with no `set_config('app.tenant_id', ...)` issued at all. That is the route the
+ *    epic's own T-048 snippet writes. It is **one of several** such routes, not the only one:
+ *    the `prisma` module singleton imported from any layer and `tx.$executeRaw` inside
+ *    `withTenant` were both measured at 0 diagnostics. S-48 stays open and carries the table.
+ *
+ *    `createDraftInvoice` is outside the `DRAFT` check by design (D5) and inside the delegate
+ *    property: there is no existing row whose status could forbid a create, and the status it
+ *    writes is the `DRAFT` constant unconditionally.
  *
  * Date predicates go through the ORM only -- never `$queryRaw` -- for the reason recorded on
  * `MeterRepository` and in `CLAUDE.md` § *Raw SQL and timestamps*.
@@ -380,6 +441,116 @@ export class InvoiceRepository extends TenantScopedRepository {
   }
 
   /**
+   * The one place in this service that widens `tx` back to the full transaction client (T-048).
+   *
+   * `withTenant` hands the callback a `TransactionClient` whose `invoice` delegate has had its
+   * nine write methods removed, so `tx.invoice.create` and `tx.invoice.update` do not exist as
+   * far as the compiler is concerned. This accessor is how the two legitimate writers get them
+   * back, and the cast is deliberately ugly for the same reason it is deliberately singular.
+   *
+   * `BU125` asserts that the cast forms it enumerates occur **exactly once** across
+   * `apps/billing-service/src`, and that the one occurrence is inside this method. A future
+   * writer that wants to bypass the seam can still write the same cast in its own body --
+   * measured, probe P-G2, it compiles clean -- and `BU125` is what turns *that* form into a red
+   * test rather than a silent second doorway.
+   *
+   * **It is a tripwire over an enumerated set, not a proof, and that distinction was earned by
+   * being wrong.** At Gate 4 the census matched one spelling; a writer casting the delegate
+   * rather than the client, under a `protected` modifier neither pattern classified, passed
+   * typecheck, lint and all 213 tests. The patterns were widened at Round 2 -- four cast
+   * targets, every access modifier, plus a third member list asserted empty so nothing falls
+   * out of the census silently -- and that writer now reddens both. A fifth spelling would
+   * still be missed. See `TransactionClient`'s docblock in `base.repository.ts` for the
+   * figures, and S-48 for the routes no source census reaches at all: `this.prisma`, the
+   * `prisma` module singleton, and `tx.$executeRaw` inside `withTenant`.
+   *
+   * **`BU125` matches on the casts' text**, so nothing in `src/` may spell those phrases in a
+   * comment -- including this one, which is why they are described rather than quoted. A
+   * comment carrying a pattern would be counted as an occurrence and would report a bypass
+   * that does not exist (the S-33 self-match).
+   */
+  private invoiceDelegate(tx: TransactionClient): FullTransactionClient["invoice"] {
+    return (tx as unknown as FullTransactionClient).invoice;
+  }
+
+  /**
+   * The guarded doorway the two writers of an invoice that **already exists** go through
+   * (T-048).
+   *
+   * Reads the addressed invoice's status through the narrowed delegate -- a read, which the
+   * narrowing leaves in place -- refuses anything that is not `DRAFT` with
+   * `InvoiceImmutableError`, and only then hands back the write delegate. Any throw happens
+   * before a single write statement is issued, and inside the caller's transaction, so there
+   * is no partial state to observe. `BU123` and `BU127` are the two halves of that: refuses
+   * before any write, and does not over-refuse a draft.
+   *
+   * **The limit, measured rather than reasoned about (Gate-4 review, MEDIUM-1).** What this
+   * seam checks is the status of the row named by `key`. What it returns is the **whole**
+   * invoice delegate, not a capability scoped to that row, and it does not constrain what the
+   * caller does with it afterwards: inserting
+   * `await writer.updateMany({ where: {}, data: { status: "FINALIZED" } })` immediately after
+   * the seam call in `absorbLateUsage` compiles with **0 diagnostics**
+   * (`pnpm --filter @telemetry/billing-service exec tsc --noEmit -p tsconfig.json`, whole
+   * package, reverted). So a caller is expected to write through the same `key` it had checked;
+   * nothing in the type says so. RLS still bounds the tenant. Nothing bounds the status.
+   *
+   * Left as a reword rather than a reshape by decision at Gate 3 Round 2: making the seam
+   * perform the write (`draftInvoiceUpdate(tx, key, data)`) is the shape that would make the
+   * binding true by construction, and it re-opens D5 and eleven existing cases. Both callers
+   * are in this file, and `BU126`'s widened census is what puts a tripwire on the next one.
+   *
+   * **`key` is built inside this repository and is never a caller's** (D4). No method on this
+   * class takes a bare `invoiceId` or a caller-supplied tenant -- `BU126` asserts that over
+   * the parsed parameter list of every `async` member rather than leaving it to the class
+   * docblock's prose, which the planning probe measured as unguarded.
+   *
+   * **`createDraftInvoice` deliberately does not come through here** (D5). Creation is not
+   * mutation: there is no existing row whose status could forbid the write, and the status it
+   * writes is the `DRAFT` constant unconditionally. It reaches the delegate through
+   * `invoiceDelegate` alone, so the property that holds across the whole class is the narrower
+   * true one -- *every* write reaches the delegate through `invoiceDelegate`, and the two
+   * writers that address an invoice which already exists obtain that delegate from this guard,
+   * having had the row named by `key` checked.
+   *
+   * **No production path reaches the refusing branch today.** A grep for `FINALIZED`, `PAID`
+   * and `finalizedAt` across every service's `src/` and `prisma/` returns declarations, reads,
+   * DDL and comments -- **zero assignments** -- so within that scope `createDraftInvoice`'s
+   * `DRAFT` is the only status any statement writes. **That scope is the grep's, and it does not
+   * read `tests/`**, which does set the status: six times, all through
+   * `integration.fixtures.ts`'s `seedInvoices` on the owner connection. Re-derived over the
+   * whole match set rather than carried forward as a numeral, and re-run **after** the last edit
+   * to any file the grep reads: **19** lines, **10** of them comments and **9** declarations,
+   * reads and DDL; **14** on `a87d952`. The added-and-removed split that used to follow is gone:
+   * three arithmetics over the same two revisions give 5 added / 0 removed, 7 / 2 and 6 / 1, and
+   * all three reach 19, so the split reproduced under no consistent rule (T-048 Gate 5 F-2).
+   * Gate 3 measured 17 lines and 8 comments, Gate 4 Round 2 measured 19 and 10 -- both correct
+   * when written, both stale inside the same task, because the sentences that
+   * record the count are themselves matches. That is the S-33 self-match, one entry further in;
+   * "zero assignments" is the half that has survived all three derivations.
+   *
+   * Every test of this branch therefore seeds its state through the owner connection (`BI23`,
+   * `BI34`) or through a double (`BU123`, `BU124`), and **none of them proves production
+   * behaviour**: they prove what this repository does when handed a state that no production
+   * path currently produces. Said as what the grep shows about today's *writers* -- deliberately not
+   * as a claim the status is unreachable, which the fixtures refute.
+   */
+  private async draftInvoiceWriter(
+    tx: TransactionClient,
+    key: Prisma.InvoiceWhereUniqueInput
+  ): Promise<FullTransactionClient["invoice"]> {
+    const existing = await tx.invoice.findUniqueOrThrow({
+      where: key,
+      select: { id: true, status: true }
+    });
+
+    if (existing.status !== BILLING_METERING.INVOICE_STATUS_DRAFT) {
+      throw new InvoiceImmutableError(existing.id, existing.status);
+    }
+
+    return this.invoiceDelegate(tx);
+  }
+
+  /**
    * Marks exactly `usageLineIds` billed, chunked, with one count assertion over the whole set.
    *
    * **Extracted rather than copied** (S-45 slice S3). `createDraftInvoice` and
@@ -404,7 +575,7 @@ export class InvoiceRepository extends TenantScopedRepository {
    * invoice write back with it, which is the property BI10 asserts against a live database.
    */
   private async markUsageLinesBilled(
-    tx: Prisma.TransactionClient,
+    tx: Omit<Prisma.TransactionClient, "invoice">,
     usageLineIds: readonly string[]
   ): Promise<void> {
     const expectedCount = usageLineIds.length;
@@ -442,7 +613,7 @@ export class InvoiceRepository extends TenantScopedRepository {
   async createDraftInvoice(input: CreateDraftInvoiceInput): Promise<DraftInvoiceResult> {
     try {
       const invoiceId = await this.withTenant(async (tx) => {
-        const invoice = await tx.invoice.create({
+        const invoice = await this.invoiceDelegate(tx).create({
           data: {
             ...this.where({}),
             periodStart: input.periodStart,
@@ -574,12 +745,18 @@ export class InvoiceRepository extends TenantScopedRepository {
    * return line items at all. Merging was rejected partly because `"InvoiceLineItem"` has a
    * primary-key index and nothing else, not even one on `invoiceId`.
    *
-   * **`DRAFT`-only mutation is a decision T-048 inherits.** T-048 is the declared invoice
-   * immutability guard (`docs/epics/epic-8-billing-service.md:140`); S-45 pre-commits what
-   * *generate* does with a non-`DRAFT` invoice and nothing else -- no `update` method and no
-   * repository-wide guard. T-048 either adopts this or overrides it deliberately, and it reuses
-   * the code name declared in that same section so the platform ends with one
-   * `INVOICE_IMMUTABLE`.
+   * **`DRAFT`-only mutation was S-45's decision and T-048 adopted it unchanged (D2).** A
+   * non-`DRAFT` invoice refuses the absorption rather than restating an already-issued
+   * document, and the usage stays `billed = false` and re-absorbable -- the revenue is
+   * deferred, not lost. Overriding that would be a product decision about invoice restatement
+   * that nothing in the epics has taken.
+   *
+   * **What T-048 changed here is the shape, not the answer.** The inline `findUniqueOrThrow`
+   * and status check that used to live in this method body moved into `draftInvoiceWriter`,
+   * the seam every write to an existing invoice now passes through, and `tx.invoice`'s write
+   * methods were removed from the type `withTenant` hands this callback. The reroute is
+   * behaviour-preserving: `BI23`, `BU98`, `BU99`, `BU100` and `BU101` were re-read at that
+   * task's S3 and all stayed green.
    */
   async absorbLateUsage(input: AbsorbLateUsageInput): Promise<AbsorbLateUsageResult> {
     const { tenantId } = this.where({});
@@ -592,16 +769,9 @@ export class InvoiceRepository extends TenantScopedRepository {
     };
 
     return this.withTenant(async (tx) => {
-      const existing = await tx.invoice.findUniqueOrThrow({
-        where: periodKey,
-        select: { id: true, status: true }
-      });
+      const writer = await this.draftInvoiceWriter(tx, periodKey);
 
-      if (existing.status !== BILLING_METERING.INVOICE_STATUS_DRAFT) {
-        throw new InvoiceImmutableError(existing.id, existing.status);
-      }
-
-      const invoice = await tx.invoice.update({
+      const invoice = await writer.update({
         where: periodKey,
         data: {
           // A SQL addition on the column -- `SET "totalAmount" = ("totalAmount" + $1)`,

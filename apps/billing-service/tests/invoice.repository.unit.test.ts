@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Prisma } from "@prisma/client";
 import type { PrismaClient } from "@prisma/client";
 import type { TenantId } from "@telemetry/shared-types";
@@ -994,5 +997,443 @@ describe("InvoiceRepository.findDetailById", () => {
     // job, so the repository stays a data accessor and the status lives in one place.
     const missing = createPrismaMock({ detailRow: null });
     await expect(missing.repository.findDetailById(LIST_INVOICE_ID_NEWER)).resolves.toBeNull();
+  });
+});
+
+/**
+ * T-048's seam cases.
+ *
+ * **Two of these five are structural rather than behavioural, and that split is the task.**
+ * The refusal itself shipped with S-45 and is already pinned by `BU100`; what did not exist
+ * was anything stopping the *next* writer from skipping it. `BU125` and `BU126` are the two
+ * that read `src/` off disk, because the property they assert -- "there is one widening" and
+ * "these are all the methods" -- is a property of the file, not of a call.
+ *
+ * Reading the source rather than importing it is the house pattern:
+ * `tests/env.schema.unit.test.ts` reads `.env.example` and `docker-compose.yml` the same way,
+ * and `apps/worker-service/tests/billing-client.service.unit.test.ts` reads this service's
+ * `constants.ts`. Both helpers below **throw** when they cannot locate their subject rather
+ * than counting zero and passing (`.claude/rules/testing.md`).
+ */
+const SRC_DIR_URL = new URL("../src/", import.meta.url);
+const SOURCE_FILE_EXTENSION = ".ts";
+const INVOICE_REPOSITORY_RELATIVE_PATH = "repositories/invoice.repository.ts";
+
+/**
+ * The cast forms `BU125` counts, as patterns rather than as one literal.
+ *
+ * **What this is and what it is not.** A regex census catches the forms it enumerates and
+ * nothing else. Round 1 of T-048's review established that by execution: the previous single
+ * pattern was `as unknown as FullTransactionClient`, and a writer that cast the *delegate*
+ * instead -- `tx.invoice` widened to the full delegate type, which needs no `unknown` hop --
+ * was not matched, compiled clean and left the package at 213/213. The four patterns below are
+ * the cast targets that reach an unnarrowed invoice delegate in the spellings we know how to
+ * write; a fifth spelling (a new alias, a helper that launders the type, a `satisfies` form)
+ * would be missed the same way. This is a tripwire over an enumerated set, not a proof.
+ *
+ * **The laundering form was executed at Gate 4 Round 2, not merely named.** A generic
+ * `reinterpret<T>(value: unknown): T`, applied inside an existing method so that no new class
+ * member appears and no enumerated cast target follows an `as`, typechecked at **0 diagnostics**
+ * with `BU125` and `BU126` both **green**. What reddened was collateral from the behavioural
+ * doubles -- `BU16`/`BU17` with the writer in `tenantExists`, `BU98`/`BU99`/`BU127` with it in
+ * `absorbLateUsage` -- which is a test double failing on a missing mock, not a guard firing. So
+ * the hedge above is measured rather than defensive, and the enumerated list is the reach.
+ *
+ * **Nothing in `src/` may spell any of these phrases in a comment**, or the census counts the
+ * comment and reports a bypass that does not exist -- the self-match S-33 is about. The
+ * docblocks on `invoiceDelegate` and in `known-gaps.md` therefore describe the widening
+ * without writing the tokens in sequence. These declarations live in `tests/`, which the
+ * census does not scan.
+ */
+const WIDENING_PATTERN = /\bas\s+(?:unknown\s+as\s+)?FullTransactionClient\b/g;
+
+const FULL_DELEGATE_CAST_PATTERNS = [
+  WIDENING_PATTERN,
+  /\bas\s+(?:unknown\s+as\s+)?PrismaClient\b/g,
+  /\bas\s+(?:unknown\s+as\s+)?Prisma\.[A-Za-z0-9_]+Delegate\b/g,
+  /\bas\s+(?:unknown\s+as\s+)?any\b/g
+] as const;
+
+/** The census's expected total across every pattern above: the one accessor, once. */
+const EXPECTED_WIDENING_COUNT = 1;
+
+/**
+ * `^  async name(` with any leading access modifiers -- class members at one indent level.
+ *
+ * Widened at Round 2 for the same reason as the cast patterns. The previous form was
+ * `/^ {2}(private )?async ([A-Za-z0-9_]+)\(/gm`, which matched `private` and nothing else, so a
+ * `protected async` member landed in **neither** expected list and both `toEqual`s passed --
+ * a member could be added and disappear rather than redden. Any modifier now matches, and
+ * anything that is not `private` or plain-public lands in a third list asserted empty, so an
+ * unclassified member fails loudly instead of falling out of the census.
+ */
+const ASYNC_MEMBER_PATTERN =
+  /^ {2}((?:private|protected|public|static|readonly|override|abstract)\s+)*async ([A-Za-z0-9_]+)\(/gm;
+
+/**
+ * `^  name = async (` with any leading modifiers -- an async class *property*.
+ *
+ * The method pattern above does not match this shape: there is no `async <name>(` sequence in
+ * `name = async (id) => {}`. Measured rather than reasoned -- adding
+ * `private probeArrowWriter = async (id: string): Promise<string> => { ... }` to the repository
+ * typechecks at 0 errors, is absent from `asyncMembers`, and reddens this assertion with
+ * `expected [ 'private probeArrowWriter = async' ] to deeply equal []`. Asserted absent rather
+ * than classified: this class declares its members as methods.
+ */
+const ASYNC_PROPERTY_PATTERN =
+  /^ {2}(?:(?:private|protected|public|static|readonly|override|abstract)\s+)*[A-Za-z0-9_]+\s*(?::[^=\n]+)?=\s*async\b/gm;
+
+const PRIVATE_MEMBER_MARKER = "private";
+const PUBLIC_MEMBER_MARKER = "public";
+
+const BLOCK_OPEN = "{";
+const BLOCK_CLOSE = "}";
+const PAREN_OPEN = "(";
+const PAREN_CLOSE = ")";
+
+/**
+ * The seven public async methods, in declaration order -- the `InvoiceRepository` class
+ * docblock's property 3. Cited by symbol rather than by line, which is this task's own lesson:
+ * the citation it carried (`:267`) is correct on the tree that ships -- re-checked, it is the
+ * docblock's first text line -- and it moves whenever that file's docblocks grow.
+ *
+ * **Appending a name to this list is an assertion, not a formality. Read this before you do
+ * it.** `BU126` censuses member *names*. When a new public async member is added it goes red
+ * with `expected [Array(7)] to deeply equal [Array(8)]`, and the obvious response -- add the
+ * name here -- makes it green again whether or not the new member is safe. Measured at T-048's
+ * Gate 5: an unguarded `finalizeInvoice` present on the repository, its name on this list,
+ * package **213/213** with lint clean.
+ *
+ * So adding a name asserts that the member has been read against `draftInvoiceWriter`: either
+ * it performs no write to an `Invoice` that already exists, or it obtains its delegate from
+ * that seam, which refuses when the row it read is not `DRAFT` -- see **S-52** for what that
+ * read does and does not settle under concurrency. Recorded as **S-51** in
+ * `.claude/rules/known-gaps.md`, with the measurement and a fix direction; this census is a
+ * notification that the member set changed, not a proof that it is safe.
+ */
+const EXPECTED_PUBLIC_ASYNC_METHODS = [
+  "tenantExists",
+  "findByPeriod",
+  "sumUnbilledByMetricKey",
+  "createDraftInvoice",
+  "absorbLateUsage",
+  "listInvoices",
+  "findDetailById"
+] as const;
+
+/**
+ * The two private async methods after T-048 added the seam, in **declaration order** -- the
+ * seam is declared above the billed-update helper.
+ *
+ * Both lists are order-sensitive on purpose. Order is not the property under test, but a census
+ * that ignored it would also accept a list that had silently gained and lost a member in one
+ * edit, and the cost of the coupling is a one-line change that makes whoever reorders read this
+ * comment.
+ */
+const EXPECTED_PRIVATE_ASYNC_METHODS = ["draftInvoiceWriter", "markUsageLinesBilled"] as const;
+
+/** The private, non-async accessor that holds the one widening. */
+const WIDENING_ACCESSOR_DECLARATION = "private invoiceDelegate(";
+
+/** Parameter names no method here may take (`.claude/rules/tenant-isolation.md`). */
+const FORBIDDEN_PARAMETER_NAMES = ["invoiceId", "tenantId"] as const;
+
+interface SourceFile {
+  readonly path: string;
+  readonly text: string;
+}
+
+/**
+ * Every `.ts` file under `apps/billing-service/src`, or a throw.
+ *
+ * An empty read is the failure this guards: a census over zero files reports zero widenings
+ * and would satisfy a `not.toBeGreaterThan` while measuring nothing.
+ */
+const readSourceTree = (): SourceFile[] => {
+  const root = fileURLToPath(SRC_DIR_URL);
+  const walk = (current: string): string[] =>
+    readdirSync(current, { withFileTypes: true }).flatMap((entry) => {
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) {
+        return walk(full);
+      }
+      return entry.isFile() && full.endsWith(SOURCE_FILE_EXTENSION) ? [full] : [];
+    });
+
+  const files = walk(root);
+  if (files.length === 0) {
+    throw new Error(`Expected TypeScript sources under ${root}`);
+  }
+  return files.map((full) => ({ path: relative(root, full), text: readFileSync(full, "utf8") }));
+};
+
+/** The text of one source file by its path relative to `src/`, or a throw. */
+const readSourceFile = (relativePath: string): string => {
+  const file = readSourceTree().find((candidate) => candidate.path === relativePath);
+  if (file === undefined) {
+    throw new Error(`Expected ${relativePath} to exist under src/`);
+  }
+  return file.text;
+};
+
+/**
+ * The balanced slice that follows `declaration`, opened by `open` and closed by `close`.
+ *
+ * Throws on a missing declaration and on an unbalanced slice, so a renamed member fails loudly
+ * instead of yielding an empty string that every downstream assertion would be happy with.
+ */
+const balancedSliceAfter = (
+  source: string,
+  declaration: string,
+  open: string,
+  close: string
+): string => {
+  const start = source.indexOf(declaration);
+  if (start === -1) {
+    throw new Error(`Expected to find ${declaration} in ${INVOICE_REPOSITORY_RELATIVE_PATH}`);
+  }
+  const from = source.indexOf(open, start);
+  if (from === -1) {
+    throw new Error(`Expected a ${open} after ${declaration}`);
+  }
+
+  let depth = 0;
+  for (let index = from; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === open) {
+      depth += 1;
+    } else if (character === close) {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(from, index + 1);
+      }
+    }
+  }
+  throw new Error(`Unbalanced ${open}${close} after ${declaration}`);
+};
+
+interface AsyncMember {
+  readonly name: string;
+  /** The declared access modifiers, whitespace-collapsed; `""` for a plain public member. */
+  readonly modifiers: string;
+  readonly parameters: string;
+}
+
+/**
+ * Every `async` member of the repository class with its modifiers and parameter list, or a
+ * throw.
+ *
+ * The modifiers are carried as text rather than reduced to `isPrivate`, so that a member the
+ * census has no expected list for (`protected`, `static`, an `override`) can be *reported*
+ * rather than silently dropped. Reducing to a boolean is what let a `protected async` writer
+ * pass both `toEqual`s in Round 1.
+ */
+const asyncMembers = (source: string): AsyncMember[] => {
+  const members = [...source.matchAll(ASYNC_MEMBER_PATTERN)].map((match) => {
+    const name = match[2];
+    if (name === undefined) {
+      throw new Error(`Failed to read a method name out of ${match[0]}`);
+    }
+    return {
+      name,
+      modifiers: (match[1] ?? "").trim().split(/\s+/).filter(Boolean).join(" "),
+      parameters: balancedSliceAfter(source, match[0], PAREN_OPEN, PAREN_CLOSE)
+    };
+  });
+
+  if (members.length === 0) {
+    throw new Error(`Expected async members in ${INVOICE_REPOSITORY_RELATIVE_PATH}`);
+  }
+  return members;
+};
+
+/** `"private"` / `""` (plain public) / `"public"` are classified; everything else is reported. */
+const isClassifiedPrivate = (member: AsyncMember): boolean =>
+  member.modifiers === PRIVATE_MEMBER_MARKER;
+const isClassifiedPublic = (member: AsyncMember): boolean =>
+  member.modifiers === "" || member.modifiers === PUBLIC_MEMBER_MARKER;
+
+describe("InvoiceRepository invoice-write seam (T-048)", () => {
+  it("BU123 - the seam refuses a FINALIZED invoice before any write, judging the row it read", async () => {
+    // **This case does not prove production behaviour.** Within `src/` and `prisma/` -- the
+    // scope of the grep this claim rests on, which never reads `tests/` -- `createDraftInvoice`
+    // writes the `DRAFT` constant and no other statement sets `Invoice.status`. `tests/` does
+    // set it: six times, all through `integration.fixtures.ts`'s `seedInvoices` on the owner
+    // connection, and once more two lines below this comment, where the double is handed a
+    // non-draft status. So the state exists here only because the double is handed it -- same
+    // caveat as `BI23`'s owner-connection fixture. An earlier revision of this comment said
+    // "Nothing on the platform writes a non-`DRAFT` status ... the only statement that sets
+    // `Invoice.status` at all", which the six seeds and the line below both refute (T-048 Gate 6,
+    // MEDIUM-1). That is Gate 4 Round 2's MEDIUM-3 in its "at all" spelling, which is why a
+    // sweep for the word "anywhere" did not reach it: sweep the property, not the phrase.
+    //
+    // Distinct from `BU100`, which asserts the same refusal from the caller's side. What is
+    // added here is *what the seam judged*: the row it read, addressed by the compound unique
+    // carrying the bound tenant, selecting exactly the two columns the decision needs. A seam
+    // that trusted a value from `input` rather than from the database would satisfy `BU100`
+    // and fail this.
+    const mock = createPrismaMock({
+      invoiceForAbsorb: { id: INVOICE_ID, status: InvoiceStatus.FINALIZED }
+    });
+
+    const error = await mock.repository
+      .absorbLateUsage(absorbInput())
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(InvoiceImmutableError);
+    expect((error as InvoiceImmutableError).code).toBe(BILLING_RESPONSES.CODE_INVOICE_IMMUTABLE);
+    expect((error as InvoiceImmutableError).currentStatus).toBe(InvoiceStatus.FINALIZED);
+    expect((error as InvoiceImmutableError).invoiceId).toBe(INVOICE_ID);
+
+    const read = firstArg(mock.invoiceFindUniqueOrThrow, "invoice.findUniqueOrThrow");
+    expect(read.where).toEqual({
+      tenantId_periodStart_periodEnd: {
+        tenantId: TENANT_ID,
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END
+      }
+    });
+    expect(read.select).toEqual({ id: true, status: true });
+    expect(JSON.stringify(read)).not.toContain(OTHER_TENANT_ID);
+
+    // The guard runs inside the transaction, after the RLS context statement, and no write
+    // reaches any delegate: not the invoice, not the line items, not the billed flags.
+    expect(mock.transaction).toHaveBeenCalledTimes(1);
+    expect(String(mock.queryRaw.mock.calls[0]?.[0])).toContain(TENANT_SETTING_NAME);
+    expect(mock.invoiceUpdate).not.toHaveBeenCalled();
+    expect(mock.invoiceCreate).not.toHaveBeenCalled();
+    expect(mock.usageLineUpdateMany).not.toHaveBeenCalled();
+    expect(mock.invoiceLineItemCreate).not.toHaveBeenCalled();
+  });
+
+  it("BU124 - the seam refuses PAID too, and the schema declares no third non-DRAFT status", async () => {
+    // The epic names **both** `FINALIZED` and `PAID`; only `FINALIZED` had ever been tested,
+    // at any layer. Owner-connection caveat as `BU123`: nothing writes `PAID` either.
+    const mock = createPrismaMock({
+      invoiceForAbsorb: { id: INVOICE_ID, status: InvoiceStatus.PAID }
+    });
+
+    const error = await mock.repository
+      .absorbLateUsage(absorbInput())
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(InvoiceImmutableError);
+    expect((error as InvoiceImmutableError).code).toBe(BILLING_RESPONSES.CODE_INVOICE_IMMUTABLE);
+    expect((error as InvoiceImmutableError).currentStatus).toBe(InvoiceStatus.PAID);
+    expect((error as InvoiceImmutableError).message).toContain(InvoiceStatus.PAID);
+    expect(mock.invoiceUpdate).not.toHaveBeenCalled();
+    expect(mock.usageLineUpdateMany).not.toHaveBeenCalled();
+    expect(mock.invoiceLineItemCreate).not.toHaveBeenCalled();
+
+    // The seam compares against `DRAFT` rather than enumerating the statuses it refuses, so a
+    // fourth enum member would be guarded automatically. This census is what makes that
+    // claim checkable instead of asserted: it names the non-`DRAFT` set the schema declares
+    // today, and goes red when a migration adds to it -- at which point whoever added it
+    // reads this comment and confirms the new state belongs on the refused side.
+    const nonDraftStatuses = Object.values(InvoiceStatus)
+      .filter((status) => status !== BILLING_METERING.INVOICE_STATUS_DRAFT)
+      .sort();
+    expect(nonDraftStatuses).toEqual([InvoiceStatus.FINALIZED, InvoiceStatus.PAID].sort());
+  });
+
+  it("BU125 - every enumerated cast that reaches an unnarrowed invoice delegate occurs exactly once in src, inside invoiceDelegate", async () => {
+    // **The control that makes a deliberate bypass visible, and the honest limit of T-048.**
+    // A bare `tx.invoice.update` outside the seam is a compile error (`TS2339`, measured); a
+    // writer that widens `tx` back to the full client compiles clean. Nothing here claims the
+    // bypass is impossible, and nothing here claims the census is complete -- it counts the
+    // cast forms `FULL_DELEGATE_CAST_PATTERNS` enumerates and no others.
+    //
+    // Round 1 of the review measured what the previous single pattern was worth: a writer
+    // casting the *delegate* rather than the client -- no `unknown` hop -- passed typecheck,
+    // lint and 213/213. Widening to the four targets below is what turns that writer red.
+    const sources = readSourceTree();
+    const occurrences = sources.flatMap((file) =>
+      FULL_DELEGATE_CAST_PATTERNS.flatMap((pattern) =>
+        [...file.text.matchAll(pattern)].map(() => file.path)
+      )
+    );
+
+    expect(occurrences).toEqual([INVOICE_REPOSITORY_RELATIVE_PATH]);
+    expect(occurrences).toHaveLength(EXPECTED_WIDENING_COUNT);
+
+    // And it is inside the accessor, not merely somewhere in that file: a second writer that
+    // widened in its own body would keep the count at one only by deleting this one.
+    const repositorySource = readSourceFile(INVOICE_REPOSITORY_RELATIVE_PATH);
+    const accessorBody = balancedSliceAfter(
+      repositorySource,
+      WIDENING_ACCESSOR_DECLARATION,
+      BLOCK_OPEN,
+      BLOCK_CLOSE
+    );
+    expect(accessorBody).toMatch(WIDENING_PATTERN);
+  });
+
+  it("BU126 - the async member census: seven public, two private, no member under any other modifier, and none takes an invoiceId or tenantId", async () => {
+    // Converts the class docblock's prose census into an assertion. The prose predicted its own
+    // failure mode and was right: the planning probe added an eighth public method and nothing
+    // went red, because the claim lived in a comment (S-33).
+    const source = readSourceFile(INVOICE_REPOSITORY_RELATIVE_PATH);
+    const members = asyncMembers(source);
+
+    expect(members.filter(isClassifiedPublic).map((member) => member.name)).toEqual([
+      ...EXPECTED_PUBLIC_ASYNC_METHODS
+    ]);
+    expect(members.filter(isClassifiedPrivate).map((member) => member.name)).toEqual([
+      ...EXPECTED_PRIVATE_ASYNC_METHODS
+    ]);
+
+    // **A member that matches neither branch must fail here rather than fall out of both
+    // lists.** That silent exclusion is half of Round 1's HIGH-1: the old pattern saw only
+    // `private`, so a `protected async` writer was absent from the public list *and* from the
+    // private list, and both `toEqual`s above passed with it in the file. Reported with the
+    // modifier text so the failure names what was added.
+    expect(
+      members
+        .filter((member) => !isClassifiedPublic(member) && !isClassifiedPrivate(member))
+        .map((member) => `${member.modifiers} async ${member.name}`)
+    ).toEqual([]);
+
+    // The method pattern does not match an async class *property* (`name = async () => {}`),
+    // which is a second shape a writer could take. Measured: an added
+    // `private probeArrowWriter = async (...) => {...}` typechecks clean, is absent from
+    // `asyncMembers`, and reddens exactly this assertion.
+    expect([...source.matchAll(ASYNC_PROPERTY_PATTERN)].map((match) => match[0].trim())).toEqual(
+      []
+    );
+
+    // Property 3 of the class docblock: no method takes a bare `invoiceId`, and none takes a
+    // caller-supplied tenant. Checked against the parsed parameter list of every one of them,
+    // so a new method with either parameter reddens this rather than being caught by review.
+    for (const member of members) {
+      for (const forbidden of FORBIDDEN_PARAMETER_NAMES) {
+        expect(member.parameters, `${member.name} must not take ${forbidden}`).not.toContain(
+          forbidden
+        );
+      }
+    }
+
+    // The widening accessor is deliberately **not** async and so is absent from every list
+    // above; it is asserted here so the census covers the whole seam.
+    expect(source).toContain(WIDENING_ACCESSOR_DECLARATION);
+  });
+
+  it("BU127 - a DRAFT invoice is not over-refused: the seam reads, then returns the writer, and update runs", async () => {
+    // The negative-path sibling of `BU123`. A seam that refused everything would satisfy
+    // `BU123`, `BU124` and `BU100` and break every absorption; what it could not satisfy is
+    // the write happening, *after* the read, on the same transaction client.
+    const mock = createPrismaMock();
+
+    const result = await mock.repository.absorbLateUsage(absorbInput());
+
+    expect(result.invoiceId).toBe(INVOICE_ID);
+    expect(mock.invoiceFindUniqueOrThrow).toHaveBeenCalledTimes(1);
+    expect(mock.invoiceUpdate).toHaveBeenCalledTimes(1);
+
+    const readOrder = mock.invoiceFindUniqueOrThrow.mock.invocationCallOrder[0];
+    const writeOrder = mock.invoiceUpdate.mock.invocationCallOrder[0];
+    if (readOrder === undefined || writeOrder === undefined) {
+      throw new Error("Expected both the seam read and the invoice update to have been called");
+    }
+    expect(readOrder).toBeLessThan(writeOrder);
   });
 });

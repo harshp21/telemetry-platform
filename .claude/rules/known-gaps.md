@@ -471,11 +471,35 @@ behaviour inside a usage-service correctness fix breaks the one-task-per-commit 
 
 Observed with `md5sum` and `diff`:
 
-- `analytics`, `billing` and `worker` are **byte-identical** (`13a533a2e2c2dcc1ff9db28fb5c7a1fd`,
-  111 lines each).
-- `auth` differs from those three in comments only — `diff` filtered to non-comment lines is
-  empty. It is 118 lines because of a doc paragraph about `UserRepository` not extending the
-  class.
+- `analytics` and `worker` are **byte-identical** (`13a533a2e2c2dcc1ff9db28fb5c7a1fd`, 111 lines
+  each). **`billing` was a third member of that set until T-048 and is not any more** — it is now
+  its own variant, materially longer. **No digest is quoted here on purpose**: re-run
+  `md5sum apps/*/src/repositories/base.repository.ts` and `wc -l`, because any recorded value is
+  falsified by the next edit to that file — including edits inside the task that records it.
+  It moved three times inside T-048 alone: T-048's
+  first pass gave `d11a7dc0cacce7a3e07e539e7f3ceb1f` / 174 lines, and the Gate-4 rework added the
+  `InvoiceReadMethod` union, the `InvoiceDelegateSurfaceCensus` type-level assertion and the
+  corrected claim paragraphs. Re-run the two commands rather than trusting either number.
+- **`billing` is a fourth variant, deliberately** (T-048). Its `TransactionClient` is no longer
+  the plain `Omit` over `PrismaClient`: it is re-expressed as
+  `Omit<FullTransactionClient, "invoice"> & { invoice: Omit<FullTransactionClient["invoice"],
+  InvoiceWriteMethod> }`, so the nine write methods are removed from the `invoice` delegate that
+  `withTenant` hands its callback, and `FullTransactionClient` is exported so `InvoiceRepository`
+  can widen back in exactly one accessor. The reason is S-48's hole — a second writer taking a
+  bare `invoiceId` and issuing `tx.invoice.update` passed typecheck, lint and 207/207 — and the
+  measured effect is that the naive bypass is now `TS2339`. Since the Gate-4 rework it also holds
+  `InvoiceDelegateSurfaceCensus`, a type-level equality between the `invoice` delegate's string
+  keys and `InvoiceWriteMethod | InvoiceReadMethod`, which fails `tsc` if a Prisma upgrade changes
+  the delegate's member list — 18 members at 6.19.3, nine of them writers. **The other four copies
+  were left alone deliberately**, on the same one-task-per-commit ground this entry was filed for: reaching
+  into four other services' transaction types inside a billing guard is the move this gap exists
+  to describe. T-048 took the **delegate-level** form and not S-48's wholesale `| "invoice"`,
+  because that shape gives 11 errors on this file — 7 × `TS2339`, of which **five are legitimate
+  reads** and two are the writers. See S-48 for the measurement and for what the narrowing does
+  **not** reach.
+- `auth` differs from `analytics` and `worker` in comments only — `diff` filtered to non-comment
+  lines is empty. It is 118 lines because of a doc paragraph about `UserRepository` not extending
+  the class.
 - `usage` is the outlier at 124 lines: S-18 added
   `set_config('TimeZone', 'UTC', true)` to its `withTenant`, and moved its two setting names
   onto `DATABASE_SESSION_SETTINGS` constants. `grep -c TIME_ZONE` → `1` for usage-service, `0`
@@ -493,16 +517,25 @@ inside each base file's own docstring):
 | Subclass | Base copy | `TimeZone` pin | Added by |
 |---|---|---|---|
 | `apps/usage-service/src/repositories/usage.repository.ts:150` | usage | **yes** | S-18 era |
-| `apps/worker-service/src/repositories/event.repository.ts:64` | worker | no | T-040 |
+| `apps/worker-service/src/repositories/event.repository.ts:73` | worker | no | T-040 |
 | `apps/billing-service/src/repositories/meter.repository.ts:35` | billing | no | T-045 |
-| `apps/billing-service/src/repositories/invoice.repository.ts:94` | billing | no | T-045 |
+| `apps/billing-service/src/repositories/invoice.repository.ts` — `export class InvoiceRepository` | billing | no | T-045 |
 
-Line numbers are as of the T-045 tree and re-derived from
+**No row was added by T-048** — it changed billing's base copy, not the set of subclasses.
+Every row is re-derived from
 `grep -rn "extends TenantScopedRepository" apps/*/src`, filtered to lines beginning
-`export class` — the unfiltered grep also returns five docstring examples. They have already
-rotted once: the `invoice.repository.ts` citation was written at `:87`, was `:92` by the time
-Gate 4 measured it, and is `:94` on the tree that shipped, because the fix for that review moved
-it. Re-run the grep rather than trusting the column.
+`export class` — the unfiltered grep also returns five docstring examples. Three rows carry a
+line number and were confirmed exact at T-048's Gate-4 Round 2. The fourth **deliberately does
+not**, and cites `export class InvoiceRepository` instead: that one citation has rotted in six
+recorded positions for a declaration nobody moved — `:87` when written, `:92` by the time
+T-045's Gate 4 measured it, `:94` shipped, `:333` after T-047's detail read, `:351` after
+T-048's Gate-3 rework rewrote the seam docblocks, and `:355` at T-048's Gate-4 Round 2, which
+found **all eight** of that file's citations in this file stale by exactly +4 and traced it to a
+44-line hunk the same round had added above them (`git diff -U0`, hunk header `@@ -301,0 +307,44
+@@`). The +4 was re-derived a second time at the rework that replaced them. Six numbers, one
+`export class` nobody moved. `event.repository.ts` went `:64` → `:73` over the same span and was
+measured exact at Gate-4 Round 2, so it keeps its line number. Re-run the grep rather than
+trusting the column.
 
 **T-042 adds a query that the obvious fix would not reach, and it is in worker-service.**
 `apps/worker-service/src/repositories/billing-enumeration.repository.ts` issues a `$queryRaw`
@@ -559,8 +592,12 @@ places:
   (`DATABASE_SESSION_SETTINGS.TENANT_ID`), `apps/auth-service/src/constants.ts:69`
   (`AUTH_DATABASE.TENANT_CONTEXT_SETTING`) and, added by T-042,
   `apps/worker-service/src/constants.ts:919` (`WORKER_DATABASE.TENANT_CONTEXT_SETTING`);
-- **four hard-coded literals inside `set_config`**, at `analytics`/`billing`/`worker`
-  `base.repository.ts:98` and `auth` `base.repository.ts:105`.
+- **four hard-coded literals inside `set_config`**, at `analytics`/`worker`
+  `base.repository.ts:98`, `billing` `base.repository.ts:249` (it was `:98` with the other two
+  until T-048 grew that file's type declarations and docblocks; re-derived at T-048's Gate-3
+  Round 2 with `grep -n "set_config" apps/*/src/repositories/base.repository.ts`, which also
+  returns docblock prose — filter to the `tx.$queryRaw` line) and `auth`
+  `base.repository.ts:105`.
 
 The count was **six** (two named constants) until T-042, whose diff edited this entry without
 re-deriving it — S-33's shape again, corrected at that task's Gate-4 review (MEDIUM-7).
@@ -569,9 +606,13 @@ usage-service's constant is at `:75`, not the `:74` this paragraph carried.
 **So worker-service now holds a constant and a literal for the same setting inside one package**,
 which `.claude/rules/constants.md` names explicitly. T-042 decided **not** to point
 `apps/worker-service/src/repositories/base.repository.ts:98` at its own new constant, and the
-reason is this entry: `md5sum apps/*/src/repositories/base.repository.ts` shows `analytics`,
-`billing` and `worker` still byte-identical (`13a533a2e2c2dcc1ff9db28fb5c7a1fd`), and that identity
-is the evidence this entry rests on. Editing one of the three to reference a service-local
+reason is this entry: `md5sum apps/*/src/repositories/base.repository.ts` shows `analytics`
+and `worker` still byte-identical (`13a533a2e2c2dcc1ff9db28fb5c7a1fd`), and that identity is the
+evidence this entry rests on. **`billing` left that set at T-048** — see the first bullet of
+this entry, which carries the command rather than a digest; this
+paragraph was written at T-042, when the set had three members, and said so until T-048's Gate-6
+review found it (HIGH-1) after the same task had corrected the first bullet and not this one.
+Editing either of the two to reference a service-local
 constant would create a fifth distinct variant of a five-copy class whose whole gap is drift, from
 inside a task told not to open S-19. The constant exists because the *tests* and the enumeration
 repository need to name the setting; the literal stays until the shared-package fix moves all
@@ -811,9 +852,19 @@ a third strictness.
 
 `CLAUDE.md` designates this directory authoritative and instructs agents to trust it *without
 re-verification*. That instruction is only safe if the copy an agent sees is the copy on disk.
-Four times now it has not been.
+Repeatedly it has not been.
 
-**Observed, both times by a review agent that then went and read the files with `cat`:**
+**The count in this entry does not reconcile, and is left as what can be listed rather than
+guessed.** The title says "twice", an earlier revision of this sentence said "Four times now"
+while listing **three** bullets, and T-048's rework added a fourth. Which sighting the missing
+fourth was is not recoverable from the text, so the durable claim is: **the bullets below are the
+recorded sightings** -- four bullets, five occurrences, because the last one records the same
+mismatch seen twice on one task in two different sessions. The numerals in the title and in the
+earlier body sentence are not evidence for any other count. Whoever fixes the mechanism should
+renumber this once, from the bullets.
+
+**Observed by agents who then went and read the files with `cat` — two reviewers and two
+implementers:**
 
 - At T-038's Gate-4 review: the injected `.claude/rules/*` were pre-`1b872b3` — a `testing.md`
   still carrying the integration-exclusion wording that `1b872b3` had already fixed, a
@@ -830,10 +881,17 @@ Four times now it has not been.
   "How this bites" paragraph below predicts, reached from the *writing* side rather than the
   reading side. It was avoided only because the working practice below was followed and the file
   was `cat`-ed first. The entry became S-42.
+- At T-048's Gate 3 Round 2 (implementation): the injected `known-gaps.md` ended at **S-39**,
+  while the file on disk ran to **S-50** — 3 176 lines, md5 `5d389f806dc78d99ebf1a7b263cd656a`,
+  `grep -n "^## S-"` putting S-50 at `:3111`. So the injected copy could not see S-46, S-47,
+  S-48 or S-50, and the rework's whole subject was **editing S-48 and S-50**. The Gate-4 review
+  of the same task, in a different session, reported the identical mismatch. Both were caught by
+  `cat`-ing the file first, which is the working practice below and is still the only thing
+  catching it.
 
-**What is *not* established:** the mechanism. Neither review investigated whether this is
-snapshot timing, caching, or something else, and nothing here reproduces it on demand — both
-sightings are after-the-fact observations by agents who noticed a mismatch, not a controlled
+**What is *not* established:** the mechanism. No session has investigated whether this is
+snapshot timing, caching, or something else, and nothing here reproduces it on demand — every
+sighting is an after-the-fact observation by an agent who noticed a mismatch, not a controlled
 probe. Do not restate the cause as known. The *consequence* is what is measured: an agent can
 cite `.claude/rules/` accurately and still be citing a superseded revision.
 
@@ -854,7 +912,7 @@ renumbering something, which every citation of it then points at wrongly.
 text. Reviews that quote these files should say which revision they read, as T-038's Gate-4
 review did. Cheap, and it is what caught both sightings.
 
-**Fix direction:** establish the mechanism before attempting a fix — the four sightings are the
+**Fix direction:** establish the mechanism before attempting a fix — the listed sightings are the
 whole evidence base, and a fix aimed at the wrong layer would be unfalsifiable. If it turns out
 to be unfixable from inside the repository, say so here and keep the working practice above.
 
@@ -1773,8 +1831,13 @@ excluding `dist/` returns three lines — the declaration plus an import and a u
 because it is the obvious home for one bounded declaration, not because it is live.
 
 The unbounded value is then multiplied into an offset:
-`apps/billing-service/src/repositories/invoice.repository.ts:388` —
-`skip: (query.page - 1) * query.pageSize` — and
+`skip: (query.page - 1) * query.pageSize` in `listInvoices`
+(`apps/billing-service/src/repositories/invoice.repository.ts`, located with
+`grep -n "skip: (query.page - 1) \* query.pageSize"`). **That citation carries no line number on
+purpose.** It read `:388`, then `:806` after T-048's Gate-3 Round 2 re-derived it; the grep
+answered `:810` at T-048's Gate-4 Round 2, and at `a87d952` the statement was at `:658`. Four
+numbers for one expression nobody moved — and this entry already said "cite it by the `skip:`
+expression, not by line" and then cited it by line anyway. Also —
 `apps/usage-service/src/repositories/usage.repository.ts:154` —
 `const offset = (input.page - 1) * input.pageSize;` — bound into
 `LIMIT ${input.pageSize} OFFSET ${offset}` at `:162`.
@@ -2832,7 +2895,7 @@ exec tsc --noEmit -p tsconfig.json` against the shipped tree (billing's `tsconfi
 |---|---|---|
 | A | `await tx.invoiceLineItem.findMany({ where: { invoiceId: id } })` inserted at the top of `findDetailById`'s `withTenant` callback | **compiles clean** — the convention is not mechanical today |
 | B | A, plus `\| "invoiceLineItem"` added to `TransactionClient`'s `Omit` (`apps/billing-service/src/repositories/base.repository.ts`, the `type TransactionClient = Omit<PrismaClient, …>` declaration) | `error TS2339: Property 'invoiceLineItem' does not exist on type 'TransactionClient'` **on the step-A call itself**, inside `findDetailById`, **plus** `TS2345` at both `markUsageLinesBilled(tx, …)` call sites |
-| C | B, plus `markUsageLinesBilled`'s parameter (`invoice.repository.ts:407`) narrowed to `Omit<Prisma.TransactionClient, "invoiceLineItem">` | both `TS2345` clear; **only** the intended `TS2339` remains |
+| C | B, plus the `tx` parameter of `markUsageLinesBilled` (`invoice.repository.ts`; `grep -n "markUsageLinesBilled"` finds the declaration — **no line number, by the entry's own advice**: it read `:407` when this row was written, `:555` after T-048's Gate-3 Round 2, and `:559` at that task's Gate-4 Round 2, three positions for a declaration nobody moved) narrowed to `Omit<Prisma.TransactionClient, "invoiceLineItem">` | both `TS2345` clear; **only** the intended `TS2339` remains |
 | D | C with the step-A re-route removed — i.e. the two narrowings alone | typecheck clean, `Tests 207 passed (207)` |
 
 **Cite this one by method and symbol, not by `file(line,col)`.** The `TS2339`'s reported position
@@ -2882,8 +2945,147 @@ would need the excluded-model set as a type parameter (or each service aliasing 
 `TransactionClient`), which is a larger decision than the two lines measured above and is exactly
 why it belongs in the unification task rather than here.
 
+### T-048 took this proposal — for the `invoice` delegate only, and the entry stays open
+
+**What was taken.** T-048 applied the narrowing to `apps/billing-service/src/repositories/
+base.repository.ts`, for the **`invoice`** delegate, in a **delegate-level** form rather than the
+wholesale `Omit` this entry proposes:
+
+```ts
+export type TransactionClient = Omit<FullTransactionClient, "invoice"> & {
+	invoice: Omit<FullTransactionClient["invoice"], InvoiceWriteMethod>;
+};
+```
+
+**The two-line figure did not transfer, and that is measured, not argued.** Nothing reads
+`tx.invoiceLineItem`, which is why a wholesale `| "invoiceLineItem"` works there. `tx.invoice` is
+read by five methods. Step A of T-048's Gate-3 progression applied this entry's shape verbatim —
+`| "invoice"` added to the `Omit` — and the same command this entry uses
+(`pnpm --filter @telemetry/billing-service exec tsc --noEmit -p tsconfig.json`, whole package)
+returned **11 errors**: 7 × `TS2339`, of which **five are legitimate reads** (`findUnique :336`,
+`findUniqueOrThrow :595`, `findMany :654`, `count :662`, `findFirst :740`, all pre-seam line
+numbers) and two are the writers, plus 2 × `TS2345` and 2 × `TS7006`. The delegate-level form
+plus the `markUsageLinesBilled` parameter narrowing this entry's step C already describes gives
+**exactly 2** errors — the two writers — and **0** once they are rerouted through the seam, with
+`Tests 213 passed (213)`.
+
+An earlier revision of this paragraph, inherited from T-048's plan, said "7 × `TS2339` on
+legitimate reads". That is an overcount of two: the 7 is the whole `TS2339` set. Corrected here
+from the transcript.
+
+**Why the entry stays open.** Three things are unchanged:
+
+- **Step E reproduces for this delegate.** With the full narrowing in place,
+  `this.prisma.invoice.update({ where: { id }, data: { … } })` inside a repository method added
+  **zero** diagnostics. `this.prisma` is still a full `PrismaClient` and still runs outside the
+  transaction with no `set_config('app.tenant_id', …)` issued at all — and that is the route
+  `docs/epics/epic-8-billing-service.md` § *T-048*'s own snippet writes. State the property as
+  "a `tx.invoice` write outside the seam becomes `TS2339`", never as "the unguarded write becomes
+  unrepresentable".
+- **The `invoiceLineItem` half is untouched.** `tx.invoiceLineItem` is still reachable and
+  `BU109` is still the whole control on it. Steps A–D above stand as written.
+- **The other four copies of `base.repository.ts` are untouched**, so this is still a decision
+  taken in one service that ought to be taken once for all five. S-19 now records billing as a
+  fourth variant with the new digest.
+
+**What stands behind the property now, and what a regex census is worth.** `BU125`
+(`apps/billing-service/tests/invoice.repository.unit.test.ts`) asserts that the cast forms it
+**enumerates** occur exactly once across `apps/billing-service/src`, inside
+`InvoiceRepository.invoiceDelegate`; `BU126` asserts the async-member census, the modifier of
+every member, and that no member takes an `invoiceId` or `tenantId` parameter. Both go red under
+the deliberate-bypass mutation (a third writer casting `tx` back) against
+`tests/invoice.repository.unit.test.ts` alone **and** the whole package suite —
+`Tests 2 failed | 211 passed (213)` for the package. The mutation **typechecks clean**, which is
+the point: the cast compiles, and the census is what makes it visible.
+
+**State that at the strength it holds: a census catches the forms it enumerates and nothing
+else.** T-048's Gate-4 review refuted the first version of this paragraph by execution. `BU125`
+then matched one spelling, `as unknown as FullTransactionClient`, and `BU126`'s member pattern
+recognised `private` and no other modifier, so this writer —
+
+```ts
+protected async probeFinalizeEvasive(id: string): Promise<string> {
+	return this.withTenant(async (tx) => {
+		const row = await (/* tx.invoice widened to the full delegate type */).update({
+			where: { id }, data: { status: "FINALIZED", finalizedAt: new Date() }, select: { id: true }
+		});
+		return row.id;
+	});
+}
+```
+
+passed typecheck (0 errors), lint (0 findings) and the whole package (**213 passed (213)**), while
+writing the exact state the guard exists to forbid. Two independent holes composed: a
+*delegate*-level cast needs no `unknown` hop and was unmatched, and a `protected` member landed in
+**neither** expected list, so both `toEqual`s passed with it in the file.
+
+Both were widened at Gate 3 Round 2 and the same writer was re-run: red in the single file
+(`Tests 2 failed | 35 passed (37)`), red in the package (`Tests 2 failed | 211 passed (213)`), and
+red **independently** — `vitest -t BU125` and `vitest -t BU126` each give `1 failed | 36 skipped`,
+so neither depends on the other. `BU125` now enumerates four cast targets (`FullTransactionClient`,
+`PrismaClient`, `Prisma.<Model>Delegate`, `any`, each with an optional `unknown` hop) and `BU126`
+classifies by modifier text with a third list, asserted empty, for anything that is neither
+`private` nor plain-public, plus an assertion that no `async` class *property* exists. A fifth cast
+spelling, or a member shape neither pattern describes, is still missed. Do not restate this as
+"every bypass is caught".
+
+**One of the named-but-unmeasured forms has now been measured, and it walks past both censuses.**
+At Gate 4 Round 2 a generic `reinterpret<T>(value: unknown): T` — the "helper that launders the
+type" the test docblock already listed — was used inside an *existing* method, so no new class
+member appears and no enumerated cast target follows an `as`: **0 diagnostics, 0 lint findings,
+`BU125` green, `BU126` green**. What reddened was collateral from the behavioural doubles
+(`BU16`/`BU17` with the writer in `tenantExists`, `BU98`/`BU99`/`BU127` in `absorbLateUsage`) —
+a double failing on a missing mock, not a guard firing. This **confirms** the hedge rather than
+refuting it; it is recorded so the next reviewer need not re-derive it, and so that "a fifth
+spelling would be missed" is a measurement and not a disclaimer.
+
+Note `BU125` matches on the casts' text, so **nothing in `src/` may spell those phrases in a
+comment** or the census counts the comment (the S-33 self-match); the docblocks describe them
+instead of quoting them.
+
+**What no source census can reach: two further routes, both measured at the same review.** Filed
+here rather than under a new id, on the reviewer's recommendation, because this entry is already
+about exactly this property.
+
+| Route | Measured | What sees it |
+|---|---|---|
+| The `prisma` **module singleton**, imported from any layer (`src/lib/prisma`, re-exported at `src/config/container.ts:5`, `:23`) | A free `probeServiceLayerFinalize` in `src/services/billing.service.ts` doing `prisma.invoice.update({ where: { id }, data: { status: "FINALIZED", … } })`: **0 diagnostics**, census file **37/37**, package **213/213** | Nothing. It needs no cast and touches no repository |
+| `tx.$executeRaw` **inside** `withTenant` | `` tx.$executeRaw`UPDATE "Invoice" SET "status" = 'FINALIZED' WHERE "id" = ${id}` ``: **0 diagnostics** both as a new private method and inserted into `absorbLateUsage`'s existing body | `BU126` only if it arrives as a *new member*. Inside an existing method it is invisible to both censuses — the unit failures that variant produces are `TypeError: tx.$executeRaw is not a function` from the test double, not a guard. **The count depends on where inside the method it goes, so it is stated with its placement**: **7** (`BU98`, `BU99`, `BU100`, `BU101`, `BU123`, `BU124`, `BU127`) as the first statement of the `withTenant` callback, **4** (`BU98`, `BU99`, `BU101`, `BU127`) immediately after the seam call. Both at 0 diagnostics, both with `BU125` and `BU126` green |
+
+`FullTransactionClient`'s `Omit` removes six `$`-methods and leaves **four**, enumerated from the
+type itself with `ts.createProgram` + `checker.getPropertiesOfType` rather than read off the
+`Omit`: `$executeRaw`, `$executeRawUnsafe`, `$queryRaw`, `$queryRawUnsafe`. The raw route is inside
+the transaction, so the RLS context statement has already run, and **the tenant policy does bound
+the raw `UPDATE` — executed, not read off the policy text**. Two tenants and two `DRAFT` invoices
+seeded through `DIRECT_DATABASE_URL`, then one `psql` session as `telemetry_app` with
+`rolsuper = false` and `rolbypassrls = false` read from `pg_roles` **on that connection**, inside a
+single `ROLLBACK`ed transaction after `set_config('app.tenant_id', <A>, true)`:
+
+| Raw statement, no application predicate | Rows |
+|---|---|
+| `UPDATE "Invoice" SET status='FINALIZED' WHERE id = <tenant **B**'s invoice>` | **0** |
+| `UPDATE "Invoice" SET status='FINALIZED' WHERE id = <tenant **A**'s own invoice>` | **1** |
+| `UPDATE "Invoice" SET currency='XXX'` — no `WHERE` at all | **1**, not 2 |
+
+The second row is what makes the first non-vacuous, and the third is the blanket case. First
+measured at T-048's Gate-4 Round 2 and re-derived independently at that task's Gate-3 rework
+round 2, both times with the same three figures. So what this route bypasses is **the status
+seam**, not tenant isolation: the same statement that RLS refuses across tenants is accepted on
+the tenant's own row and takes it straight to `FINALIZED`. Scope: this table, this policy
+(`invoice_tenant_isolation`, `FOR ALL`, tenant term only), one session, one role. `InvoiceLineItem`
+has no policy at all (S-10) and is a different answer.
+
+**One thing that did become mechanical.** `InvoiceWriteMethod`'s nine names were reasoning when
+T-048 shipped them; they are now measured and guarded. The generated `InvoiceDelegate` at
+`@prisma/client` 6.19.3 declares **18** string members (compiler API), the nine writers and nine
+readers, and `base.repository.ts`'s `InvoiceDelegateSurfaceCensus` is a type-level equality that
+fails `pnpm typecheck` if an upgrade adds, removes or renames any of them — mutated in both
+directions, `error TS2344: Type 'false' does not satisfy the constraint 'true'` each time. It does
+**not** decide whether a new member mutates; it removes the silence. S-49 is the standing entry for
+that class of drift.
+
 **Until then:** keep `BU109`, and keep the `findDetailById` docblock's account of the Prisma
-suppression. They are the whole control.
+suppression. They are the whole control **on the `invoiceLineItem` half**.
 
 ---
 
@@ -3021,7 +3223,14 @@ path has no reviewer looking at this docblock at all. It becomes **MEDIUM** the 
 these is true: a second production path reads `InvoiceLineItem`, or an upgrade lands without the
 four rows being re-derived in that PR. Today there is exactly one such path, and no direct call at
 all: `grep -rn "invoiceLineItem\." apps/*/src --include=*.ts` returns **five** lines and **all five
-are comments** (`invoice.repository.ts:522`, `:537`, `:539`, `:699`, `:725`). Line items are reached
+are comments**, every one of them in `invoice.repository.ts` — three in `absorbLateUsage`'s
+docblock and two in `findDetailById`'s (attributed by walking each match forward to the next
+`async` declaration, not by eye). **The line numbers are gone from this entry on purpose.**
+They have been written four times for five comments nobody moved: `:522`/`:537`/`:539`/`:699`/`:725`,
+then `:625`/`:640`/`:642`/`:801`/`:827` on the tree that shipped T-048's first pass, then
+`:671`/`:686`/`:688`/`:847`/`:873` from T-048's Gate-3 Round 2 — which were already stale by +4
+when Gate-4 Round 2 re-ran the grep and got `:675`/`:690`/`:692`/`:851`/`:877`. **Five comments,
+two docblocks, and the grep above are the durable part**; run it. Line items are reached
 only through the `Invoice` relation — the nested `select` in `findDetailById` and the nested
 `create` in `createDraftInvoice` — so `BU109` plus that docblock is the whole control.
 
@@ -3030,3 +3239,213 @@ Related but distinct, and deliberately a new id rather than an extension: **S-48
 **S-33** is about stale counts in comments, not about a dependency silently invalidating a measured
 behaviour. **S-10** is the reason this matters at all and stays the underlying fix: give
 `InvoiceLineItem` a policy and the client's plan stops being load-bearing.
+
+---
+
+## S-50 · The epic's T-048 snippet is "refused by this repository's shape" only in one of its three spellings, and the route it actually writes is one of several nothing guards — **LOW, open**
+
+Same class as S-17, S-29, S-32, S-35 and S-47: a documentation claim that is stronger than the
+code supports. Filed by T-048 and **verified at that task's Gate 3**, not carried over from its
+plan.
+
+`docs/epics/epic-8-billing-service.md` § *T-048*'s forward-reference block says the snippet's
+`findById(id, tenantId)` / `update({ where: { id } })` signatures "are refused by this
+repository's shape — no method takes a bare `invoiceId` or a caller-supplied tenant". The
+sentence has real content — that *is* the convention, and it is the right convention — but
+"refused by the shape" reads as a compiler property, and it is not one.
+
+**Three probes, one dimension varied, each
+`pnpm --filter @telemetry/billing-service exec tsc --noEmit -p tsconfig.json` (billing's
+`tsconfig.json` includes `tests/**`, so this is the whole package), each reverted:**
+
+| Probe | Spelling | Result |
+|---|---|---|
+| 1 | `async probeFindById(id: string, tenantId: TenantId)` **declared**, the parameter not fed into `this.where` | **compiles clean, 0 errors** |
+| 2 | the same, feeding it: `where: this.where({ id, tenantId })` | `error TS2322: Type 'TenantId' is not assignable to type 'undefined'` |
+| 3 | the same, predicate built by hand: `where: { id, tenantId }` | **compiles clean, 0 errors** |
+
+So what refuses the epic's signature is **one compile error at one call site**, produced by
+`TenantScopedRepository.where`'s `{ tenantId?: never }` constraint, and it is routed around by
+not calling `this.where` — which is exactly what the epic's snippet does. Declaring the parameter
+is free. The shape does not refuse it.
+
+**The sharper half: the snippet's write is a route the T-048 narrowing does not reach.** The
+snippet ends `return this.prisma.invoice.update({ where: { id }, data })` — not `tx`. T-048
+narrowed `TransactionClient` so that a `tx.invoice` write outside the guarded seam is `TS2339`,
+and measured (S-48 step E, reproduced for this delegate) that the identical write through
+`this.prisma` adds **zero** diagnostics. It also runs outside `withTenant`, so no
+`set_config('app.tenant_id', …)` has been issued at all. The epic's own suggested code therefore
+takes a route the task's structural guard does not close — which is worth writing down, because
+the next reader of that section is the person who will write the finalize flow.
+
+**An earlier revision of this entry, and of the epic block it is about, said "the single route"
+and "the one route none of that reaches".** That was a universal, and T-048's Gate-4 review
+refuted it with two more, both at 0 diagnostics: the `prisma` module singleton imported from any
+layer, and `tx.$executeRaw` inside `withTenant`. Both are recorded in **S-48**'s route table
+rather than here, so the count lives in one place; this entry keeps the epic-wording half. Read
+that table before writing "the one route" anywhere — the honest form is "one of several, and the
+list is the ones that have been probed".
+
+**What did change at T-048, stated at measured strength.** `BU126`
+(`apps/billing-service/tests/invoice.repository.unit.test.ts`) parses every `async` member's
+parameter list out of `invoice.repository.ts` and fails on a member outside its named census or
+on a parameter named `invoiceId` or `tenantId`. Probe 3 above — the spelling that compiles clean
+— **reddens it**, measured against `tests/invoice.repository.unit.test.ts` alone
+(`Tests 1 failed | 36 passed (37)`) and against the whole package suite
+(`Tests 1 failed | 212 passed (213)`). Both of `BU126`'s halves catch it independently: with the
+probe added to the census's expected list so the method-name assertion passes, the parameter
+assertion still fails with
+`probeFindById must not take tenantId: expected '(id: string, tenantId: TenantId)' not to contain 'tenantId'`.
+So the convention is now guarded by a **test**, which the planning probe measured it was not
+(an eighth method taking a bare `invoiceId` was added pre-T-048 and typecheck, lint and 207/207
+stayed green). It is still **not** guarded by the compiler, and this entry is open for that
+sentence in the epic rather than for the code.
+
+**Credit where due**, and the reason this is LOW: that block is the epic's own forward reference,
+added by S-45 before T-048 planned anything, and it warns the reader *before* the snippet rather
+than after — which S-32 records as the fix direction for the T-041 section and which the T-040,
+T-042 and T-043 sections do not do. Two of the three things it flags are correct. This entry is
+about the third.
+
+**Fix direction:** reword `epic-8-billing-service.md` § *T-048*'s "are refused by this
+repository's shape" to what the probes measured — *"violate this repository's convention;
+`this.where({ id, tenantId })` is a compile error, but declaring the parameter and building the
+predicate by hand is not, and `BU126` is what catches it"* — and add one line noting that the
+snippet's `this.prisma` write is outside the seam T-048 built. Do not delete the snippet: the
+epic files are a record of what was specified (S-32). Pairs with S-29, S-32, S-35 and S-47, which
+are the same defect in the T-040, T-041, T-043 and T-047 sections of the same and neighbouring
+files; consolidating all five is a docs task with its own review, and this file's id-stability
+rule forbids retiring the live ids to do it.
+
+---
+
+## S-51 · `BU126` censuses member *names*, so the natural response to it going red discharges it — **LOW, open**
+
+`apps/billing-service/tests/invoice.repository.unit.test.ts`'s `BU126` asserts that
+`InvoiceRepository`'s async members are exactly the names in `EXPECTED_PUBLIC_ASYNC_METHODS` and
+`EXPECTED_PRIVATE_ASYNC_METHODS`, with a third list of unclassified members asserted empty. It is
+a real tripwire — T-048's planning probe measured that an eighth method could be added pre-T-048
+with typecheck, lint and 207/207 all green — and it notifies that the member set **changed**. It
+does not assert the new member is safe.
+
+**Measured at T-048's Gate 5 (QA F-1b):** with an unguarded `finalizeInvoice` present on the
+repository and its name appended to `EXPECTED_PUBLIC_ASYNC_METHODS`, the package is
+**213/213 with lint clean**. The red that `BU126` produces is
+`expected [Array(7)] to deeply equal [Array(8)]`, and the one-line edit that clears it — append
+the name — is both the obvious response and the one that discharges the guard. So `BU126` is a
+**notification that the member set changed**, not a guard that the member set is guarded.
+
+This is inherent to a name census and was not fixable inside T-048. What T-048 added instead, at
+the user's direction, is one comment above `EXPECTED_PUBLIC_ASYNC_METHODS` telling whoever
+appends a name what they are discharging, plus this entry.
+
+**Two related measurements, filed here because they are the same "the guard reaches less than it
+reads" shape and because S-48 is already long.**
+
+- **The cast census counts `as`-form spellings, not cast targets.** All four
+  `FULL_DELEGATE_CAST_PATTERNS` are anchored on `\bas\s+`, so an **angle-bracket type assertion**
+  of `tx` through `unknown` to `FullTransactionClient` — the census's own first identifier,
+  written verbatim in `src/` — is invisible to every one of them. Measured at T-048's Gate 6 and
+  re-run at its Gate-3 Round 4 by inserting the assertion after the seam call in
+  `absorbLateUsage` and taking the widened delegate's `updateMany`:
+  `pnpm --filter @telemetry/billing-service exec tsc --noEmit -p tsconfig.json` → **0 errors**;
+  `pnpm --filter @telemetry/billing-service lint` → **0 findings**;
+  `pnpm --filter @telemetry/billing-service exec vitest run tests/invoice.repository.unit.test.ts`
+  → **37 passed (37)**, `BU125` and `BU126` both green; while
+  `grep -rn "FullTransactionClient>" apps/billing-service/src` finds it. It is the cheapest
+  evasion found across four gates, because unlike the delegate cast (Gate 4), `reinterpret<T>`
+  (Gate 4 Round 2) and QA's annotation-plus-`as never` (Gate 5, E2) it changes **no** target and
+  adds **no** member. Probe reverted from a copy; the tree carries none of it. Whether a sixth
+  spelling exists is not established — four gates have each found one the previous had not, which
+  is evidence the enumerated list is smaller than the space, not that it is now complete.
+- **The `seedInvoices` figure is a census of a literal spelling** (QA F-4). The six `tests/`
+  writes of a non-`DRAFT` status that T-048's scoped sentences now cite come from
+  `grep -rEn "status: InvoiceStatus\.(FINALIZED|PAID)" apps/billing-service/tests` → **17** lines,
+  six of them `seedInvoices` arguments. Extracting `BI23`'s fixture block into a parameterised
+  helper — an ordinary refactor — takes 17 to 16 and the six to five while the number of tests
+  seeding a non-`DRAFT` status is unchanged. It **under-reports silently**. Note the spelling of
+  the command matters: the BRE form with escaped alternation and the `-E` form above both return
+  17; an ERE pattern run without `-E` returns **0**.
+
+**Fix direction.** For the member census: assert a *property* of each public member rather than
+its name — for example that every public async member's body either reaches `draftInvoiceWriter`
+or contains no `invoice` write — which is an AST question rather than a regex one, and belongs
+with whichever task builds invoice finalization (it is the first task that will add a member and
+meet the red). For the cast census: adding an angle-bracket pattern is one line and is a
+test-logic change, deliberately not made at T-048's Gate-3 Round 4, which was text-only; the
+probe above is the case that proves it red. For the `seedInvoices` figure: cite the helper and the
+call sites by name rather than quoting a count, or count call sites with an AST pass.
+
+**Do not close this by widening the lists.** Every widening so far has been correct and none has
+changed the shape: a census over an enumerated set catches the members of that set. The shipped
+docblocks say so — *"a regex census catches the forms it enumerates and nothing else"*,
+*"a fifth spelling would still be missed"* — and this entry exists so the next person to append a
+name to `EXPECTED_PUBLIC_ASYNC_METHODS` reads it before doing so.
+
+---
+
+## S-52 · The invoice seam reads with `findUniqueOrThrow` and writes with `update`, and takes no row lock — **LOW, open, latent**
+
+`InvoiceRepository.draftInvoiceWriter` (`apps/billing-service/src/repositories/invoice.repository.ts`;
+`grep -n "private async draftInvoiceWriter" apps/billing-service/src/repositories/invoice.repository.ts`)
+reads the invoice with `findUniqueOrThrow` selecting `id` and `status`, refuses unless the status
+is `BILLING_METERING.INVOICE_STATUS_DRAFT`, and returns the delegate the caller then writes
+through. The read and the write are in one `withTenant` transaction and **nothing locks the row
+between them**: `grep -rn "FOR UPDATE\|forUpdate\|isolationLevel" apps/billing-service/src`
+returns **no lines**, and the database's `default_transaction_isolation` is **`read committed`**
+(`psql -Atc "SHOW default_transaction_isolation"`). So two concurrent callers can each read
+`DRAFT` and both proceed.
+
+**Measured, not reasoned about.** One `DRAFT` invoice seeded through `DIRECT_DATABASE_URL` (the
+owner), then two `psql` sessions **as `telemetry_app`**, each in a transaction that first issues
+`set_config('app.tenant_id', <tenant>, true)` exactly as `withTenant` does. Session A read, wrote
+`status = 'FINALIZED'`, slept 3 s and committed; session B started 1 s later:
+
+| | Without `FOR UPDATE` (what ships) | With `FOR UPDATE` on the read |
+|---|---|---|
+| A's read | `DRAFT` | `DRAFT` |
+| B's read | **`DRAFT`** — A's write is uncommitted, so B sees the old row | **blocks, then returns `FINALIZED`** |
+| B's write | `UPDATE 1`, applied after A commits | `UPDATE 1` |
+| Final row | `FINALIZED`, `totalAmount` 10 → 60 | `FINALIZED`, `totalAmount` 10 → 60 |
+
+The load-bearing cell is B's read. Unlocked, it returns `DRAFT`, so a seam checking that value
+proceeds and its write lands on a row that is `FINALIZED` by the time the write executes — B's
+`UPDATE` blocks on A's row lock, then applies to the updated row rather than re-checking it.
+Locked, the same read under the same timing returns `FINALIZED`, which is the value a seam needs
+to refuse. The probe rows were deleted and `Invoice` and `InvoiceLineItem` re-checked at **0**.
+Scope: one table, one host, PostgreSQL's `read committed` default, two sessions, this timing —
+the `FOR UPDATE` column shows the read *returns* the post-commit value, not that any shipped code
+consumes it.
+
+**Why this is latent and not live.** Nothing in `apps/*/src`, `packages/*/src` or `prisma` writes
+a non-`DRAFT` status — the standing census
+(`grep -rn "FINALIZED\|PAID\|finalizedAt" apps/*/src packages/*/src prisma --include=*.ts
+--include=*.prisma --include=*.sql | grep -v dist`, 19 matching lines, **zero assignments**) is
+the evidence, and `tests/` reaches the state only through `seedInvoices` on the owner connection.
+The only two writers that address an existing invoice are `absorbLateUsage`'s `update` and the
+seam itself, and neither can produce the status the interleaving needs. So the second half of the
+race has no producer today.
+
+**What would make it live:** the first statement anywhere in `src/` that sets `Invoice.status` to
+`FINALIZED` or `PAID` — invoice issuance, which is declared and unbuilt. At that moment
+finalization and late-usage absorption race on the same row, and the outcome measured above is a
+line item appended to an issued invoice with the guard having passed.
+
+**Sibling of S-38**, which records the same shape on the `P2002` path in the same file: a
+concurrency property that is correct by construction today, has no standing test, and whose
+obvious test passes vacuously. **S-38's vacuity trap applies verbatim** — a `Promise.all` over two
+`absorbLateUsage` calls is green whether or not the two transactions overlapped, because a
+serialised pair produces the same observable result. Whoever writes it must prove the overlap
+(advisory locks, a `pg_sleep` inside one transaction, or asserting on the block itself) and must
+show the case red against the unlocked seam first.
+
+**Not fixed at T-048**, which was a text-only round; adding a lock is production behaviour with
+its own deadlock-ordering question and needs its own plan.
+
+**Fix direction:** have the seam take the row lock it already relies on — a
+`SELECT … FOR UPDATE` on the invoice before the status check, which on this codebase means
+`tx.$queryRaw` with `Prisma.sql` and a bound id (Prisma's fluent API has no `FOR UPDATE`), or an
+optimistic `updateMany` whose `where` carries `status: DRAFT` and whose `count` of `0` is the
+refusal. The second needs no raw SQL and no lock ordering, and is worth costing first. Decide it
+with whichever task builds finalization, not before: a lock added now guards an interleaving
+nothing can currently produce.
