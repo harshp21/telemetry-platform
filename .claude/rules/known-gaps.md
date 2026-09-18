@@ -3512,3 +3512,125 @@ missing guard that a test written from the spec would fail is a separate task, n
 
 **Do not close this by raising `maxHeaderSize`.** That moves the threshold and keeps the shape: a
 secret with no declared upper bound, failing somewhere in traffic rather than at startup.
+
+---
+
+## S-55 · usage-service's `env.PORT` still defaults to a port nothing in usage-service uses, and the field is dead in all six services with only three saying so — **LOW, open**
+
+T-050 fixed analytics-service's instance of this and deliberately did not touch usage-service's,
+on the one-task-per-commit objection S-19 and S-39 both record for their own duplications.
+Recorded here rather than in `docs/plans/t-050-analytics-env-schema.md`, because `CLAUDE.md` is
+explicit that nothing may read `docs/plans/` as a record — the S-25 precedent.
+
+**Every claim below re-derived on the T-050 tree** (`493e699` plus T-050's uncommitted changes)
+with the command beside it. Three findings, related by cause and separated by severity, so the
+first is not read as covering the other two.
+
+### 1 · usage-service declares 3000 where its deployment says 3002
+
+`apps/usage-service/src/config/env.ts:8` is
+`PORT: z.coerce.number().int().positive().default(3000)`. `git grep -n "3002"` puts 3002 at
+**five non-test sites carrying six numbers**, which is the same artifact set analytics had:
+
+```
+apps/usage-service/.env.example:6:PORT=3002
+docker/docker-compose.yml:92:      PORT: "3002"
+docker/docker-compose.yml:95:      - "3002:3002"          <- published *and* container port
+docker/docker-compose.yml:187:      USAGE_SERVICE_URL: http://usage-service:3002   (gateway block)
+apps/gateway/.env.example:22:USAGE_SERVICE_URL=http://localhost:3002
+```
+
+plus two source constants — `apps/usage-service/src/constants.ts:102`
+(`USAGE_SERVICE_RUNTIME.DEFAULT_PORT`) and `apps/usage-service/src/startup.constants.ts:3` — and
+one test fixture, `apps/usage-service/tests/setup.ts:3`.
+
+**Nothing is misrouted, and that is the point.** `apps/usage-service/src/index.ts:56` binds
+`Number(process.env.PORT ?? USAGE_SERVICE_STARTUP.DEFAULT_PORT)`, which is 3002. The parsed
+`env.PORT` is read nowhere (finding 3), so the 3000 is a declaration contradicting its own
+deployment — the S-6 shape, config that is declared, validated and then ignored — not a
+mis-bind. Severity is LOW for exactly that reason, and it would rise the moment anything wired
+`env.PORT` into the bind.
+
+**Fix direction:** what T-050 did for analytics. `PORT` defaults from
+`USAGE_SERVICE_STARTUP.DEFAULT_PORT`; `USAGE_SERVICE_RUNTIME.DEFAULT_PORT` derives from the same
+constant instead of repeating the literal; extend
+`apps/usage-service/tests/env.schema.unit.test.ts` with the two cases
+`apps/analytics-service/tests/env.schema.unit.test.ts` added — the schema default, and the
+deploy-artifact pin through throwing locators. Note usage's suite writes `PORT: "3000"` as a bare
+literal in its own fixture at `apps/usage-service/tests/env.schema.unit.test.ts:25`; that literal
+is the current wrong default written a second time, and whoever fixes the schema must fix it too
+or the fixture will pin the value the schema stopped producing.
+
+### 2 · Four services still write their port as two or three unlinked literals
+
+`grep -n "PORT:" apps/*/src/config/env.ts | grep -v EXPORTER`, `grep -n "DEFAULT_PORT"
+apps/*/src/startup.constants.ts` and `grep -rn "DEFAULT_PORT" apps/*/src/constants.ts`, together:
+
+| Service | `config/env.ts` | `constants.ts` | `startup.constants.ts` | Literal sites | Agree? |
+|---|---|---|---|---|---|
+| analytics | derives (`:21`) | derives (`:20`) | `3005` (`:3`) | **1** | n/a — T-050 |
+| billing | derives (`:12`) | derives (`:290`) | `3004` (`:3`) | **1** | n/a — T-044 |
+| auth | derives from `AUTH_RUNTIME` (`:11`) | `3001` (`:157`) | `3001` (`:3`) | 2 | yes |
+| worker | derives (`:12`) | `3003` (`:44`) | `3003` (`:3`) | 2 | yes |
+| gateway | `3100` (`:7`) | `3100` (`:72`) | `3100` (`:3`) | 3 | yes |
+| usage | `3000` (`:8`) | `3002` (`:102`) | `3002` (`:3`) | 3 | **no** — finding 1 |
+
+Auth's row is a different shape from the rest and is listed as derived on that basis: its
+`env.ts` imports `AUTH_RUNTIME` from `../constants`, so the derivation points at `constants.ts`
+rather than at `startup.constants.ts`. T-050 rejected that direction for analytics (plan decision
+D4) because it makes `constants.ts` both an upstream of `env.ts` and a downstream of
+`startup.constants.ts`; it is recorded as a divergence in *direction*, not as a defect, and auth's
+two literals do agree.
+
+These four are DRY findings, not contradictions — **every value in the four rows above agrees
+with itself**, checked per row. Only usage's disagrees, and that is finding 1.
+
+### 3 · The parsed `env.PORT` is read nowhere, and half the services do not say so
+
+Two greps over `apps/*/src` and `packages/*/src`, `--include='*.ts'`, `dist/` filtered:
+
+- `grep -rn "env\.PORT\|\.PORT\b"` returns **12** lines: the six
+  `const port = Number(process.env.PORT ?? <SERVICE>_STARTUP.DEFAULT_PORT)` binds (analytics,
+  auth, billing, usage `:56`; gateway `:55`; worker `:276`) and **six comment lines**, two each in
+  analytics', billing's and worker's `config/env.ts`. Those six are the comments *documenting*
+  the deadness, so this grep matches its own subject — the self-match sub-pattern S-33 names, and
+  the reason the count moved from 10 to 12 inside T-050's own commit. Count the binds, not the
+  lines.
+- `grep -rnE "\[[[:space:]]*[\"']PORT[\"'][[:space:]]*\]"` returns nothing (exit 1), so the
+  dynamic-index spelling is absent too.
+
+**What that establishes and what it does not.** No *statically spelled* read of the parsed value
+exists under those two search roots. It does **not** exclude a computed property name, a spread of
+the whole `env` object into something that later indexes it, or a read from outside those roots.
+Stated as measured rather than as "nothing reads it".
+
+`grep -ci "nothing.*reads the parsed\|no read of the parsed" apps/*/src/config/env.ts` returns
+`1` for analytics, billing and worker and `0` for auth, gateway and usage. So three of six
+`env.ts` files tell the next reader the field is inert and three leave them to work it out — and
+a reader of usage's, where the number is also wrong, has nothing to warn them.
+
+**Two of those three say it too strongly, and both predate T-050.** `git show HEAD:` on each
+file at `493e699` shows `apps/billing-service/src/config/env.ts:8` reading "Nothing reads the
+parsed `env.PORT`" and `apps/worker-service/src/config/env.ts:9` reading "Nothing in this repo
+reads the parsed `env.PORT`" — unqualified universals of exactly the kind the paragraph above
+declines to make, and "in this repo" is the stronger of the two because it names a scope wider
+than the one that was searched. Only `apps/analytics-service/src/config/env.ts:7`, which T-050
+wrote, carries the measured form with its roots. Not fixed here: editing two other services'
+source comments inside an analytics env-schema commit is the one-task-per-commit objection this
+entry's own fix direction records, and the same one T-050's Gate-4 LOW-1 applied to analytics'
+test file. Whoever takes finding 2 and 3's single task should bring all three to the measured
+wording rather than copying billing's.
+
+**Fix direction for 2 and 3 together:** one task, not six opportunistic edits. Derive each
+service's `PORT` and `<SERVICE>_RUNTIME.DEFAULT_PORT` from its own `startup.constants.ts`,
+add the dead-field comment where it is missing, and give each service the deploy-artifact pin.
+`startup.constants.ts` must stay import-free in every service — it is the module `index.ts` loads
+before `initTracing(...)` (`grep -c "^import" apps/*/src/startup.constants.ts` → `0` for all six)
+— so the derivation direction is always *into* `env.ts` and `constants.ts`, never out of them.
+Do **not** close any of this by wiring `env.PORT` into an `index.ts`: a static import of the
+parsed env there hoists zod and `@telemetry/shared-config` ahead of `initTracing`, which is the
+ordering `CLAUDE.md` § *Startup ordering* exists to protect. Measured for that property alone, on
+Node v22.22.2 with a four-file ESM fixture (T-050 plan P5): a static import evaluated the heavy
+module *before* the tracing call and a dynamic import after it evaluated it *after*. Scope of that
+measurement is plain ESM on one Node version, one static and one dynamic import — it says nothing
+about tsx, bundlers, or which spans would actually be lost.
