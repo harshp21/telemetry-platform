@@ -3347,7 +3347,10 @@ Filed by S-8, which found it while checking that its own change touched no times
 class as S-17, S-29, S-32, S-35, S-42, S-47 and S-50 — an epic snippet that diverges from what the
 code must do — and recorded here rather than by editing the epic, matching that precedent.
 
-`docs/epics/epic-9-analytics-service.md:59` specifies:
+`docs/epics/epic-9-analytics-service.md:61` specifies (it was `:59` when this entry was filed; the Q3 ruling added two lines above it — re-run
+`grep -n "AT TIME ZONE" docs/epics/epic-9-analytics-service.md` rather than trusting the
+number, and note that grep now returns **two** lines, the snippet and the Q3 pointer at `:15`
+that says not to write it):
 
 ```sql
 DATE_TRUNC('day', period_start AT TIME ZONE 'UTC') AS bucket_start
@@ -3407,6 +3410,26 @@ is and why. Whichever T-051 does, the guard it needs is a test that pins its own
 because a UTC-only fixture asserts nothing here. Do not "fix" this by moving `AT TIME ZONE` to the
 bound parameter and leaving the column expression — the bound side is already correct and is not
 what this entry is about.
+
+**Disposition under the Q3 ruling — the choice this entry asked for has been made, and it is the
+narrower of the two.** Q3 is now recorded **decided: fixed UTC for every tenant**
+(`docs/epics/README.md` § *Q3 — UTC aggregation timezone*, and the gates table there). That
+settles the contract-first question above in favour of **correcting the epic snippet**, not the
+code: the projection is `DATE_TRUNC('<unit>', "periodStart")` on the bare naive column, with no
+`AT TIME ZONE` anywhere in it. So the remaining work on this half is a one-line edit to
+`docs/epics/epic-9-analytics-service.md:61` (the snippet line; re-derive it, it has already moved once).
+
+**That edit was deliberately not made when the ruling was recorded, and this entry stays open
+because of it.** It belongs to **T-051**, the task that builds the rollup, for the reason S-29,
+S-32, S-35, S-42, S-47 and S-50 all give: an epic snippet is corrected by the task that
+implements it, so the correction and the code that proves it land in one commit. Editing the
+snippet from a docs-only change would leave a corrected epic with nothing standing behind it.
+
+Three things in this entry are **not** discharged by the ruling and are still T-051's to handle:
+the snake_case identifiers, the `$2`/`$3` bound-parameter half (which is S-18 and is about the
+predicate, not the projection), and the requirement that whatever T-051 writes be guarded by a
+test pinning its own non-UTC session — a UTC-only fixture asserts nothing here, and
+`postgres:16-alpine` defaults to `UTC`.
 
 
 ---
@@ -3634,3 +3657,194 @@ Node v22.22.2 with a four-file ESM fixture (T-050 plan P5): a static import eval
 module *before* the tracing call and a dynamic import after it evaluated it *after*. Scope of that
 measurement is plain ESM on one Node version, one static and one dynamic import — it says nothing
 about tsx, bundlers, or which spans would actually be lost.
+
+---
+
+## S-56 · The platform emits zero spans: every service is ESM and nothing registers OpenTelemetry's ESM module hook — **MEDIUM, open**
+
+`initTracing(...)` runs first in all six service entrypoints, builds a real provider, registers
+three instrumentations and returns without error. **No span is ever produced.** Nothing reports a
+failure: startup logs are clean, `/health` returns `200`, and the only visible symptom is that
+every log line is missing the `traceId` the logger is built to inject.
+
+**All measurements below were taken on this tree at `0aa19c1`** with a temporary probe under
+`apps/analytics-service/` (so workspace deps resolved), run with tsx on Node v22.22.2, then
+deleted. `@opentelemetry/api` 1.9.1, `@opentelemetry/instrumentation` 0.55.0,
+`@opentelemetry/instrumentation-fastify` 0.44.2. The probe set
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces` so `initTracing` does **not** hit
+its `if (!endpoint) return;` early exit, attached a `SimpleSpanProcessor` over an
+`InMemorySpanExporter` to the provider `initTracing` had registered, built a real Fastify app
+with a `/health` route, `listen`ed on a real port and issued a real `fetch` — and imported
+Fastify **dynamically after** `initTracing`, which is the ordering the real entrypoints use
+(`apps/analytics-service/src/index.ts` does `await import("./app")` at `:22`, after
+`initTracing(...)` at `:18`).
+
+### What was measured
+
+| Probe | Result |
+|---|---|
+| provider `initTracing` registered | `NodeTracerProvider` — so it did not early-return |
+| `GET /health` over a real socket | `200 {"status":"ok"}` |
+| **finished spans** | **0**, span names `[]` |
+| `trace.getActiveSpan() !== undefined` inside the route handler | **false** |
+| a `shared-logger` line emitted inside that handler | `{"level":"info","time":"…","service":"probe-service","msg":"inside route handler"}` |
+
+**Correction to how this was first written up, because the difference matters to anyone grepping
+for it.** The symptom was originally described as the logger emitting `traceId: null` /
+`spanId: null`. It does not. `createLogger`'s mixin
+(`packages/shared-logger/src/index.ts`) is `if (!span) { return {}; }`, so with no active span
+the two keys are **absent from the JSON object entirely**, not present-and-null. Measured with
+an `in` check, not by eye: `"traceId" in o` → `false`. A log pipeline alerting on
+`traceId == null` would match nothing.
+
+### The mixin is not at fault — the isolating mutation
+
+In the **same process**, immediately after the request, the probe started a span by hand and
+logged inside its context:
+
+```
+shared-logger line inside manual span:
+  {"level":"info","time":"…","service":"probe-service",
+   "traceId":"3196a2a658b7b8ed7808b822455d84cb","spanId":"7d3ccc2a1fa7fb44",
+   "msg":"inside a manually started span"}
+SPANS FINISHED after manual span : 1
+span names                       : ["manual-probe-span"]
+```
+
+So the provider, the processor, the exporter, the context manager and the logger mixin all work.
+The missing piece is upstream of all of them: nothing creates a span for the request.
+
+### Root cause — and the first explanation for it was wrong
+
+The explanation this entry was originally going to carry is that
+**`@opentelemetry/instrumentation-http` is absent**, and that `instrumentation-fastify` alone
+emits nothing because its spans are children of an HTTP span that never exists.
+
+The absence is real. `grep -rn "instrumentation-http" --include=package.json .` outside
+`node_modules` returns nothing, `grep -n "instrumentation-http" pnpm-lock.yaml` returns nothing,
+and the only OpenTelemetry instrumentation packages in the lockfile are
+`@opentelemetry/instrumentation`, `-fastify` and `-ioredis`.
+
+**The causal half is refuted.** Reading
+`instrumentation-fastify`'s `_hookPreHandler` shows it calling
+`tracer.startSpan(spanName, { attributes })` with no explicit parent, which would produce a root
+span rather than nothing. Tested directly: the probe was re-run **with the ESM loader hook
+registered and `instrumentation-http` still absent**, and produced
+
+```
+SPANS: 1
+  name        : request handler - fastify
+  parentSpanId: (none -> ROOT span)
+  service.name: "probe-service"
+  attributes  : {"plugin.name":"fastify","fastify.type":"request_handler","http.route":"/health"}
+getActiveSpan() in handler is a span : true
+shared-logger line: {… "traceId":"25e0e3391e950b952a315422f0c1a988","spanId":"4895390cf1c85eb6" …}
+```
+
+One dimension changed, and the count went 0 → 1. So `instrumentation-fastify` **does** emit on
+its own, and the absence of `instrumentation-http` is not what produces the zero.
+
+**What produces the zero is that the module patching does not happen, because this codebase is
+ESM.** Measured for the `fastify` module specifically — that is the one whose patching the probe
+varied. `ioredis` and Prisma were not separately probed, so read this as "the module the probe
+exercised was unpatched", not as a statement about all three instrumentations at once. `@opentelemetry/instrumentation` patches CommonJS through `require-in-the-middle`, which
+needs no setup, and ESM through `import-in-the-middle`, which does: Node has to be told to load
+`@opentelemetry/instrumentation/hook.mjs` as a loader, either with `--experimental-loader` or
+with `module.register(...)`. Every manifest under `apps` and `packages` declares
+`"type": "module"` — 13 of 13, checked with a loop over
+`ls apps/*/package.json packages/*/package.json` — so every service's imports go through the ESM
+path, and a repo-wide sweep for
+`experimental-loader`, `hook.mjs`, `import-in-the-middle`, `NODE_OPTIONS` and `module.register`
+(excluding `node_modules`, `dist`, `.git` and `pnpm-lock.yaml`) **returns nothing**: not in
+`src`, not in a `package.json` script, not in `Dockerfile`, not in `docker-compose.yml`, not in
+`.github/workflows/ci.yml`.
+
+This is also why `CLAUDE.md` § *Startup ordering* and T-055's "first executable line" rule, both
+of which are correctly implemented, do not help. They protect the *ordering* of patching against
+module load. There is no patching to order.
+
+### T-055 is classified done and its acceptance criterion is false
+
+`docs/epics/epic-10-observability.md`'s T-055 acceptance reads *"A request to `/health` produces
+a root span with `service.name = "{serviceName}"`"*. The probe produced zero spans.
+
+**State it as the ambiguity it is: the code T-055 names is present, and the behaviour it promises
+is absent.** The code is present — `import { initTracing } from "@telemetry/shared-tracing"` is
+line 1 and `initTracing(<SERVICE>_STARTUP.SERVICE_NAME)` is line 18 of all six entrypoints
+(`grep -n "initTracing" apps/*/src/index.ts` reports `1:` and `18:` for each). Checked across all
+six rather than generalised from one: lines 1-18 are the same in every entrypoint — two imports,
+a `type EnvLoadError` alias, and the `loadLocalEnv` function binding, none of which runs anything,
+and `startup.constants.ts` is side-effect-free. So the "first executable line" rule is genuinely
+satisfied. There is no commit naming
+T-055 (`git log --all --format="%h %s" | grep -iE "T-?05[5-7]"` → nothing) and no plan file, so
+"done" here rests on the code being visibly in place — which is exactly the inference this
+finding breaks. Note the two remaining criteria are also unmet: there are no Prisma child spans,
+and "no OTel errors in startup logs" is satisfied **vacuously**.
+
+### T-056's acceptance is not reachable by the logger swap alone
+
+T-056 asks that *"Every request log line contains `service`, `traceId`, `spanId`, and `level`"*,
+by replacing `Fastify({ logger: true })` with `Fastify({ loggerInstance: createLogger(...) })`.
+All six apps still use `Fastify({ logger: true })` (`apps/*/src/app.ts`), so T-056 is not done —
+but doing exactly what it says would not satisfy it. Measured by performing precisely that swap
+in the probe, with no ESM hook:
+
+```
+{"level":"info","time":"…","service":"probe-service","reqId":"req-1","req":{…},"msg":"incoming request"}
+    has service: true | has level: true | has traceId: false | has spanId: false
+{"level":"info","time":"…","service":"probe-service","reqId":"req-1","res":{"statusCode":200},"msg":"request completed"}
+    has service: true | has level: true | has traceId: false | has spanId: false
+```
+
+`service` and `level` yes; `traceId` and `spanId` absent on every line. T-056 depends on this
+entry, and a reviewer checking T-056's acceptance against two of its four fields would pass it.
+
+### The fix is partly measured and partly inferred — do not conflate the halves
+
+**Measured**, and it needs no install: calling
+`module.register("…/@opentelemetry/instrumentation/hook.mjs", pathToFileURL("./"))` in-process
+*before* the dynamic imports takes the same probe from `SPANS: 0` to `SPANS: 1`, a **root** span
+carrying `service.name`. Run twice in one command, hook off then on, as the only varied
+dimension.
+
+**Inferred, and stated as a hypothesis rather than a finding:**
+
+- That adding `@opentelemetry/instrumentation-http` gives the `GET /health` **HTTP server** span
+  with `http.method` / `http.status_code` semantics as the root, with the fastify span as its
+  child. Installing a package is a write that was out of scope here, so this was **not** run.
+  What would establish it: install it, add it to `registerInstrumentations`, re-run the probe
+  with the hook registered, and assert two spans with the fastify span's `parentSpanId` equal to
+  the HTTP span's `spanId`.
+- That registering the hook from inside `initTracing` is safe for all six services. The probe
+  covered **one** synthetic app on one Node version under tsx. Not covered: the other five
+  entrypoints, a built `dist` run without tsx, the container images, and whether registering an
+  ESM loader affects the five vitest suites that import service modules directly. Each of those
+  is a place this could behave differently.
+- Whether the missing HTTP span alone would satisfy T-055's second criterion (Prisma child
+  spans). `PrismaInstrumentation` is registered and was not separately probed.
+
+### Severity — argued, MEDIUM
+
+**MEDIUM, not LOW.** No data is lost, nothing is insecure, and no test is red, which is the case
+for LOW. Three things push it up. First, it is **silent**: `initTracing` returns normally, there
+is no OTel error, and the `OTEL_EXPORTER_OTLP_ENDPOINT` env var is required by every service's
+schema, so the configuration looks healthy and complete. Second, it removes **distributed
+tracing across a seven-service platform** — the tool you reach for when a request crosses
+gateway → usage → worker → billing, which a log-only view of that path reconstructs poorly if
+at all, since nothing correlates the four services' lines. Third, and the reason it is filed rather than left in a report: **a task is
+classified done whose acceptance criterion is measurably false, and a second task would be
+passed on two of its four fields.** That is the failure mode `CLAUDE.md` warns about when it
+says a plan marks a task started, not finished.
+
+**MEDIUM, not HIGH**, because nothing is wrong with any shipped behaviour: no request fails, no
+row is mis-written, no tenant boundary is weakened. The cost is entirely observability, and it
+is recoverable at any time without a migration or a data fix.
+
+**Fix direction:** own it as a task in Epic 10 that re-opens T-055 rather than as a patch. It
+needs, in order: register the ESM hook (decide between `module.register` inside `initTracing` and
+a `NODE_OPTIONS`/`--import` flag at the process boundary — the in-process form is measured to
+work and keeps the entrypoints honest, the flag form is what the OpenTelemetry docs lead with and
+survives a `dist` run); add `@opentelemetry/instrumentation-http` for the root HTTP span; then
+re-derive T-055's acceptance by running the probe in this entry against each of the six real
+entrypoints rather than a synthetic app. Do T-056 after, not before — its acceptance is
+not satisfiable until spans exist, and swapping the logger first would make it look done.

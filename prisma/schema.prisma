@@ -12,6 +12,14 @@ model Tenant {
   id        String   @id @default(uuid())
   name      String
   plan      Plan     @default(FREE)
+  // NOT an aggregation input. Q3 is decided as fixed UTC for every tenant
+  // (docs/epics/README.md, "Q3 - UTC aggregation timezone"), so analytics and
+  // usage-summary buckets are bare DATE_TRUNC on the naive column and no
+  // reader consults this value. The column has three writers and no readers, and all
+  // three hard-code "UTC": auth-service's tenant create, and prisma/seed.ts twice.
+  // Do not make it a reader without reopening Q3 - every cached MetricRollup row
+  // would need recomputing, since @@unique(tenantId, metricKey, granularity,
+  // bucketStart) has no column to distinguish two zones' buckets.
   timezone  String   @default("UTC")
   createdAt DateTime @default(now())
   deletedAt DateTime?

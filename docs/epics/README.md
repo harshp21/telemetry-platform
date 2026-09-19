@@ -16,7 +16,7 @@ Implementation sequence based on architectural dependencies and open decision ga
 | Q9 — Worker concurrency (**decided**: horizontal-ready, single instance locally) | Epic 7 |
 | Q10 — DLQ retry policy (**decided**: `MAX_RETRY_COUNT` 3, `DEAD_LETTER_STREAM` `telemetry:dead-letter`, no retry delay, alerting counter deferred to T-057) | Epic 7 |
 | Q2 — Pricing model (**decided**: flat only for v1 — `amount = summedQuantity x unitPrice`; `Meter.tierJson` unread; tiered deferred pending a graduated-vs-volume ruling) | Epic 8 |
-| Q3 — UTC aggregation timezone | Epic 9 |
+| Q3 — UTC aggregation timezone (**decided**: fixed UTC for every tenant; `Tenant.timezone` is not an aggregation input) | Epic 9 — T-051, T-052, T-053 only |
 | Q11 — Dashboard scope | Epic 11 |
 
 ### Day 1 decision notes
@@ -74,6 +74,71 @@ Implementation sequence based on architectural dependencies and open decision ga
 - Revisit trigger: the first customer contract that prices by band, or any `Meter` row written
   with a non-null `tierJson`.
 
+#### Q3 — UTC aggregation timezone
+
+- Decision: **fixed UTC for every tenant.** Every analytics bucket boundary is a UTC boundary.
+  There is no per-tenant timezone, no per-request `timezone` query parameter, and no plan for
+  one in v1.
+- Bucket expressions use a **bare `DATE_TRUNC(<unit>, "<column>")` on the naive column** with no
+  `AT TIME ZONE` conversion. `AT TIME ZONE 'UTC'` applied to the *column* is the defect
+  `CLAUDE.md` § *Raw SQL and timestamps* names and S-53 records; applied to a bound *parameter*
+  it is correct. Fix the bound, never the column.
+- **`Tenant.timezone` is not an aggregation input.** It stays in the schema and keeps its
+  writers; nothing reads it, and nothing in Epic 9 may start. Recorded at the column in
+  `prisma/schema.prisma` as well as here, because that is where a reader of the column looks.
+
+**Why now, each point re-derived by command rather than inherited.**
+
+- **Every application timestamp column is naive, so there is no stored offset to aggregate by.**
+  `information_schema.columns` over `table_schema='public'` returns **20** columns of
+  `timestamp without time zone`, all precision 3, and **3** of `timestamp with time zone` — and
+  all three of those are `_prisma_migrations.started_at`, `.finished_at`, `.rolled_back_at`.
+  `grep -n "Timestamptz" prisma/schema.prisma` returns no match (exit 1), so no model asks for
+  one. A per-tenant zone would have to be applied at read time to a value that carries no offset.
+- **usage-service already ships this answer, deliberately.** The `GRANULARITY_SQL` map in
+  `apps/usage-service/src/repositories/usage.repository.ts` buckets `hour`/`day`/`week` with bare
+  `DATE_TRUNC(<unit>, "periodStart")`, and its docblock states the reasoning. Deciding Q3 any
+  other way would make analytics disagree with the usage-summary endpoint on what a "day" is,
+  for the same underlying rows.
+- **`Tenant.timezone` has writers and no readers, and every writer hard-codes `"UTC"`.**
+  `grep -rn "timezone" apps/*/src packages/*/src prisma --include=*.ts --include=*.prisma`
+  (excluding `dist`) returns six lines: the column at `prisma/schema.prisma:15`
+  (`@default("UTC")`); three writers — `apps/auth-service/src/repositories/user.repository.ts:295`
+  writing `AUTH_TENANT_DEFAULTS.TIMEZONE`, which is `"UTC"` at
+  `apps/auth-service/src/constants.ts:138`, and `prisma/seed.ts:23` and `:30` writing the
+  literal `"UTC"`; one optional parameter type at `user.repository.ts:85` that no caller ever
+  supplies; and one **unrelated** line, `apps/worker-service/src/queues/invoice-generation.queue.ts:172`,
+  which is BullMQ's cron timezone (`WORKER_INVOICE_JOB.TIMEZONE`) and has nothing to do with the
+  column. A search for a read — property access, destructure, or a Prisma `select`/`include`
+  naming the field — returns nothing. Live values agree: `SELECT id, timezone FROM "Tenant"`
+  returns 2 rows, both `UTC`.
+- **The rollup cache key has no timezone column, so a later change is not migratable.**
+  `MetricRollup @@unique([tenantId, metricKey, granularity, bucketStart])` — live as
+  `MetricRollup_tenantId_metricKey_granularity_bucketStart_key` in `pg_indexes` — and the model
+  has seven columns, none of them a timezone. A cached row's `bucketStart` would therefore mean
+  something different under any per-tenant or per-request option, with nothing in the key to say
+  which. Reversing this decision later is a recomputation of every cached row, not a migration.
+
+**Scope: Q3 gates the bucket-computing tasks only — T-051, T-052, T-053 — not all of Epic 9.**
+The evidence is that **T-050 shipped under the unresolved gate**, at `0aa19c1`
+(`fix(analytics-service): derive the env schema's PORT default from the startup constant (T-050)`),
+which is `HEAD` and the commit at which Q3 still carried no `decided` marker. T-050 is the env
+schema and touches no timestamp path.
+
+**Which file is authoritative, because the two disagreed.** This README's dependency table gave
+Epic 9 as depending on `Epic 3, Q3` — the whole epic — while
+`docs/epics/epic-9-analytics-service.md:4`'s own **Depends on** line reads
+`Epic 2 (UsageLine, MetricRollup models), Epic 3` and does not mention Q3 at all. **This README is
+authoritative**, per S-15's fix direction that it be "the single authority it claims to be"; the
+epic file carries a forward pointer to this section rather than a second copy of the ruling.
+
+- Implemented by: nothing yet. T-051 is the first task that must build on it, and owns the
+  one-line correction to `docs/epics/epic-9-analytics-service.md`'s rollup snippet recorded as
+  S-53 in `.claude/rules/known-gaps.md`.
+- Revisit trigger: the first customer requirement for billing or reporting boundaries in a local
+  zone. Note the cost is not the query — it is recomputing every cached `MetricRollup` row,
+  because the unique key carries no column recording which zone a bucket was computed in.
+
 #### Q6 — Multi-tenancy scope
 
 - Decision: Enforce tenant scoping in repositories and enable PostgreSQL RLS immediately.
@@ -114,7 +179,7 @@ Implementation sequence based on architectural dependencies and open decision ga
 | 6 — Usage Service | [epic-6-usage-service.md](./epic-6-usage-service.md) | v1-mvp | Epic 3, Q1, Q8 |
 | 7 — Worker Service | [epic-7-worker-service.md](./epic-7-worker-service.md) | v1-mvp | Epic 3, Epic 6, Q10 |
 | 8 — Billing Service | [epic-8-billing-service.md](./epic-8-billing-service.md) | v1 | Epic 3, Epic 7, Q2 |
-| 9 — Analytics Service | [epic-9-analytics-service.md](./epic-9-analytics-service.md) | v1 | Epic 3, Q3 |
+| 9 — Analytics Service | [epic-9-analytics-service.md](./epic-9-analytics-service.md) | v1 | Epic 3; Q3 gates T-051, T-052, T-053 only |
 | 10 — Observability | [epic-10-observability.md](./epic-10-observability.md) | v1-mvp + v1 | Wire during each service epic |
 | 11 — Frontend | [epic-11-frontend.md](./epic-11-frontend.md) | v1-mvp + v1 | Epic 4, 6, 8, 9 |
 | 12 — Testing | [epic-12-testing.md](./epic-12-testing.md) | v1-mvp + v1 | Write alongside each epic |

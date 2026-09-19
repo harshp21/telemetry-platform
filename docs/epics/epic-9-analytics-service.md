@@ -1,7 +1,9 @@
 # Epic 9 — Analytics Service
 
 **Milestone**: v1
-**Depends on**: Epic 2 (UsageLine, MetricRollup models), Epic 3
+**Depends on**: Epic 2 (UsageLine, MetricRollup models), Epic 3, and Q3 for T-051/T-052/T-053
+(this line previously omitted Q3 while README.md's dependency table applied it to the whole
+epic; README.md is authoritative and both now read as the scoped form)
 **Blocks**: Epic 11 (dashboard + usage pages consume these APIs)
 
 ---
@@ -10,7 +12,7 @@
 
 | Question | Decision needed |
 |---|---|
-| Q3 — UTC aggregation | Bucket boundary timezone — assumed UTC midnight until confirmed |
+| Q3 — UTC aggregation | **Decided: fixed UTC for every tenant.** Bare `DATE_TRUNC` on the naive column, no `AT TIME ZONE`; `Tenant.timezone` is not an aggregation input. The ruling and its evidence live in [README.md](./README.md) § *Q3 — UTC aggregation timezone*, which is authoritative — this table is a pointer, not a second copy. Gates T-051, T-052 and T-053 only; T-050 shipped before it was decided. |
 
 ---
 
