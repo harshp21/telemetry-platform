@@ -36,17 +36,123 @@ production code reads it. The enforced cap is a hard-coded `BATCH_SIZE_MAX: 100`
 
 ---
 
-## S-9 · analytics-service has no service-to-service auth and no `INTERNAL_API_SECRET` — **LOW, open**
+## S-9 · analytics-service's internal-auth guard is wired around **zero routes** — **LOW, open, narrowed**
 
-`apps/analytics-service/src/app.ts` registers `/health` and nothing else, and
-`apps/analytics-service/src/config/env.ts` has no `INTERNAL_API_SECRET`. There is no tenant data
-to reach today, so this is LOW rather than a live hole — but the gateway already proxies
-`/v1/analytics` to it (`apps/gateway/src/constants.ts`, `GATEWAY_PROXY_PREFIXES.ANALYTICS`) and
-now sends `X-Internal-Secret` on every proxied request. The moment a tenant-scoped route lands
-there, it is S-4 again with a different service name.
+> **Narrowed, not closed.** The original entry read *"analytics-service has no service-to-service
+> auth and no `INTERNAL_API_SECRET`"*. Both halves of that headline are now false, so leaving it
+> would ship a knowingly-wrong authoritative file. What is left is the residue below, and
+> **T-051 discharges it** by registering its route inside the scope that already exists.
 
-**Fix direction:** add the guard *before* the first tenant-scoped route, not after — mirror
-`apps/usage-service/src/middleware/internal-auth.middleware.ts` and its env-schema entry.
+**What now exists** (slice 1 of scope B, `docs/plans/s-009-analytics-internal-auth.md` — note
+that `CLAUDE.md` forbids reading `docs/plans/` as a record of completion, which is why the
+substance is here):
+
+- `apps/analytics-service/src/config/env.ts` declares `INTERNAL_API_SECRET` as
+  `internalApiSecretSchema` **by identity**, not as a local chain, so analytics is the fifth
+  derivation of S-8's one rule rather than a fifth strictness. Asserted, not assumed: repointing
+  the declaration at a locally written chain with the fragment's *exact* spelling reddens
+  `declares INTERNAL_API_SECRET as internalApiSecretSchema itself` in
+  `apps/analytics-service/tests/env.schema.unit.test.ts` and nothing else
+  (`Tests 1 failed | 18 passed (19)`).
+- `src/middleware/internal-auth.middleware.ts` — the same `secretsMatch` from
+  `@telemetry/shared-utils` the other three guards use, a non-string header rejected rather than
+  normalised, a returned `reply`, and `ANALYTICS_RESPONSES.HTTP_STATUS_UNAUTHORIZED` rather than
+  a literal. **Four properties, three of them guarded.** The first, second and fourth each redden
+  exactly one named case when reverted — `AU15`, `AU13`, `AU16` respectively, one failure each,
+  re-derived by three separate mutations at Gate 4 and again at the Gate-3 rework.
+
+  **The returned `reply` is guarded by nothing, and no case was added for it**, because there is
+  no behavioural difference to guard. Measured at the rework: dropping the `return` leaves the
+  package **56/56 green**, and a request with no secret against a composed app answers
+  `401 {"code":"UNAUTHORIZED"}` with `handlerRan=0` and the tenant hook never entered — byte-identical
+  to the shipped form on all four observations. So the `return` is a statement of intent, which is
+  what the middleware's own docblock already says. The only thing that could pin it is a third
+  source-text census, and the one that exists is weaker than it reads (see the `AU15` note below),
+  so another was judged not worth its maintenance cost. An earlier revision of this bullet said
+  "each of those three" against four listed properties; corrected at Gate 4 (LOW-1).
+- `src/middleware/tenant-context.middleware.ts` — `tenantIdSchema`, two distinct errors, no
+  allowlist.
+- `src/app.ts` — an `app.register` scope carrying both hooks as `onRequest`, guard first, with
+  `/health` left on the root instance **outside** it.
+
+**`AU15` is weaker than "the comparison is timing-safe", and the limit is measured.** It is a
+source-text assertion over one file. A timing oracle inserted *ahead* of `secretsMatch` as
+`internalApiSecret.length !== providedSecret.length ||` — which leaks the configured secret's exact
+length through response latency — leaves the package **56/56 green** with `AU15` green, typecheck
+exit 0 and lint clean. The same oracle in the other operand order **does** redden `AU15`, but only
+because that spelling contains the substring `!== internalApiSecret` the assertion forbids: a
+source-text coincidence, not a guard. Both orders measured at Gate 4 and re-derived at the rework.
+**A second evasion is on record and is worse: S-59.** All three of `AU15`'s assertions hold while
+the live comparison is a plain `===` — keep the import, call `secretsMatch("", "")` into an unused
+local, and write the decision as `!(providedSecret === internalApiSecret)`, which contains no
+forbidden substring. Measured `56/56` green, typecheck exit 0, lint exit 0. That restores the full
+byte-prefix short-circuit S-8 removed from billing and worker, where the length oracle leaks only
+the length.
+
+Do not read a green `AU15` as evidence that no oracle was added, and do not read *two* recorded
+evasions as the complete set — S-59 says why, and S-51 is the same enumerated-spelling shape in
+billing-service.
+
+**The residue, and it is the whole reason this id survives: the scope holds no routes, and a
+scope with no routes never runs its hooks.** Measured at fastify 5.10.0 / Node v22.22.2, three
+forms — an unmatched `GET` and an unmatched `POST` under an unprefixed scope, and a `GET` under a
+scope registered with `{ prefix: "/v1/analytics" }`. Every one answered `404` with the hook's own
+call log still empty. With one route added inside the scope the hook ran for that route and did
+**not** run again for a sibling 404. So the guard is fitted and is currently reached by nothing.
+
+That the seam is *correct* was measured separately, by registering one probe route inside the
+production scope and injecting four header combinations against the real
+`buildAnalyticsServiceApp()`:
+
+```
+/health, no headers                  -> 200 {"status":"ok","service":"analytics-service"}
+scoped route, no headers             -> 401 {"code":"UNAUTHORIZED"}
+scoped route, secret only            -> 401 {"code":"TENANT_CONTEXT_MISSING", ...}
+scoped route, secret + tenant        -> 200
+scoped route, wrong secret + tenant  -> 401 {"code":"UNAUTHORIZED"}
+```
+
+**What no test in slice 1 establishes:** that a *future* tenant-scoped route is inside that
+scope. Nothing behavioural can, while the scope is empty. The nearest guards are `AU22b`, which
+asserts the two `addHook` registrations' phase and order by reading `src/app.ts`'s text, and
+`AU23`, which asserts `/health` answers `200` with no secret and goes red when that registration
+is moved inside the scope (`expected 401 to be 200`).
+
+**Discharged by T-051** — the first `/v1/analytics` endpoint — which must call its route
+registration **inside** the existing `app.register` callback in `src/app.ts`. A route registered
+outside it is unauthenticated and untenanted, and on this tree nothing would notice. Remove this
+entry when that route lands with a case that fails if it is moved out (billing's `BU78` is the
+shape: assert the service method was never called).
+
+**The epic will not tell that implementer any of this, and that is the trap.**
+`docs/epics/epic-9-analytics-service.md` § *T-051*'s **Files** line names
+`controllers/analytics.controller.ts`, `services/analytics.service.ts` and
+`repositories/rollup.repository.ts` — **not `src/app.ts`** — and no line in that section says the
+route must be registered inside the scope. S-9 added a one-line forward reference under it; the
+durable statement is here. Measured rather than warned about, four route placements against one
+guarded scope carrying both hooks, fastify 5.10.0 / Node v22.22.2:
+
+```
+route inside the guarded scope        GET /v1/analytics/metrics -> 200  hooksRan=["auth","tenant"]
+route in a sibling scope              GET /v1/analytics/metrics -> 200  hooksRan=[]
+route on the root instance            GET /v1/analytics/metrics -> 200  hooksRan=[]
+route in a sibling scope, prefixed    GET /v1/analytics/metrics -> 200  hooksRan=[]
+```
+
+So the wrong placement is not a 404 that someone notices — it is a **`200` that works**, at the
+right URL, with the guard silently skipped. Three of the four placements ship an unauthenticated,
+untenanted endpoint and only one is correct. The fourth row is this rework's addition; the middle
+two were measured at Gate 4.
+
+**Two adjacent gaps analytics now inherits, recorded so they are not rediscovered as new:**
+
+- **S-54** — `internalApiSecretSchema` has no *maximum* length, so analytics accepts a secret long
+  enough to be rejected downstream as an oversized header. Not fixed here: the ceiling belongs on
+  the shared fragment, which is a five-service change.
+- **S-19** — `apps/analytics-service/src/repositories/base.repository.ts` has no
+  `set_config('TimeZone','UTC',true)` pin and **zero** real subclasses; its single
+  `extends TenantScopedRepository` hit is the docstring example. T-051 creates the first subclass
+  and inherits S-19 there. This slice creates no repository and does not touch that file.
 
 ---
 
@@ -739,7 +845,9 @@ re-verification*. That instruction is only safe if the copy an agent sees is the
 Repeatedly it has not been.
 
 **The count in this entry does not reconcile, and is left as what can be listed rather than
-guessed.** The title says "twice", an earlier revision of this sentence said "Four times now"
+guessed — deliberately not "fixed" at S-9**, which added the bullet below and whose brief was
+explicit that this entry should be renumbered once, from the bullets, by whoever establishes the
+mechanism. Renumbering it now would make the title agree with a list that is still growing. The title says "twice", an earlier revision of this sentence said "Four times now"
 while listing **three** bullets, and T-048's rework added a fourth. Which sighting the missing
 fourth was is not recoverable from the text, so the durable claim is: **the bullets below are the
 recorded sightings** -- four bullets, five occurrences, because the last one records the same
@@ -772,6 +880,17 @@ implementers:**
   of the same task, in a different session, reported the identical mismatch. Both were caught by
   `cat`-ing the file first, which is the working practice below and is still the only thing
   catching it.
+
+- **At S-9, both outcomes in one task, hours apart — the first evidence the condition is
+  *intermittent*.** This is new information, and it is why the pair is recorded together rather
+  than as a fifth bullet about staleness. At S-9's Gate-3 rework the injected copy **matched
+  disk**: md5 `4b0b9a3c02844d2e22d301bf0848430a`, 3 907 lines, 48 headings ending at S-56, checked
+  by `cat` before the entry was edited. At that task's **Gate 4 Round 2**, in a different session
+  on the same working tree, the injected copy was the **Round-1 revision** — 48 headings ending at
+  S-56 — while disk was md5 `543fbc3a3ab8f0d0937775b6997abbd9`, 4 079 lines, **50** headings: it
+  could not see S-57 and S-58, which the *same task* had written between the two sessions. So the
+  injected copy is not reliably stale and not reliably fresh; it was both, for one file, within
+  one task. Any fix aimed at "the snapshot is always old" is aimed at the wrong shape.
 
 **What is *not* established:** the mechanism. No session has investigated whether this is
 snapshot timing, caching, or something else, and nothing here reproduces it on demand — every
@@ -1338,6 +1457,55 @@ bottom. A count you cannot re-run is not evidence.
 | `constants.ts` + S-27: the `RESERVED_STREAM_FIELDS` grep "returns **four** lines" | `grep -rn "RESERVED_STREAM_FIELDS" apps packages --include=*.ts` | **five** — same self-match |
 | S-19: "exactly one real subclass … **latent, not live**" | `grep -rn "extends TenantScopedRepository" apps/*/src` | **two** at T-040, which added worker's `EventRepository` — the first live data path over a base copy without the `TimeZone` pin. **Four** at T-045, which added billing's `MeterRepository` and `InvoiceRepository` over a third unpinned copy. Re-counted in each task rather than trusted; the entry now carries the table rather than a number in prose |
 | T-043 `stream.consumer.unit.test.ts`: the `dispatch`-guard mutation "reddens **nine** cases", with the nine listed | apply `if (this.shouldStop()) return;` at the top of `dispatch`'s per-entry loop, then `pnpm --filter @telemetry/worker-service exec vitest run tests/stream.consumer.unit.test.ts` | **eleven** — `Tests 11 failed \| 43 passed (54)`; the list omitted `U37` and `U70`. Caught at T-043's Gate 4 as LOW-2, inside a comment written in this entry's own style |
+
+**A fourth recurrence, S-9, and it is the reason to stop filing these and build the checker.**
+Three instances in one task, all in files `CLAUDE.md` designates authoritative, and in every one
+the author wrote the refuting evidence into the same entry or the same file:
+
+| Instance | Claim as written | Measured |
+|---|---|---|
+| S-9 test docblock (Gate 4, MEDIUM-1) | "A false positive is possible; a false negative is not, which is the right way round." | A length oracle ahead of `secretsMatch` leaves the package **56/56 green**, `AU15` green, typecheck exit 0, lint clean. The *same docblock* already said the assertions "would not notice a leaky comparison written some third way" |
+| S-58 title (Gate 4 Round 2, MEDIUM-3) | "The **five** `.env.example` files carry **three** different values" | **Six** files (the repo root was missed) and **two** values — and the entry's own body said the rework had removed the third spelling while the title still asserted it |
+| S-57 (Gate 4 Round 2, MEDIUM-4) | "a one-character edit to any one of the three declarations would ship green through all 13 packages" | True of **two** of three: analytics 56/56 and billing 231/231 ship green, usage is caught `3 failed \| 235 passed (238)` — by the three bare literals the *same entry* lists as a constants-gate violation |
+
+**What the proposed checker would have caught here, stated precisely rather than optimistically:**
+the S-58 rows, because both carry a re-runnable `grep` next to a numeral — a discover-the-files
+form would have returned six and the value census two. It would **not** have caught S-57's, because
+"would ship green through all 13 packages" has no command in it, only a prediction about a mutation
+nobody ran; nor MEDIUM-1's, for the same reason. So the checker reaches the counts and misses the
+universals, which is the split the scope note below already describes — now measured on a fourth
+task rather than argued.
+
+**Then S-9's Gate 6 found two more, and they change which half to build first.** Both arrived in
+the round that wrote the sentence above, which is the cleanest possible demonstration of it:
+
+| Instance | Claim as written | Measured |
+|---|---|---|
+| S-58's table (Gate 6, LOW-6) | row cites `apps/analytics-service/.env.example:33` | the line is **`:39`** — moved by the six comment lines the *same batch* added above it |
+| S-59 (Gate 6, LOW-7) | "**S-48** records exactly that progression — four gates, four previously-unlisted spellings" | `grep -c "four gates"` → **0** in S-48, **2** in S-51. The correct id is **S-51**, which the same entry cites correctly two paragraphs earlier |
+
+**Neither is a count, and neither is reachable by the `grep`-and-compare half.** One is a
+`file:line`; one is a finding-id cross-reference. Both are squarely the **second** half of this
+entry's own proposal — the citation checker the scope note below calls "the harder and more
+valuable target" — and the scope note's argument is now carried by six instances across three
+rounds of one task rather than by reasoning.
+
+So the block above is wrong in its emphasis and is corrected here rather than rewritten: it
+concluded the checker "reaches the counts and misses the universals", which is true of *those*
+three instances and stops being the useful summary once these two are added. The count half
+reaches 2 of 6; the citation half reaches 2 of 6; the universals reach neither. **The half nobody
+has prioritised is the one with the most instances behind it that a machine could actually
+settle** — a `file:line` either resolves to the cited text or does not, and a finding id either
+exists and says what the citing text claims or does not. Both are decidable without judgement,
+which is more than can be said for a universal.
+
+**This is the point to build it, and a task is being opened.** Four tasks have filed instances and
+the checker is still unbuilt; a seventh entry describing the same shape is worth less than the
+pass S-33 has specified since T-041. Scope it to **both** halves, and start with the citation
+check: `file:line` references and `S-xx` / `T-0xx` / `U`/`I`/`BU`-case ids quoted between
+`.claude/rules/`, `docs/plans/`, `docs/reviews/`, `docs/qa/` and source comments. Do not wait for
+another instance — the previous revision of this paragraph said "should not wait for a fifth
+instance" and two more landed before it was read.
 
 **A second shape, and it is not a count: a measurement attached to the wrong mutation.** S-26's
 T-043 note quoted a three-element log array as what "the drain removed" produces. Re-measured by
@@ -3848,3 +4016,401 @@ survives a `dist` run); add `@opentelemetry/instrumentation-http` for the root H
 re-derive T-055's acceptance by running the probe in this entry against each of the six real
 entrypoints rather than a synthetic app. Do T-056 after, not before — its acceptance is
 not satisfiable until spans exist, and swapping the logger first would make it look done.
+
+---
+
+## S-57 · The tenant-context vocabulary is three copies in three services, and S-9 made it the third without promoting it — **LOW, open**
+
+Filed by S-9's Gate-4 review (MEDIUM-2) and recorded rather than fixed, on the user's ruling and
+on **S-39**'s precedent: promote what the current task owns, record what belongs to other
+services.
+
+`.claude/rules/constants.md` is a **required** review gate and says *"before adding a third copy
+of a literal, promote it"*. S-9 added the third copy of four literals and did not.
+
+**Measured census.** `grep -rn --include='*.ts' '"<literal>"' apps packages`, `dist/` filtered,
+run once per literal — **three `src/` sites each, all executable, and all byte-identical today**:
+
+| Literal | usage | billing | analytics (added by S-9) |
+|---|---|---|---|
+| `"TENANT_CONTEXT_MISSING"` | `src/constants.ts:27` | `src/constants.ts:83` | `src/constants.ts:44` |
+| `"X-Tenant-Id header is required"` | `:28` | `:84` | `:45` |
+| `"TENANT_CONTEXT_INVALID"` | `:29` | `:85` | `:46` |
+| `"X-Tenant-Id header must be a valid UUID"` | `:30` | `:86` | `:47` |
+
+The `TenantContextMissingError` / `TenantContextInvalidError` classes that consume them are
+duplicated the same way — `grep -rln "class TenantContextMissingError" apps/*/src` returns
+analytics, billing and usage — but that is three small classes over one vocabulary, and it is the
+**vocabulary** that is the wire contract. Promote the strings; the classes can follow or not.
+
+**A fourth occurrence that is not a fourth declaration**, listed because the rule covers tests
+too: `apps/usage-service/tests/middleware.tenant-context.unit.test.ts:53`, `:70` and `:86` write
+`code: "TENANT_CONTEXT_MISSING"` as a bare literal while that service's own constant is
+importable. The other three literals have no test occurrences. So the full count for
+`"TENANT_CONTEXT_MISSING"` is **six** lines, three declarations and three test literals; for the
+other three it is three lines each.
+
+**The omission was selective, not uniform, and that is the evidence it is worth recording.**
+The same file, `apps/analytics-service/src/constants.ts`, derives its **other two** vocabularies
+correctly: `ANALYTICS_HEADERS` takes `INTERNAL_SECRET` from `INTERNAL_AUTH_HEADERS` and
+`TENANT_ID` from `TENANT_CONTEXT_HEADERS` (`:23-24`), and `ANALYTICS_RESPONSES.CODE_UNAUTHORIZED`
+takes its value from `INTERNAL_AUTH_RESPONSES` (`:33`) — all three from
+`@telemetry/shared-types`. S-9 created **no** fourth `x-tenant-id` literal, which is what S-39
+asks of it. So the rule was applied twice in one file and skipped once, rather than not being
+known.
+
+**Failure mode, stated at the strength it holds — and the first version of this paragraph
+overstated it.** These four strings are a response contract a client branches on: a caller that
+checks `code === "TENANT_CONTEXT_MISSING"` gets the same answer from usage, billing and analytics
+**today**, and nothing *designed* enforces that it keeps getting it. No test compares the three,
+and the gateway does not inspect the code. This entry originally added that "a one-character edit
+to any one of the three declarations would ship green through all 13 packages". **Measured, that
+is true of two of the three, not three of three** — the mutation being
+`CODE_TENANT_CONTEXT_MISSING: "TENANT_CONTEXT_MISSING"` → `"TENANT_CONTEXT_MISSINX"`, applied to
+one service's `constants.ts` at a time and reverted with `md5sum -c`:
+
+| Declaration edited | That package's suite |
+|---|---|
+| `apps/analytics-service/src/constants.ts:44` | **`Tests 56 passed (56)`** — ships green |
+| `apps/billing-service/src/constants.ts:83` | **`Tests 231 passed (231)`** — ships green |
+| `apps/usage-service/src/constants.ts:27` | **`Tests 3 failed \| 235 passed (238)`** — caught |
+
+usage-service's three failures are `rejects request with missing X-Tenant-Id header with 401
+TENANT_CONTEXT_MISSING`, `rejects request with empty X-Tenant-Id header` and `rejects request with
+whitespace-only X-Tenant-Id header`, all in
+`apps/usage-service/tests/middleware.tenant-context.unit.test.ts` (scoped:
+`Tests 3 failed | 13 passed (16)`).
+
+**And here is the part that matters more than the count.** What catches usage's drift is *exactly*
+the three bare literals at `:53`, `:70` and `:86` that this entry lists above as a constants-gate
+violation. They assert the literal string against a response built from the constant, so they are
+an **accidental partial guard** — the only drift protection the platform has for this vocabulary,
+created by breaking the rule this entry is about. Nobody designed it and it covers one service of
+three.
+
+So the correct statement is: a one-character edit to analytics' or billing's declaration ships
+green; usage's is caught, by a test that should not have been written that way. Still the S-39
+shape — a wire string resolved through unrelated declarations — and still latent rather than live,
+because no consumer of these codes exists on this tree to break (`apps/web` reads none of them).
+
+**Why promotion was declined here.** Rewiring `apps/usage-service/src/constants.ts:27-30` and
+`apps/billing-service/src/constants.ts:83-86` puts two other services' constants in an
+analytics-service diff, which is the one-task-per-commit objection this file has now recorded at
+S-19, S-22, S-23, S-39, S-40 and S-45. S-39 took the same decision for the same reason and
+recorded the copies it could not rewire; this is that entry's sibling for the response vocabulary
+rather than the header name.
+
+**Fix direction — and read the ordering warning before starting.** Add
+`TENANT_CONTEXT_RESPONSES = { CODE_MISSING, MESSAGE_MISSING, CODE_INVALID, MESSAGE_INVALID }` to
+`packages/shared-types/src/index.ts` beside `TENANT_CONTEXT_HEADERS`, point all three services'
+`constants.ts` at it, and replace the three bare literals in usage-service's tenant-context test
+with the constant.
+
+**Those two halves must land in the same change, in that order.** Replacing usage's three literals
+is the obvious tidy-up and it is the one step that makes things *worse on its own*: per the table
+above, those literals are the only thing that catches a drifted declaration anywhere on the
+platform, and a test asserting the constant against a response built from the same constant
+catches nothing. Tidy them first and the platform goes from one-service-guarded to
+zero-service-guarded with the whole gate green. After promotion the guard is structural — one
+declaration cannot drift from itself — so the literals are genuinely redundant then, and not
+before. If the promotion is ever deferred, **leave usage's literals alone** and say why in the
+test. One change that does nothing else, value-identical, no
+behaviour change, and the full gate re-proves it. Do it as its own task across the three services
+— not opportunistically inside a fourth service's feature work, which is how this reached three.
+Note the promotion target is **not** hypothetical: `TENANT_CONTEXT_HEADERS` already lives at
+`packages/shared-types/src/index.ts:103` and is what the header half of this vocabulary derives
+from.
+
+---
+
+## S-58 · The six `.env.example` files carry **two** different `INTERNAL_API_SECRET` values, so a local stack built from them fails service-to-service auth — **LOW, open, pre-existing**
+
+Found by S-9's Gate-4 review (LOW-2) while checking the value that task added. **The split
+predates S-9** — gateway/usage and billing/worker already disagreed.
+
+**Both of this entry's original counts were wrong and are corrected here** (S-9 Gate-4 Round 2,
+MEDIUM-3). It said *five* files and *three* values. It is **six** files — the repo-root
+`.env.example` was missed, and it is the one a developer copies first — and **two** values, because
+the third spelling existed only on the Round-1 tree and S-9's own rework removed it by moving
+analytics onto gateway's. The entry's body already said the rework had done that while its title
+still asserted the pre-fix state: the author wrote the refuting evidence into the same entry, which
+is S-33's shape and is now a row there.
+
+**Measured** — `grep -rn "^INTERNAL_API_SECRET=" --include=".env.example" .`, `node_modules`
+excluded, with lengths, re-derived at Round 2:
+
+| File | Value | Length |
+|---|---|---|
+| **`.env.example` — the repo root, untouched by S-9** | `dev-local-internal-secret-at-least-32-chars` | 43 |
+| `apps/gateway/.env.example` — **the sender** | `dev-local-internal-secret-at-least-32-chars` | 43 |
+| `apps/usage-service/.env.example` | `dev-local-internal-secret-at-least-32-chars` | 43 |
+| `apps/analytics-service/.env.example` (added by S-9) | `dev-local-internal-secret-at-least-32-chars` | 43 |
+| `apps/billing-service/.env.example` | `dev-local-secret-change-in-production` | 37 |
+| `apps/worker-service/.env.example` | `dev-local-secret-change-in-production` | 37 |
+
+**No line numbers in that table, deliberately.** They were there and one of them was already wrong:
+the analytics row read `:33` while the line was `:39`, moved by the six comment lines the *same
+batch* added above it — a citing change breaking its own citation, inside the entry whose subject
+is a census (S-9 Gate 6, LOW-6). The line number also adds nothing here: the table answers "which
+files declare this and with what value", and the command above prints the line for anyone who
+wants it. This is the rule S-19 reached after six recorded positions rotted for a declaration
+nobody moved, S-48 states as "cite by method and symbol, not `file(line,col)`", and S-40 applied by
+dropping its `skip:` line — **cite a line only in a file the citing change does not edit, and
+prefer an anchor even then.**
+
+`sort | uniq -c` over the six values: **4 × `dev-local-internal-secret-at-least-32-chars`**,
+**2 × `dev-local-secret-change-in-production`**. So the split is now 4–2 between two spellings, and
+the minority is billing and worker.
+
+**The analytics row is a net addition, not a value change** (QA O-1):
+`git show HEAD:apps/analytics-service/.env.example | grep -c INTERNAL_API_SECRET` → **0**. That file
+had no such line before S-9, so S-9 added one and picked gateway's value; it did not edit an
+existing value. Anything describing it as a value change is wrong.
+
+Every one is a legal secret — both spellings are printable ASCII and over
+`INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH`, so every service **starts**. They simply do not
+match each other.
+
+**The consequence is measured, not reasoned about.** Driving billing-service's *real*
+`buildInternalAuthMiddleware` factory with each value as the configured secret and gateway's
+`.env.example` value as the inbound `x-internal-secret`:
+
+```
+gateway .env.example value -> a guard holding billing's .env.example value  -> 401 {"code":"UNAUTHORIZED"}
+gateway .env.example value -> a guard holding gateway's own value           -> 200
+```
+
+So a developer who copies the `.env.example` files verbatim and runs the stack gets `401` on
+**every** proxied `/v1/billing` and `/v1/worker` request, with two healthy-looking services and no
+startup warning. That half is **live today**, because billing and worker have real routes behind
+their guards. The analytics half is not live yet — its guarded scope holds no routes until T-051
+(S-9) — which is why S-9 could fix its own line cheaply and why fixing it did not resolve this.
+
+**`docker/docker-compose.yml` is correct and must not be "aligned" to these.** All five blocks
+carry `ci-internal-api-secret-with-at-least-32-chars`, verified identical
+(`grep -n "INTERNAL_API_SECRET:" docker/docker-compose.yml` → five lines, one value). Compose is a
+self-consistent world; the defect is entirely in the `.env.example` set.
+
+**Why it is LOW.** Nothing is insecure — the failure is a refusal, not an acceptance, and it fails
+closed in the S-8 sense: mismatched secrets reject rather than authenticate. No deployment uses
+these values; they are local-development placeholders, and a real deployment supplies its own. The
+cost is a developer's afternoon, and a misleading one, because the symptom (`401 UNAUTHORIZED`
+from a service that started cleanly) looks like a code defect rather than a configuration one.
+
+**Why S-9 did not fix it.** Rewiring `apps/billing-service/.env.example` and
+`apps/worker-service/.env.example` puts two other services' configuration in an analytics diff —
+the one-task-per-commit objection recorded at S-19, S-22, S-23, S-39, S-40, S-45 and S-57. S-9
+fixed only the line it added, and pointed its own comment here.
+
+**Fix direction:** pick one value for all **six** `.env.example` files — the repo root included,
+which is the row this entry originally missed and the file a developer reads first — and write it
+once, in a change that does nothing else. Match **gateway's**, because gateway is the service that sends the header
+and two of the five already agree with it. Then consider whether these five files should be
+generated from one source at all: nothing checks that they agree, and nothing would have caught
+this. A cheap interim guard is a test in `@telemetry/shared-validation` (or any one service's env
+suite) that **discovers** the `.env.example` files rather than listing them — a hard-coded list is
+how this entry came to omit the repo root — and asserts one distinct `INTERNAL_API_SECRET` value — the throwing-locator shape
+`apps/analytics-service/tests/env.schema.unit.test.ts` already uses for the port, which would have
+caught this the day the second spelling landed.
+
+---
+
+## S-59 · `AU15` has a second, worse evasion: the guard can compare with `===` while every assertion stays green — **LOW, open**
+
+Found by S-9's Gate-5 QA (F-1) and re-derived at that task's Gate-4 Round-2 rework. It answers
+affirmatively the open question that review left — whether a spelling worse than the length oracle
+exists — and the answer matters more than the first one did.
+
+`apps/analytics-service/tests/internal-auth.middleware.unit.test.ts`'s `AU15` makes three
+source-text assertions about `src/middleware/internal-auth.middleware.ts`: the `secretsMatch`
+import is present, the substring `secretsMatch(` is present, and the substring
+`!== internalApiSecret` is **absent**. **All three hold while the live comparison is a plain
+`===`:**
+
+```ts
+const shapeOk = typeof providedSecret === "string" && secretsMatch("", "");
+
+if (
+  typeof providedSecret !== "string" ||
+  !(providedSecret === internalApiSecret) ||
+  !shapeOk
+) {
+```
+
+`secretsMatch` is still imported and still *called* — on two empty strings, where its result is
+constant and load-bearing on nothing. The real decision is `providedSecret === internalApiSecret`.
+
+**Measured**, mutation applied to the shipped file and reverted with `md5sum -c`:
+
+```
+pnpm --filter @telemetry/analytics-service typecheck   -> exit 0
+pnpm --filter @telemetry/analytics-service lint        -> exit 0, 0 findings
+pnpm --filter @telemetry/analytics-service exec vitest run -> Tests 56 passed (56)
+AU15's three assertions, evaluated against the mutated source:
+  contains `secretsMatch } from "@telemetry/shared-utils"`  -> true
+  contains `secretsMatch(`                                  -> true
+  contains `!== internalApiSecret`                          -> false   (the assertion requires false)
+```
+
+**It is materially worse than the length oracle already recorded in S-9.** That one leaks the
+secret's *length*; this one restores the full **byte-prefix short-circuit** that S-8 existed to
+remove from billing and worker — response latency reveals how many leading bytes a guess got
+right, so the secret is recoverable one byte at a time rather than guessed whole.
+
+**That last sentence is inherited, not measured here, and is labelled because this entry is about a
+census claiming more than it establishes** (Gate 6, NIT-5). It is S-8's premise — the reason that
+change replaced `!==` with `secretsMatch` in three guards — and no timing measurement of `===`
+against this platform's guard has been taken by S-8, S-9 or this entry. `secretsMatch`'s own
+docblock is explicit that the constant-time property rests on `crypto.timingSafeEqual`'s contract
+rather than on any test here, and that a timing assertion is not reliably measurable in a vitest
+process on a shared runner. So: the *reachability* of the `===` form is measured below; its
+*exploitability* is inherited reasoning and should be cited as S-8's, not as this entry's.
+
+`===` is also not an exotic spelling: it is what an ordinary refactor or a merge resolution
+reaches for, where `internalApiSecret.length !== providedSecret.length` has to be written on
+purpose.
+
+**Why a new id and not an extension of S-51.** S-51's title is scoped to billing-service's member
+and cast censuses (`BU125`/`BU126`); extending it to an analytics guard assertion would make that
+title false — the objection this file records for keeping S-32 out of S-29 and S-35 out of both.
+What the two share is the **shape**, and it is S-51's own sentence: *a census over an enumerated
+set catches the members of that set*. Read them together.
+
+**Two known evasions is evidence the set is larger than enumerated, not that it is now complete.**
+S-9 records the length oracle and its operand-order asymmetry; this entry records the `===` form.
+Neither was found by widening the list on principle — each was found by someone trying one more
+spelling, and each time the previous list looked sufficient. Do not write "`AU15` now catches every
+inline comparison", and do not close this by adding `=== internalApiSecret` to the forbidden list:
+that buys the one spelling named here and leaves `Object.is`, a `==`, a `localeCompare`, a helper
+that launders the comparison, and the next thing nobody has thought of. **S-51** records exactly
+that progression for billing — four gates, four previously-unlisted spellings. (An earlier revision
+of this sentence credited it to **S-48**; `grep -c "four gates"` returns **0** in S-48 and **2** in
+S-51, and S-48's prose enumerates two. Corrected at Gate 6, LOW-7 — and note this entry cites S-51
+correctly two paragraphs above, so it was one idea landing on two different ids.)
+
+**Severity LOW, argued.** Nothing is wrong on the shipped tree: the guard does call `secretsMatch`
+on the real operands, verified by reading it, and analytics' guard protects zero routes until
+T-051 (S-9). The cost is evidentiary — a reviewer or agent can read a green `AU15` as "the
+comparison is timing-safe" when what it establishes is "the file spells `secretsMatch(` somewhere
+and does not spell one forbidden substring". It becomes **MEDIUM** the moment T-051 puts a
+tenant-scoped route behind that guard *and* someone relies on `AU15` in a review instead of
+reading the comparison.
+
+**Fix direction.** A text census cannot be made complete, so stop trying to complete it and change
+what is asserted. Two options, neither taken here because both are test-logic changes outside a
+text-only round:
+
+- **Assert the call's operands, not the file's substrings** — parse the middleware with the
+  TypeScript compiler API and assert that the `if` condition's only comparison is a call to
+  `secretsMatch` whose arguments are the two identifiers in scope. That reaches every spelling of
+  an inline comparison, including all three now on record, because it asserts a shape rather than
+  a string. `apps/billing-service/src/repositories/base.repository.ts`'s
+  `InvoiceDelegateSurfaceCensus` is the precedent for a compiler-level assertion in this repo.
+- **Or delete `AU15` and say the property is unguarded**, which is honest and is what
+  `.claude/rules/testing.md` prefers to a case that cannot fail for the reason it names.
+
+Whichever is chosen, write the two evasions on record as the cases the replacement must go red on,
+and confirm both red before trusting it.
+
+---
+
+## S-60 · The scoping command `CLAUDE.md` recommends bypasses turbo's env filtering, so an ambient invalid `INTERNAL_API_SECRET` reddens four of six services — **LOW, open**
+
+Found by S-9's Gate-5 QA (F-2) and re-derived at that task's Gate-4 Round-2 rework. A conflict
+between two pieces of this repository's own documentation, not a defect in any service.
+
+`CLAUDE.md` and `.claude/rules/testing.md` both say the same thing, because
+`pnpm --filter <pkg> test -- <file>` does not filter: **use `pnpm --filter <pkg> exec vitest run
+<file>` to scope a run.** That command runs vitest directly and therefore **inherits the caller's
+whole environment**. `pnpm test` runs through turbo, which passes only the variables a task
+declares — and `turbo.json:16` declares `INTERNAL_API_SECRET` on the **`dev`** task **only**, not
+on `test`. So the two paths disagree about whether an ambient `INTERNAL_API_SECRET` reaches the
+module-load `parseEnv`.
+
+**Measured**, same shell, same tree, an ambient 5-character secret against the 32 minimum:
+
+| Command | Result |
+|---|---|
+| `INTERNAL_API_SECRET=short pnpm test --force --filter @telemetry/analytics-service` | `Tests 56 passed (56)` — turbo strips it |
+| `INTERNAL_API_SECRET=short pnpm test --force --filter @telemetry/billing-service` | `Tests 231 passed (231)` — turbo strips it |
+| `INTERNAL_API_SECRET=short pnpm --filter @telemetry/analytics-service exec vitest run` | `Test Files 4 failed \| 3 passed (7)` |
+| `INTERNAL_API_SECRET=short pnpm --filter @telemetry/billing-service exec vitest run` | `Test Files 8 failed \| 12 passed (20)` |
+| `INTERNAL_API_SECRET=short pnpm --filter @telemetry/worker-service exec vitest run` | `Test Files 4 failed \| 14 passed (18)` |
+| `INTERNAL_API_SECRET=short pnpm --filter @telemetry/usage-service exec vitest run` | `Test Files 6 failed \| 13 passed (19)` |
+| `INTERNAL_API_SECRET=short pnpm --filter @telemetry/gateway exec vitest run` | `Test Files 9 passed (9)` — **immune, structurally** |
+| `INTERNAL_API_SECRET=short pnpm --filter @telemetry/auth-service exec vitest run` | `Test Files 15 passed (15)` — **immune, but only to this field** |
+
+**Four of the six services**, and the table now carries all six so the count is derivable from it
+— the auth row was missing when this entry was written, which made "four of six" unsupported by
+its own evidence (Gate 6, NIT-4). The four that fail parse at module load
+(`export const env = parseEnv(EnvSchema, process.env)`), which is the property that makes a
+misconfigured service fail at startup instead of in traffic — a deliberate design this entry is
+**not** arguing against. The failures are import-time collection failures, not assertion failures:
+the suites do not run at all.
+
+**The two immunities are not the same immunity, and the difference matters.**
+
+- **gateway is immune structurally.** Its schema parses lazily inside `loadEnv()` rather than at
+  module load, so importing its modules does not parse the environment at all. No ambient value
+  for any field reaches it through this path.
+- **auth-service is immune only to *this field*.** It parses eagerly like the other four
+  (`apps/auth-service/src/config/env.ts:39`), and is untouched here solely because it declares no
+  `INTERNAL_API_SECRET` — `grep -c "INTERNAL_API_SECRET" apps/auth-service/src/config/env.ts` →
+  **0**, and its `EnvSchema` holds eleven fields, none of them that one. Undeclared keys are
+  stripped by `z.object`, so the ambient value is ignored.
+
+  Measured, because "immune to this field" invites the reading "immune": the **same command** with
+  an ambient invalid value for a field auth *does* declare reproduces the defect there —
+  `JWT_SECRET=short pnpm --filter @telemetry/auth-service exec vitest run` fails with
+  `Invalid environment configuration for JWT_SECRET: JWT_SECRET must be at least 32 characters`.
+  `JWT_SECRET` is `z.string().min(32, …)` at `apps/auth-service/src/config/env.ts:16`.
+
+So the honest scope is: **five of six services are reachable by this mechanism** and only gateway
+is structurally out of reach; **four of six** is the count for `INTERNAL_API_SECRET` specifically,
+which is the variable this entry was filed about. Do not generalise the four into "the other two
+are safe".
+
+**The trigger on the machine where this was found is a local file, and the entry must not be read
+as "everyone's suite is red".** The repo-root `.env` carries a **16-character**
+`INTERNAL_API_SECRET`, below the 32 minimum. That file is **gitignored** (`.gitignore:6`) and
+untracked, so the value is one developer's, not something the repository ships. Two things were
+measured separately and should not be conflated:
+
+- **The mechanism is platform-wide** — it follows from turbo's env filtering versus a direct
+  vitest invocation, and it reproduces for any ambient invalid value, as the table above shows.
+- **The `.env` file does not by itself reach a vitest process here.** Control, same machine, same
+  shell: a plain `pnpm --filter @telemetry/analytics-service exec vitest run` with no ambient
+  variable returns `Tests 56 passed (56)`. So vitest did **not** load the root `.env` into
+  `process.env`; the value must be exported into the invoking shell (a `set -a` source, `direnv`,
+  a CI step, an editor's terminal profile) to bite. What is **not** established is how common that
+  is, or whether some other tool on another machine does load it.
+
+**Analytics is the fourth service to inherit this, and it did so by being correct.** S-9 mirrored
+billing's and worker's pattern exactly — declare the field from the shared fragment, parse at
+module load, supply the test value from `tests/setup.ts` — which is what `CLAUDE.md` instruction 5
+asks for. Doing the right thing is what acquires the defect, which is the part worth recording:
+there is no local choice a fifth service could make to avoid it short of gateway's lazy parse.
+
+**Severity LOW.** Nothing ships wrong and no production behaviour is implicated — it is entirely a
+developer-experience and diagnosis cost. It earns an id rather than a shrug because the failure is
+badly misleading: a developer follows the documented scoping command, sees four suites fail to
+collect with `Invalid environment configuration for INTERNAL_API_SECRET`, and has no reason to
+suspect their own shell rather than the change they are making. The same person running
+`pnpm test` sees green, which makes it look intermittent.
+
+**Fix direction — decide it, do not patch one service.** Options, in rough order of cost:
+
+- **Document it where the command is recommended.** One sentence in `CLAUDE.md` and
+  `.claude/rules/testing.md`: `exec vitest run` inherits the ambient environment where `pnpm test`
+  does not, so unset `INTERNAL_API_SECRET` (and anything else a schema validates) before scoping a
+  run. Cheapest, and it puts the warning where the trap is sprung.
+- **Have `tests/setup.ts` overwrite rather than default.** Every service uses `??=`, which defers
+  to an ambient value on purpose; changing it to `=` would make the suites hermetic and would also
+  silently discard a value someone set deliberately. That is a real trade and needs deciding for
+  all six services at once, not for whichever one is being edited — the S-19/S-23/S-39 objection.
+- **Declare `INTERNAL_API_SECRET` on turbo's `test` task**, which would make the two paths agree by
+  making `pnpm test` *also* fail on an ambient invalid value. Note this is the opposite direction
+  from the first two and would turn a silent divergence into a loud one for every developer.
+
+Do not close this by adding the variable to some services' `test` env and not others; that
+converts one divergence into two.

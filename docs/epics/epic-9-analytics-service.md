@@ -35,7 +35,29 @@ export const EnvSchema = z.object({
 
 ## T-051 · Metrics rollup — `GET /v1/analytics/metrics`
 
-**Files**: `controllers/analytics.controller.ts`, `services/analytics.service.ts`, `repositories/rollup.repository.ts`
+**Files**: `controllers/analytics.controller.ts`, `services/analytics.service.ts`, `repositories/rollup.repository.ts`, **`src/app.ts`**
+
+> **Register the route *inside* the existing `app.register` scope in `src/app.ts`.** S-9 fitted
+> analytics' internal-auth guard and tenant-context hook into that scope and left it holding no
+> routes, so this task's route is the first thing behind them. The Files line above named three
+> files and not `src/app.ts` until S-9's Gate-4 review (LOW-4); a route registered anywhere else is
+> unauthenticated and untenanted, and **nothing on this tree would notice**.
+>
+> Measured, four placements against that scope, fastify 5.10.0 / Node v22.22.2 — the wrong
+> placement is not a 404 somebody spots, it is a working `200` with the guard skipped:
+>
+> ```
+> route inside the guarded scope      GET /v1/analytics/metrics -> 200  hooksRan=["auth","tenant"]
+> route in a sibling scope            GET /v1/analytics/metrics -> 200  hooksRan=[]
+> route on the root instance          GET /v1/analytics/metrics -> 200  hooksRan=[]
+> route in a sibling scope, prefixed  GET /v1/analytics/metrics -> 200  hooksRan=[]
+> ```
+>
+> Pair it with a case that fails when the registration moves out of the callback —
+> `apps/billing-service/tests/billing-invoices.route.test.ts` `BU78` is the shape: assert the
+> service method was **never called**, not merely that the status was 401. See
+> `.claude/rules/known-gaps.md` S-9, which this task discharges, and S-53 for the separate
+> defects in the `$queryRaw` snippet below.
 
 **Query params**:
 ```ts

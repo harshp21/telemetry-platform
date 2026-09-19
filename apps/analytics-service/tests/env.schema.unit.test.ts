@@ -1,5 +1,7 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { INTERNAL_AUTH_CONSTANTS } from "@telemetry/shared-types";
+import { internalApiSecretSchema } from "@telemetry/shared-validation";
 import { EnvSchema } from "../src/config/env";
 import { ANALYTICS_RUNTIME } from "../src/constants";
 import { ANALYTICS_SERVICE_STARTUP } from "../src/startup.constants";
@@ -17,6 +19,11 @@ import { ANALYTICS_SERVICE_STARTUP } from "../src/startup.constants";
  * declared at `apps/gateway/src/config/env.ts:41`; and `grep -n "PORT" apps/gateway/tests/env.schema.unit.test.ts`
  * matches one line, which is `OTEL_EXPORTER_OTLP_ENDPOINT`.
  *
+ * **S-9 extended this file** with the `internal service auth configuration` block at the end and
+ * with `INTERNAL_API_SECRET` in `buildBaseEnv` and `EXPECTED_ENV_FIELDS`. That block's red/green
+ * split is recorded on the block itself; it is a different one from T-050's below, because the
+ * field did not exist at all before S-9.
+ *
  * Red/green split at Gate 3, stated because most of this file is a guard being added rather
  * than a regression test for the bug: exactly **one** assertion was red on the unfixed tree --
  * `defaults PORT to the port index.ts binds`, where the parsed default was 3000 against the
@@ -25,13 +32,35 @@ import { ANALYTICS_SERVICE_STARTUP } from "../src/startup.constants";
  * permits; what it forbids is claiming they went red.
  */
 
-/** The three fields the schema requires with no default. Everything else has one. */
+/**
+ * A secret this suite owns, distinct from the one `tests/setup.ts` supplies, so that a case
+ * asserting on a parsed value cannot pass because it happened to match the ambient environment.
+ * 46 printable-ASCII characters, above `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH`.
+ */
+const VALID_INTERNAL_API_SECRET = "s-009-analytics-internal-secret-at-least-32ch";
+
+/**
+ * The top of `INTERNAL_AUTH_CONSTANTS.SECRET_PATTERN`'s accepted range, and the code point one
+ * above it. A *boundary* rather than a character from deep inside the rejected space: a pattern
+ * one character too wide would still reject U+200B, so a case built on that would pass while the
+ * rule it guards was wrong. `apps/billing-service/tests/env.schema.unit.test.ts` carries the same
+ * pair for the same reason; the exhaustive character table lives once, against the fragment
+ * itself, in `packages/shared-validation/tests/unit.test.ts`.
+ */
+const PRINTABLE_ASCII_RANGE_END = 0x7e;
+const JUST_ABOVE_PRINTABLE_ASCII = String.fromCharCode(PRINTABLE_ASCII_RANGE_END + 1);
+
+/**
+ * The four fields the schema requires with no default -- three until S-9 added
+ * `INTERNAL_API_SECRET`, which `internalApiSecretSchema` declares with no default either.
+ */
 const buildBaseEnv = (): Record<string, string> => ({
   NODE_ENV: "test",
   DATABASE_URL: "postgresql://telemetry_app:telemetry_app_local_dev@localhost:5432/telemetry",
   REDIS_URL: "redis://localhost:6379",
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318",
-  LOG_LEVEL: "silent"
+  LOG_LEVEL: "silent",
+  INTERNAL_API_SECRET: VALID_INTERNAL_API_SECRET
 });
 
 /**
@@ -112,7 +141,8 @@ const EXPECTED_ENV_FIELDS = [
   "DATABASE_URL",
   "REDIS_URL",
   "OTEL_EXPORTER_OTLP_ENDPOINT",
-  "LOG_LEVEL"
+  "LOG_LEVEL",
+  "INTERNAL_API_SECRET"
 ] as const;
 
 /**
@@ -432,12 +462,138 @@ describe("analytics-service env schema", () => {
   });
 
   describe("schema shape", () => {
-    // AC8. Green from the start -- a drift guard, with the S-51 limit noted on
-    // `EXPECTED_ENV_FIELDS`. Order is asserted as well as membership because the epic's
-    // snippet declares these six in this order and a reordering is the cheapest way for a
-    // reviewer's diff of the two to stop being readable.
-    it("declares exactly the six documented fields", () => {
+    // AC8 / AU2. Green from the start at T-050 with six names; **red at S-9's Gate 3** with the
+    // seventh, which is the point of a census. Order is asserted as well as membership because
+    // the epic's snippet declares the first six in this order and a reordering is the cheapest
+    // way for a reviewer's diff of the two to stop being readable. `INTERNAL_API_SECRET` is
+    // appended rather than inserted, matching its position in `src/config/env.ts` and the three
+    // other services that declare it last.
+    //
+    // The S-51 limit noted on `EXPECTED_ENV_FIELDS` applies with full force here: this case
+    // notified that the set changed and said nothing about whether the new field is sound. What
+    // vets the field is the identity assertion below, not this line.
+    it("declares exactly the seven documented fields", () => {
       expect(Object.keys(EnvSchema.shape)).toEqual([...EXPECTED_ENV_FIELDS]);
+    });
+  });
+
+  /**
+   * S-9 slice 1. Until this task analytics-service was the only one of the six services with no
+   * `INTERNAL_API_SECRET` at all -- `grep -n "INTERNAL_API_SECRET" apps/analytics-service/src/config/env.ts`
+   * returned nothing on `1220051`, while gateway, usage, billing and worker all declared it.
+   *
+   * **Every case in this block was red before the field existed**, measured at Gate 3 by running
+   * this file against the unchanged `src/config/env.ts`: `Tests 8 failed | 11 passed (19)` -- the
+   * seven here plus `declares exactly the seven documented fields` above. Each failed for the
+   * reason that matters rather than incidentally: an undeclared key is *stripped* by `z.object`,
+   * so all four rejection cases parsed successfully, the identity case compared `undefined`
+   * against the fragment, the module-load case resolved instead of rejecting, and its control
+   * read `undefined`.
+   */
+  describe("internal service auth configuration", () => {
+    const previousSecret = process.env.INTERNAL_API_SECRET;
+
+    afterEach(() => {
+      if (previousSecret === undefined) {
+        delete process.env.INTERNAL_API_SECRET;
+      } else {
+        process.env.INTERNAL_API_SECRET = previousSecret;
+      }
+      vi.resetModules();
+    });
+
+    // AU1 -- the strongest single assertion in this file, and the one that transfers the
+    // fragment's whole input table to this service by construction. It is what stops analytics
+    // becoming a fifth strictness: repointing this declaration at a locally written
+    // `z.string().trim().min(32).regex(...)` reddens this line **even with an identical
+    // spelling**, because it compares object identity rather than behaviour. The other four
+    // services that declare the field assert exactly this (`apps/gateway/tests/env.schema.unit.test.ts`,
+    // `apps/usage-service/tests/env.schema.unit.test.ts`,
+    // `apps/billing-service/tests/env.schema.unit.test.ts`,
+    // `apps/worker-service/tests/env.schema.unit.test.ts`), so analytics is the fifth.
+    //
+    // What it does not establish: that the fragment's rule is *right*. That is asserted once,
+    // against the fragment, in `packages/shared-validation/tests/unit.test.ts`.
+    it("declares INTERNAL_API_SECRET as internalApiSecretSchema itself", () => {
+      expect(EnvSchema.shape.INTERNAL_API_SECRET).toBe(internalApiSecretSchema);
+    });
+
+    // AU3. The field has no default, so an env without it does not parse and the service does
+    // not start -- which is the direction §9 R1 of the plan calls loud and cheap to fix.
+    it("rejects an env with no INTERNAL_API_SECRET", () => {
+      expectIssueOn(
+        EnvSchema.safeParse(buildEnvWithout("INTERNAL_API_SECRET")),
+        "INTERNAL_API_SECRET"
+      );
+    });
+
+    // AU4. The boundary comes from the shared constant, never written as 32, so a change to
+    // `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH` moves this case with the schema.
+    it("rejects an INTERNAL_API_SECRET one character below the shared minimum", () => {
+      expectIssueOn(
+        EnvSchema.safeParse({
+          ...buildBaseEnv(),
+          INTERNAL_API_SECRET: "x".repeat(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH - 1)
+        }),
+        "INTERNAL_API_SECRET"
+      );
+    });
+
+    // AU5. The case that distinguishes the fragment's `.trim().min(...)` order from both of its
+    // neighbours: `.min(32)` alone parses 32 spaces verbatim, `.min(32).trim()` parses them to
+    // `""`, and only `.trim().min(32)` raises an issue. Analytics does not own that order -- the
+    // fragment does -- but this is the end-to-end proof that the whole-object parse reaches it.
+    it("rejects an all-whitespace INTERNAL_API_SECRET at the minimum length", () => {
+      expectIssueOn(
+        EnvSchema.safeParse({
+          ...buildBaseEnv(),
+          INTERNAL_API_SECRET: " ".repeat(INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH)
+        }),
+        "INTERNAL_API_SECRET"
+      );
+    });
+
+    // AU6. The printable-ASCII rule, the part `.trim().min(...)` never gave: `.trim()` strips the
+    // ECMAScript WhiteSpace + LineTerminator set and nothing else, so a secret of invisible `Cf`
+    // characters used to parse cleanly and authenticate. The first assertion is a self-check on
+    // the boundary, so the rejection below cannot become a tautology by pointing at a code point
+    // the pattern happens to accept.
+    it("rejects an INTERNAL_API_SECRET carrying a character just outside printable ASCII", () => {
+      expect(
+        INTERNAL_AUTH_CONSTANTS.SECRET_PATTERN.test(String.fromCharCode(PRINTABLE_ASCII_RANGE_END))
+      ).toBe(true);
+      expect(INTERNAL_AUTH_CONSTANTS.SECRET_PATTERN.test(JUST_ABOVE_PRINTABLE_ASCII)).toBe(false);
+
+      expectIssueOn(
+        EnvSchema.safeParse({
+          ...buildBaseEnv(),
+          INTERNAL_API_SECRET: `${VALID_INTERNAL_API_SECRET}${JUST_ABOVE_PRINTABLE_ASCII}`
+        }),
+        "INTERNAL_API_SECRET"
+      );
+    });
+
+    // AU24 -- **not in the plan's §7 table**, added at Gate 3 because that table's AC1 row says
+    // the four cases above refuse a bad secret "at module load" and they do not: they call
+    // `safeParse` directly. This is the one that drives `parseEnv` through a real import, which
+    // is what makes "a misconfigured analytics-service never reaches `app.listen`" a measured
+    // statement rather than a reading of the source. Billing's suite carries the same pair.
+    it("fails fast at module load when INTERNAL_API_SECRET is absent", async () => {
+      vi.resetModules();
+      delete process.env.INTERNAL_API_SECRET;
+
+      await expect(import("../src/config/env")).rejects.toThrow(/INTERNAL_API_SECRET/);
+    });
+
+    // AU24, second half. The control: without it, a module that threw for any reason at all --
+    // or one whose import was simply broken -- would satisfy the case above.
+    it("loads at module load when INTERNAL_API_SECRET is present", async () => {
+      vi.resetModules();
+      process.env.INTERNAL_API_SECRET = VALID_INTERNAL_API_SECRET;
+
+      const loaded = (await import("../src/config/env")) as { env: { INTERNAL_API_SECRET: string } };
+
+      expect(loaded.env.INTERNAL_API_SECRET).toBe(VALID_INTERNAL_API_SECRET);
     });
   });
 });

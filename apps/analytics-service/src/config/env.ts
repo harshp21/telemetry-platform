@@ -1,4 +1,5 @@
 import { parseEnv } from "@telemetry/shared-config";
+import { internalApiSecretSchema } from "@telemetry/shared-validation";
 import { z } from "zod";
 import { ANALYTICS_SERVICE_STARTUP } from "../startup.constants";
 
@@ -22,7 +23,25 @@ export const EnvSchema = z.object({
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().min(1),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().min(1),
-  LOG_LEVEL: z.string().default("info")
+  LOG_LEVEL: z.string().default("info"),
+  // Service-to-service auth (S-9). **Derived from one shared fragment, never re-declared**:
+  // `internalApiSecretSchema` in `@telemetry/shared-validation` is the single definition of what
+  // a valid `INTERNAL_API_SECRET` is -- trimmed, at least
+  // `INTERNAL_AUTH_CONSTANTS.SECRET_MIN_LENGTH` characters, printable ASCII only. Four services
+  // used to write that rule out separately and two had drifted, which S-8 fixed by promoting it;
+  // analytics is the fifth derivation and adds no sixth rule. `tests/env.schema.unit.test.ts`
+  // asserts this field **is** that object, so a local copy reddens even with an identical
+  // spelling rather than drifting quietly.
+  //
+  // Required with no default, so `parseEnv` throws at module load and an analytics-service that
+  // cannot authenticate its callers never reaches `app.listen`. That makes four artifacts carry
+  // the variable together -- `tests/setup.ts`, `.env.example`, the compose block and CI -- and
+  // they landed in one change for that reason.
+  //
+  // S-54 is inherited here and deliberately not fixed: the fragment has no *maximum* length, so
+  // a secret long enough to exceed a peer's header limit is accepted at startup and fails later
+  // in traffic. The ceiling belongs on the fragment, which is a five-service change.
+  INTERNAL_API_SECRET: internalApiSecretSchema
 });
 
 export type ServiceEnv = z.infer<typeof EnvSchema>;

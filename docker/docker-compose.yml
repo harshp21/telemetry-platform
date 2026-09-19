@@ -128,6 +128,11 @@ services:
     environment:
       <<: *common-app-env
       PORT: "3005"
+      # Written inline, not added to the *common-app-env anchor: the four services that already
+      # carry it write it inline, and moving it into the anchor would hand the secret to every
+      # service including ones that have their own line. Required by analytics' env schema with
+      # no default since S-9, so an analytics-service without it crash-loops.
+      INTERNAL_API_SECRET: ci-internal-api-secret-with-at-least-32-chars
     ports:
       - "3005:3005"
     depends_on:
