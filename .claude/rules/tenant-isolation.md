@@ -17,10 +17,22 @@ Multi-tenant data separation is the platform's core security invariant. Four lay
    billing and worker used `!==` at `preHandler`, which both leaked comparison timing and let an
    unauthenticated caller's body be parsed before rejection.
 
-   **analytics-service's guard protects zero routes today**, and that is a measured statement
-   rather than a caveat: its scope holds no routes until T-051, and at fastify 5.10.0 a scope
-   carrying hooks and no routes never runs them. So the count of four is a count of *guards
-   written*, not of services behind one. See S-9.
+   **All four now protect real routes.** analytics-service's guard protected *zero* routes until
+   T-051, which is why the count of four used to be a count of guards written rather than of
+   services behind one — its scope held no routes, and at fastify 5.10.0 a scope carrying hooks
+   and no routes never runs them. T-051 registered `GET /v1/analytics/metrics` inside that scope
+   and discharged S-9, whose id is retired; the record is
+   `docs/plans/t-051-analytics-metrics-rollup.md`.
+
+   **The hazard moved rather than closed, and it is worth stating because it is invisible.** A
+   route registered *outside* that scope is not a `404` anybody notices. Re-measured at T-051
+   against the real `buildAnalyticsServiceApp()`, one probe route per placement injected with no
+   headers: a sibling unprefixed scope, a sibling scope registered with the `/v1/analytics`
+   prefix, and the root instance **all answered `200`** — the same status the correct placement
+   gives an authorised caller. Register new analytics routes inside the existing `app.register`
+   callback, and pair each with a case asserting the **service method was never called** rather
+   than one asserting a status code (`AM20` in
+   `apps/analytics-service/tests/metrics.route.test.ts`; billing's `BU78` is the same shape).
 
    The *phase* is part of the contract, not a detail: at `preHandler` fastify has already run the
    content-type parser, so a caller holding no secret could distinguish body shapes from the
@@ -147,14 +159,23 @@ nothing at all, which is the trap S-11 documents. Revoke explicitly anyway, gran
 
 ## Known gaps
 
-Read `.claude/rules/known-gaps.md` (S-5, S-6, S-9, S-10, S-11) before relying on any of
+Read `.claude/rules/known-gaps.md` (S-5, S-6, S-10, S-11, S-46, S-59) before relying on any of
 these layers.
-Note that **analytics-service's guard is wired around zero routes** (S-9, narrowed): it now
-carries the strong form described above and an `INTERNAL_API_SECRET` derived from the shared
-fragment, but the `app.register` scope holding both hooks has no route in it until T-051, and a
-scope with no routes never runs its hooks. T-051 must register its route **inside** that
-callback. The other three services carry the strong form and real routes behind it since S-8,
-whose id is retired; the record is `docs/plans/s-008-timing-safe-internal-auth.md`.
+**S-9 is retired** — analytics-service's guard was wired around zero routes until T-051 put
+`GET /v1/analytics/metrics` inside that scope; the record is
+`docs/plans/t-051-analytics-metrics-rollup.md`. All four guards now carry the strong form and
+have real routes behind them, the other three since S-8, whose id is also retired
+(`docs/plans/s-008-timing-safe-internal-auth.md`).
+
+Two that bear directly on reading a green suite in this area. **S-59:** `AU15`, which guards
+analytics' comparison, stays green while that guard compares with `===` — so a passing analytics
+suite is evidence the route sits behind the guard and is *not* evidence the comparison is
+timing-safe. **S-46:** an integration case over an RLS-enabled table cannot observe the
+application-layer `tenantId` predicate at all, because the policy returns the identical rows
+either way; pair every isolation case with a *shape* assertion on the emitted SQL. Reproduced
+again at T-051 on `"UsageLine"` and `"MetricRollup"`: removing the predicate from both of
+`RollupRepository`'s filter builders left the two integration suites **38/38 green**, including
+the two-tenant isolation case, and reddened only three unit shape cases.
 Do not treat a passing RLS test as evidence unless it runs as a `NOSUPERUSER NOBYPASSRLS`
 role — and unless its fixtures were seeded through a *different* connection, or the test is
 asserting against data it could not have created.

@@ -36,126 +36,6 @@ production code reads it. The enforced cap is a hard-coded `BATCH_SIZE_MAX: 100`
 
 ---
 
-## S-9 · analytics-service's internal-auth guard is wired around **zero routes** — **LOW, open, narrowed**
-
-> **Narrowed, not closed.** The original entry read *"analytics-service has no service-to-service
-> auth and no `INTERNAL_API_SECRET`"*. Both halves of that headline are now false, so leaving it
-> would ship a knowingly-wrong authoritative file. What is left is the residue below, and
-> **T-051 discharges it** by registering its route inside the scope that already exists.
-
-**What now exists** (slice 1 of scope B, `docs/plans/s-009-analytics-internal-auth.md` — note
-that `CLAUDE.md` forbids reading `docs/plans/` as a record of completion, which is why the
-substance is here):
-
-- `apps/analytics-service/src/config/env.ts` declares `INTERNAL_API_SECRET` as
-  `internalApiSecretSchema` **by identity**, not as a local chain, so analytics is the fifth
-  derivation of S-8's one rule rather than a fifth strictness. Asserted, not assumed: repointing
-  the declaration at a locally written chain with the fragment's *exact* spelling reddens
-  `declares INTERNAL_API_SECRET as internalApiSecretSchema itself` in
-  `apps/analytics-service/tests/env.schema.unit.test.ts` and nothing else
-  (`Tests 1 failed | 18 passed (19)`).
-- `src/middleware/internal-auth.middleware.ts` — the same `secretsMatch` from
-  `@telemetry/shared-utils` the other three guards use, a non-string header rejected rather than
-  normalised, a returned `reply`, and `ANALYTICS_RESPONSES.HTTP_STATUS_UNAUTHORIZED` rather than
-  a literal. **Four properties, three of them guarded.** The first, second and fourth each redden
-  exactly one named case when reverted — `AU15`, `AU13`, `AU16` respectively, one failure each,
-  re-derived by three separate mutations at Gate 4 and again at the Gate-3 rework.
-
-  **The returned `reply` is guarded by nothing, and no case was added for it**, because there is
-  no behavioural difference to guard. Measured at the rework: dropping the `return` leaves the
-  package **56/56 green**, and a request with no secret against a composed app answers
-  `401 {"code":"UNAUTHORIZED"}` with `handlerRan=0` and the tenant hook never entered — byte-identical
-  to the shipped form on all four observations. So the `return` is a statement of intent, which is
-  what the middleware's own docblock already says. The only thing that could pin it is a third
-  source-text census, and the one that exists is weaker than it reads (see the `AU15` note below),
-  so another was judged not worth its maintenance cost. An earlier revision of this bullet said
-  "each of those three" against four listed properties; corrected at Gate 4 (LOW-1).
-- `src/middleware/tenant-context.middleware.ts` — `tenantIdSchema`, two distinct errors, no
-  allowlist.
-- `src/app.ts` — an `app.register` scope carrying both hooks as `onRequest`, guard first, with
-  `/health` left on the root instance **outside** it.
-
-**`AU15` is weaker than "the comparison is timing-safe", and the limit is measured.** It is a
-source-text assertion over one file. A timing oracle inserted *ahead* of `secretsMatch` as
-`internalApiSecret.length !== providedSecret.length ||` — which leaks the configured secret's exact
-length through response latency — leaves the package **56/56 green** with `AU15` green, typecheck
-exit 0 and lint clean. The same oracle in the other operand order **does** redden `AU15`, but only
-because that spelling contains the substring `!== internalApiSecret` the assertion forbids: a
-source-text coincidence, not a guard. Both orders measured at Gate 4 and re-derived at the rework.
-**A second evasion is on record and is worse: S-59.** All three of `AU15`'s assertions hold while
-the live comparison is a plain `===` — keep the import, call `secretsMatch("", "")` into an unused
-local, and write the decision as `!(providedSecret === internalApiSecret)`, which contains no
-forbidden substring. Measured `56/56` green, typecheck exit 0, lint exit 0. That restores the full
-byte-prefix short-circuit S-8 removed from billing and worker, where the length oracle leaks only
-the length.
-
-Do not read a green `AU15` as evidence that no oracle was added, and do not read *two* recorded
-evasions as the complete set — S-59 says why, and S-51 is the same enumerated-spelling shape in
-billing-service.
-
-**The residue, and it is the whole reason this id survives: the scope holds no routes, and a
-scope with no routes never runs its hooks.** Measured at fastify 5.10.0 / Node v22.22.2, three
-forms — an unmatched `GET` and an unmatched `POST` under an unprefixed scope, and a `GET` under a
-scope registered with `{ prefix: "/v1/analytics" }`. Every one answered `404` with the hook's own
-call log still empty. With one route added inside the scope the hook ran for that route and did
-**not** run again for a sibling 404. So the guard is fitted and is currently reached by nothing.
-
-That the seam is *correct* was measured separately, by registering one probe route inside the
-production scope and injecting four header combinations against the real
-`buildAnalyticsServiceApp()`:
-
-```
-/health, no headers                  -> 200 {"status":"ok","service":"analytics-service"}
-scoped route, no headers             -> 401 {"code":"UNAUTHORIZED"}
-scoped route, secret only            -> 401 {"code":"TENANT_CONTEXT_MISSING", ...}
-scoped route, secret + tenant        -> 200
-scoped route, wrong secret + tenant  -> 401 {"code":"UNAUTHORIZED"}
-```
-
-**What no test in slice 1 establishes:** that a *future* tenant-scoped route is inside that
-scope. Nothing behavioural can, while the scope is empty. The nearest guards are `AU22b`, which
-asserts the two `addHook` registrations' phase and order by reading `src/app.ts`'s text, and
-`AU23`, which asserts `/health` answers `200` with no secret and goes red when that registration
-is moved inside the scope (`expected 401 to be 200`).
-
-**Discharged by T-051** — the first `/v1/analytics` endpoint — which must call its route
-registration **inside** the existing `app.register` callback in `src/app.ts`. A route registered
-outside it is unauthenticated and untenanted, and on this tree nothing would notice. Remove this
-entry when that route lands with a case that fails if it is moved out (billing's `BU78` is the
-shape: assert the service method was never called).
-
-**The epic will not tell that implementer any of this, and that is the trap.**
-`docs/epics/epic-9-analytics-service.md` § *T-051*'s **Files** line names
-`controllers/analytics.controller.ts`, `services/analytics.service.ts` and
-`repositories/rollup.repository.ts` — **not `src/app.ts`** — and no line in that section says the
-route must be registered inside the scope. S-9 added a one-line forward reference under it; the
-durable statement is here. Measured rather than warned about, four route placements against one
-guarded scope carrying both hooks, fastify 5.10.0 / Node v22.22.2:
-
-```
-route inside the guarded scope        GET /v1/analytics/metrics -> 200  hooksRan=["auth","tenant"]
-route in a sibling scope              GET /v1/analytics/metrics -> 200  hooksRan=[]
-route on the root instance            GET /v1/analytics/metrics -> 200  hooksRan=[]
-route in a sibling scope, prefixed    GET /v1/analytics/metrics -> 200  hooksRan=[]
-```
-
-So the wrong placement is not a 404 that someone notices — it is a **`200` that works**, at the
-right URL, with the guard silently skipped. Three of the four placements ship an unauthenticated,
-untenanted endpoint and only one is correct. The fourth row is this rework's addition; the middle
-two were measured at Gate 4.
-
-**Two adjacent gaps analytics now inherits, recorded so they are not rediscovered as new:**
-
-- **S-54** — `internalApiSecretSchema` has no *maximum* length, so analytics accepts a secret long
-  enough to be rejected downstream as an oversized header. Not fixed here: the ceiling belongs on
-  the shared fragment, which is a five-service change.
-- **S-19** — `apps/analytics-service/src/repositories/base.repository.ts` has no
-  `set_config('TimeZone','UTC',true)` pin and **zero** real subclasses; its single
-  `extends TenantScopedRepository` hit is the docstring example. T-051 creates the first subclass
-  and inherits S-19 there. This slice creates no repository and does not touch that file.
-
----
-
 ## S-10 · `"RefreshToken"` has RLS `FORCE`d but never `ENABLE`d — policies are inert — **MEDIUM, open**
 
 Found while landing S-7, and deliberately not folded into it: that change already flips the
@@ -497,10 +377,11 @@ Consequence: the other four services' `withTenant` opens a transaction whose ses
 whatever the server defaults to. Their columns are the same `timestamp(3) without time zone`, so
 the first raw timestamp predicate written in any of them inherits S-18 exactly.
 
-**How bad it is today, stated no stronger than measured — and it has now changed twice.**
-`grep -rn "extends TenantScopedRepository" apps/*/src` finds **four** real subclasses across
-**three** services, in nine total matches (the other five are the `EventRepository` example
-inside each base file's own docstring):
+**How bad it is today, stated no stronger than measured — and it has now changed three times.**
+`grep -rn "extends TenantScopedRepository" apps/*/src --include=*.ts`, filtered to lines
+beginning `export class`, finds **five** real subclasses across **four** services, in ten total
+matches (the other five are the `EventRepository` example inside each base file's own
+docstring). Re-derived with that exact command at T-051 rather than incremented:
 
 | Subclass | Base copy | `TimeZone` pin | Added by |
 |---|---|---|---|
@@ -508,8 +389,28 @@ inside each base file's own docstring):
 | `apps/worker-service/src/repositories/event.repository.ts:73` | worker | no | T-040 |
 | `apps/billing-service/src/repositories/meter.repository.ts:35` | billing | no | T-045 |
 | `apps/billing-service/src/repositories/invoice.repository.ts` — `export class InvoiceRepository` | billing | no | T-045 |
+| `apps/analytics-service/src/repositories/rollup.repository.ts` — `export class RollupRepository` | analytics | no | **T-051** |
 
 **No row was added by T-048** — it changed billing's base copy, not the set of subclasses.
+
+**T-051's row is the first one where the missing pin is a *tested* property rather than a
+latent one, and that is deliberate.** Its plan decision D7 left
+`apps/analytics-service/src/repositories/base.repository.ts` untouched — re-derived at T-051,
+still byte-identical to worker's at `13a533a2e2c2dcc1ff9db28fb5c7a1fd`, `grep -c TimeZone` → `0`
+— precisely because adding a fifth variant from inside a feature task is the move this entry
+exists to describe. The consequence is the isolation **S-21** records as missing in
+usage-service: analytics has exactly *one* timezone guard (the bound normalization-and-cast in
+`rollup.repository.ts`), so reverting that guard alone must go red. Measured at T-051 Gate 3,
+`utcTimestampBound` reverted to `Prisma.sql\`${new Date(isoInstant)}\`` and nothing else:
+`apps/analytics-service/tests/analytics.timezone.integration.test.ts` → `Tests 12 failed | 11
+passed (23)`, the failures being `AI8`, `AI8b` and `AI8c` under `Asia/Kolkata`,
+`America/New_York` and `Asia/Kathmandu` — and **green under `UTC`**, which is the row where the
+two forms agree and the reason CI alone cannot catch this. S-21 records the same revert leaving
+usage-service's suite 17/17 green.
+
+Note the citation for the analytics row deliberately carries **no line number**, on the same
+ground the `InvoiceRepository` row does: that one has now rotted through six recorded positions,
+and `export class RollupRepository` answered `:242` when this row was written. Re-run the grep.
 Every row is re-derived from
 `grep -rn "extends TenantScopedRepository" apps/*/src`, filtered to lines beginning
 `export class` — the unfiltered grep also returns five docstring examples. Three rows carry a
@@ -3509,99 +3410,6 @@ nothing can currently produce.
 
 ---
 
-## S-53 · `docs/epics/epic-9-analytics-service.md`'s rollup snippet applies `AT TIME ZONE 'UTC'` to the column, which is the mistake `CLAUDE.md` names — **LOW, open**
-
-Filed by S-8, which found it while checking that its own change touched no timestamp path. Same
-class as S-17, S-29, S-32, S-35, S-42, S-47 and S-50 — an epic snippet that diverges from what the
-code must do — and recorded here rather than by editing the epic, matching that precedent.
-
-`docs/epics/epic-9-analytics-service.md:61` specifies (it was `:59` when this entry was filed; the Q3 ruling added two lines above it — re-run
-`grep -n "AT TIME ZONE" docs/epics/epic-9-analytics-service.md` rather than trusting the
-number, and note that grep now returns **two** lines, the snippet and the Q3 pointer at `:15`
-that says not to write it):
-
-```sql
-DATE_TRUNC('day', period_start AT TIME ZONE 'UTC') AS bucket_start
-```
-
-`CLAUDE.md` § *Raw SQL and timestamps* is explicit that `AT TIME ZONE 'UTC'` on a bound
-**parameter** is correct, and on the **column** produces a `timestamptz` and shifts every bucket
-boundary by the server offset. This snippet writes the column form.
-
-**Verified live on this host's PostgreSQL 16**, through `DIRECT_DATABASE_URL`, session zone set
-with `options=-c timezone=…`. No table was touched; the probe evaluates literals. One naive
-`timestamp(3)` value, `2026-01-01 03:00:00`, truncated to the day:
-
-| Session `TimeZone` | `DATE_TRUNC('day', col AT TIME ZONE 'UTC')` | `DATE_TRUNC('day', col)` |
-|---|---|---|
-| `UTC` | `2026-01-01 00:00:00+00` | `2026-01-01 00:00:00` |
-| `Asia/Kolkata` | `2026-01-01 00:00:00+05:30` | `2026-01-01 00:00:00` |
-| `America/New_York` | **`2025-12-31 00:00:00-05`** | `2026-01-01 00:00:00` |
-
-So under `America/New_York` the snippet's expression buckets that row into the **previous day**,
-while the bare column is stable across all three zones tried. Scope of the measurement: three
-session zones, one value, this host's PostgreSQL 16. Not measured: other zones, DST boundaries, or
-any granularity other than `day`.
-
-**Why this is worth an id rather than a note.** T-051 is the task that builds analytics' rollups,
-and this snippet is what it will be built from. A bucket-boundary error of this shape is silent —
-every query succeeds, every total is plausible, and the only symptom is that a customer's usage
-appears on the wrong day. It is also **not** caught by CI: `postgres:16-alpine` defaults `TimeZone`
-to `UTC`, where the two expressions above are identical. That is the same reason S-18's regression
-suite has to pin its own non-UTC session.
-
-**Two further defects in the same snippet**, found while verifying it and recorded so T-051 does
-not copy them either.
-
-**Every identifier in it is snake_case, and nothing in this database is.** The snippet writes
-`metric_key`, `period_start`, `period_end`, `tenant_id` and `FROM usage_lines`. `grep -n "@@map\|@map"
-prisma/schema.prisma` returns **nothing**, so Prisma emits the model names and field names
-verbatim as quoted identifiers; `information_schema.tables` for `table_schema='public'` lists
-`UsageLine`, not `usage_lines`, and the real columns are `metricKey`, `periodStart`, `periodEnd`,
-`tenantId` and `billed` (`prisma/schema.prisma`, `model UsageLine`). Unquoted `usage_lines` and
-`period_start` would be folded to lower case by PostgreSQL and match nothing, so the snippet
-raises rather than returning wrong rows — the loud failure, which is why this half is a
-copy-and-fix nuisance rather than a hazard. `bucketStart` is `MetricRollup`'s column, and that
-model has no `@@map` either.
-
-**The `$2`/`$3` predicate is S-18 on the other side of the same query.** `periodStart` and
-`periodEnd` are naive `timestamp(3)` columns like every other application timestamp on this
-platform, so `AND period_start >= $2` with a bound JS `Date` resolves through the session zone.
-`CLAUDE.md` § *Raw SQL and timestamps* covers this and analytics-service's
-`base.repository.ts` does **not** carry the `set_config('TimeZone','UTC',true)` pin that
-usage-service's does (S-19). So a T-051 built from this snippet inherits the hazard twice: once in
-the projection, which this entry is about, and once in the predicate.
-
-**Fix direction:** decide contract-first — correct the epic snippet to `DATE_TRUNC('day',
-"periodStart")` with the real column names, or, if a different projection is intended, say what it
-is and why. Whichever T-051 does, the guard it needs is a test that pins its own non-UTC session,
-because a UTC-only fixture asserts nothing here. Do not "fix" this by moving `AT TIME ZONE` to the
-bound parameter and leaving the column expression — the bound side is already correct and is not
-what this entry is about.
-
-**Disposition under the Q3 ruling — the choice this entry asked for has been made, and it is the
-narrower of the two.** Q3 is now recorded **decided: fixed UTC for every tenant**
-(`docs/epics/README.md` § *Q3 — UTC aggregation timezone*, and the gates table there). That
-settles the contract-first question above in favour of **correcting the epic snippet**, not the
-code: the projection is `DATE_TRUNC('<unit>', "periodStart")` on the bare naive column, with no
-`AT TIME ZONE` anywhere in it. So the remaining work on this half is a one-line edit to
-`docs/epics/epic-9-analytics-service.md:61` (the snippet line; re-derive it, it has already moved once).
-
-**That edit was deliberately not made when the ruling was recorded, and this entry stays open
-because of it.** It belongs to **T-051**, the task that builds the rollup, for the reason S-29,
-S-32, S-35, S-42, S-47 and S-50 all give: an epic snippet is corrected by the task that
-implements it, so the correction and the code that proves it land in one commit. Editing the
-snippet from a docs-only change would leave a corrected epic with nothing standing behind it.
-
-Three things in this entry are **not** discharged by the ruling and are still T-051's to handle:
-the snake_case identifiers, the `$2`/`$3` bound-parameter half (which is S-18 and is about the
-predicate, not the projection), and the requirement that whatever T-051 writes be guarded by a
-test pinning its own non-UTC session — a UTC-only fixture asserts nothing here, and
-`postgres:16-alpine` defaults to `UTC`.
-
-
----
-
 ## S-54 · `internalApiSecretSchema` has no maximum length, so an over-long secret starts every service and then fails in traffic — **LOW, open**
 
 Filed by S-8's Gate-5 QA (F-4) and re-measured at that task's Gate-3 rework rather than inherited.
@@ -4182,9 +3990,22 @@ gateway .env.example value -> a guard holding gateway's own value           -> 2
 
 So a developer who copies the `.env.example` files verbatim and runs the stack gets `401` on
 **every** proxied `/v1/billing` and `/v1/worker` request, with two healthy-looking services and no
-startup warning. That half is **live today**, because billing and worker have real routes behind
-their guards. The analytics half is not live yet — its guarded scope holds no routes until T-051
-(S-9) — which is why S-9 could fix its own line cheaply and why fixing it did not resolve this.
+startup warning. **The split is billing's and worker's, and only theirs.** analytics carries
+gateway's value, so it contributes no mismatch to this entry at all — re-derived at T-051 over
+all six declaring files with
+`grep -rn "INTERNAL_API_SECRET" apps/*/.env.example .env.example`: gateway, usage, analytics and
+the repo-root file all read `dev-local-internal-secret-at-least-32-chars`, while
+`apps/billing-service/.env.example:35` and `apps/worker-service/.env.example:58` read
+`dev-local-secret-change-in-production`.
+
+An earlier revision of this paragraph said "the analytics half is not live yet — its guarded
+scope holds no routes until T-051 (S-9)". Both clauses are false, **but not in the same way**:
+the first became false at T-051, which registered `GET /v1/analytics/metrics` inside that scope
+so the guard is live; the second was **already** false when it was written, because analytics
+never had a "half" here at all — its value has always matched gateway's. **S-9 is retired** — the record is
+`docs/plans/t-051-analytics-metrics-rollup.md`, and `known-gaps.md` carries no S-9 entry, so do
+not cite one. Corrected at T-051's Gate-4 review (MEDIUM-1), which found this sentence by
+grepping the *claim* rather than a list of files.
 
 **`docker/docker-compose.yml` is correct and must not be "aligned" to these.** All five blocks
 carry `ci-internal-api-secret-with-at-least-32-chars`, verified identical
@@ -4252,7 +4073,11 @@ AU15's three assertions, evaluated against the mutated source:
   contains `!== internalApiSecret`                          -> false   (the assertion requires false)
 ```
 
-**It is materially worse than the length oracle already recorded in S-9.** That one leaks the
+**It is materially worse than the length oracle**, which is recorded in
+`docs/reviews/s-009-analytics-internal-auth.md` (the leaky form at `:35`, both operand orders
+re-derived at `:913`). **Not in a `known-gaps.md` entry** -- this sentence used to say "already
+recorded in S-9", and S-9 was retired by T-051, so there is no such entry to read (corrected at
+T-051's Gate-4 Round 2, MEDIUM-5). That one leaks the
 secret's *length*; this one restores the full **byte-prefix short-circuit** that S-8 existed to
 remove from billing and worker — response latency reveals how many leading bytes a guess got
 right, so the secret is recoverable one byte at a time rather than guessed whole.
@@ -4277,7 +4102,10 @@ What the two share is the **shape**, and it is S-51's own sentence: *a census ov
 set catches the members of that set*. Read them together.
 
 **Two known evasions is evidence the set is larger than enumerated, not that it is now complete.**
-S-9 records the length oracle and its operand-order asymmetry; this entry records the `===` form.
+`docs/reviews/s-009-analytics-internal-auth.md` records the length oracle and its operand-order
+asymmetry (`:35`, `:49`, `:476`, `:913`); this entry records the `===` form. Cite that review and
+not S-9: the id is retired and `known-gaps.md` carries no S-9 entry, which this same file says in
+terms seventy lines earlier, inside S-58.
 Neither was found by widening the list on principle — each was found by someone trying one more
 spelling, and each time the previous list looked sufficient. Do not write "`AU15` now catches every
 inline comparison", and do not close this by adding `=== internalApiSecret` to the forbidden list:
@@ -4288,13 +4116,26 @@ of this sentence credited it to **S-48**; `grep -c "four gates"` returns **0** i
 S-51, and S-48's prose enumerates two. Corrected at Gate 6, LOW-7 — and note this entry cites S-51
 correctly two paragraphs above, so it was one idea landing on two different ids.)
 
-**Severity LOW, argued.** Nothing is wrong on the shipped tree: the guard does call `secretsMatch`
-on the real operands, verified by reading it, and analytics' guard protects zero routes until
-T-051 (S-9). The cost is evidentiary — a reviewer or agent can read a green `AU15` as "the
-comparison is timing-safe" when what it establishes is "the file spells `secretsMatch(` somewhere
-and does not spell one forbidden substring". It becomes **MEDIUM** the moment T-051 puts a
-tenant-scoped route behind that guard *and* someone relies on `AU15` in a review instead of
-reading the comparison.
+**Severity LOW, argued — and half of the escalation condition has now fired.** Nothing is wrong
+on the shipped tree: the guard does call `secretsMatch` on the real operands, verified by reading
+it. The cost is evidentiary — a reviewer or agent can read a green `AU15` as "the comparison is
+timing-safe" when what it establishes is "the file spells `secretsMatch(` somewhere and does not
+spell one forbidden substring".
+
+This entry used to say the guard *"protects zero routes until T-051 (S-9)"* and that it becomes
+**MEDIUM** the moment T-051 puts a tenant-scoped route behind it **and** someone relies on `AU15`
+in a review instead of reading the comparison. **T-051 has landed**, so the first conjunct is now
+satisfied: `GET /v1/analytics/metrics` is registered inside that scope and the guard is on the
+serving path for real tenant data. S-9 is discharged and its id retired; the record is
+`docs/plans/t-051-analytics-metrics-rollup.md`.
+
+The severity is left at LOW because the *second* conjunct is a property of a future review rather
+than of the tree, and nothing here can measure it. What changed is that the cost of the second
+conjunct is now a real endpoint rather than an empty scope. Re-rate this to MEDIUM the first time
+a review cites `AU15` as evidence about the comparison. T-051 did not: its route suite
+(`apps/analytics-service/tests/metrics.route.test.ts`) carries a docblock saying in terms that
+its green run establishes the route sits behind the guard and establishes **nothing** about the
+comparison being timing-safe.
 
 **Fix direction.** A text census cannot be made complete, so stop trying to complete it and change
 what is asserted. Two options, neither taken here because both are test-logic changes outside a
@@ -4414,3 +4255,248 @@ suspect their own shell rather than the change they are making. The same person 
 
 Do not close this by adding the variable to some services' `test` env and not others; that
 converts one divergence into two.
+
+---
+
+## S-61 · The analytics rollup cache can never validate for a range containing an idle bucket, so on sparse data it is write-only — **LOW, open, accepted by design**
+
+Filed by T-051, which built the cache and the completeness rule that makes it unreachable on the
+data shape most tenants actually have. **Nothing is wrong**: every answer is correct, and when
+the cache cannot be used the `UsageLine` aggregation runs and is the authority. What is lost is
+the optimisation, and it is lost *silently* — the endpoint has no way to say "I tried".
+
+### The mechanism
+
+`GET /v1/analytics/metrics` is two-tier. It serves pre-computed totals from `"MetricRollup"` only
+when the cache is **complete** for the request, and decision D0-A defines complete as
+`cachedBuckets == expectedBuckets` — the count of distinct cached `bucketStart` values against
+the count of calendar buckets spanning `[from, to)`. Any shortfall discards the whole cache and
+re-derives the range.
+
+**A bucket with genuinely zero usage produces no rollup row.** `cacheRange` is an
+`INSERT ... SELECT ... GROUP BY` over `"UsageLine"`, so an interval with no usage lines
+contributes nothing to insert. `expectedBuckets` counts it anyway, because it is a calendar
+bucket. So a range containing one idle bucket can never satisfy the equality, no matter how many
+times it is requested.
+
+Measured at T-051 Gate 1 on a seeded fixture: a three-day range with usage on two of the days
+gives `expectedBuckets = 3` against `cachedBuckets = 2` (the empty day being `2026-03-02`), and
+the range falls back on every request forever.
+
+**What stands behind that, stated precisely** (corrected at Gate 4, NIT-1). The *fixture shape*
+is pinned by the standing test `AI2` in
+`apps/analytics-service/tests/analytics.integration.test.ts`, which seeds exactly that range and
+asserts the **response items** -- three grouped rows with no `2026-03-02` row. The two **counts**
+were measured at Gate 1 and are pinned only against **doubles** -- `AM17a` in
+`tests/rollup.repository.unit.test.ts`, which seeds `{ expectedBuckets: 3, cachedBuckets: 2 }` as
+a mock reply and asserts the pass-through, and `AM19` in `tests/analytics.service.unit.test.ts`,
+which drives the fallback branch with `cachedBuckets: EXPECTED_BUCKETS - 1`. No standing test
+asserts `3` against `2` over a live database: re-derived with
+`grep -rn "describeRangeCoverage\|expectedBuckets\|cachedBuckets" apps/analytics-service/tests`,
+every hit is in those two unit files or in a comment, and no integration case inspects
+`describeRangeCoverage`'s return value at all.
+
+### How bad, stated as what was measured and what was not
+
+- **Measured:** the three-day / two-days-of-usage case above never validates.
+- **Measured:** a range in which *every* bucket has usage does validate and is served from the
+  cache — `AI9` proves it non-vacuously, by overwriting the cached values with a sentinel and
+  deleting the underlying `"UsageLine"` rows, so the case can only pass if the answer genuinely
+  came out of `"MetricRollup"`.
+- **Not measured, and stated as reasoning:** that this makes the cache useless at `hour`
+  granularity in practice. It follows from the mechanism — an hourly range needs usage in *every*
+  hour — but no production-shaped dataset has been run against it, and "close to permanent" is an
+  inference, not a figure. Whoever revisits this should measure a real tenant's hit rate rather
+  than quote this bullet.
+- **The write still happens.** A fallback over an unfiltered, bucket-aligned range upserts the
+  whole range (`AI10`), so on sparse data the table accumulates rows that no read will ever
+  validate. The cost is write amplification plus storage, bounded per request by
+  `ANALYTICS_METRICS.MAX_CACHED_ROWS`, and unbounded across requests. `"MetricRollup"` has no
+  retention or eviction of any kind — `grep -rn "metricRollup" apps/*/src --include=*.ts`
+  outside analytics returns nothing, so there is no other reader or writer to collect them.
+
+### Why it was accepted rather than worked around
+
+D0-A was ruled before planning: an absent bucket discards the cache, it is not topped up. The
+alternatives were considered and each is worse:
+
+- **Compare against the buckets that *have* usage** instead of the calendar buckets. Self-defeating:
+  establishing that set requires reading `"UsageLine"`, which is the read the cache exists to
+  avoid.
+- **Treat "no cached row" as "zero usage"** and serve the cache anyway. This is the dangerous one
+  and it is why the equality is written the way it is. It cannot distinguish *a bucket with no
+  usage* from *a bucket that was never cached*, so the first stale or partially-written range
+  would under-report — silently, in the direction that makes a bill look smaller.
+
+### Fix direction
+
+The cache needs to record **what was computed**, not only what was non-zero. A completeness
+marker on the table — a row per `(tenantId, granularity, bucketStart)` asserting the bucket was
+aggregated, or a `computedThrough` watermark per tenant and granularity — lets an idle bucket be
+cached as genuinely empty and turns the count into a real test. That is a **migration** plus a
+change to both tiers, which is why T-051 did not do it inside a feature task.
+
+Until then, do **not** close this by loosening the completeness comparison. `AM19` in
+`tests/analytics.service.unit.test.ts` and `AI6` in `tests/analytics.integration.test.ts` are the
+guards, and both were confirmed red at Gate 3 under the obvious loosening: replacing
+`cachedBuckets === expectedBuckets` with `cachedBuckets > 0` gives
+`Tests 7 failed | 21 passed (28)` across those two files, with `AI6` failing
+`expected [ '424242' ] to deeply equal [ '10.5', '3' ]` — the sentinel value escaping into the
+response, which is exactly the under-report the equality prevents.
+
+**Read this with S-62, which is the same check failing the other way.** This entry is the cache
+being *unreachable* — the check correctly falls back, forever, and every answer is right. S-62 is
+the cache being *reachable and wrong* — the check correctly validates and is structurally blind
+to a bucket that is populated but stale. They are not folded together because each title would
+then be false of half its subject, and the id-stability rule forbids retiring either. Together
+they make the sharper point: **the completeness check is sound for the question it asks, and the
+question is the wrong one** — it asks "have all these buckets been computed?" where a cache needs
+"are these buckets still right?". A fix that answered both would be one migration carrying a
+completeness marker *and* a freshness signal.
+
+Related but distinct: **S-45** records usage landing in a window whose invoice already exists,
+which is the same "late data against a closed aggregate" family on the billing side. The
+mechanisms do not resemble each other and the fixes do not either; noted so the kinship is not
+rediscovered as sameness.
+
+---
+
+## S-62 · The analytics rollup cache goes permanently stale on late usage, and the completeness check is structurally unable to notice — **MEDIUM, open, disclosed-and-accepted behaviour with an under-recorded consequence**
+
+Found by T-051's Gate-5 QA (F-1) and re-derived at that task's Gate-4 Round-2 rework before being
+written here. **The behaviour was disclosed at planning** — `docs/plans/t-051-analytics-metrics-rollup.md`
+carries it as risk **R4**, graded LOW under the user's D1-A ruling. What was not durable is the
+consequence: `CLAUDE.md` is explicit that a plan marks a task *started* and that nothing may read
+`docs/plans/` as a record, so R4 lived nowhere a later reader would look. That is the same
+omission S-25 and S-44 are filed for.
+
+### The mechanism, stated as the structural asymmetry it is
+
+`AnalyticsService.getMetricsRollup` decides whether to serve the cache with
+`cachedBuckets === expectedBuckets` — a comparison of **counts**. A count can detect a bucket
+that is **missing**. It can never detect a bucket that is **present and wrong**.
+
+So the check's two outcomes are exactly inverted relative to where the risk is:
+
+- It **falls back** when the range contains an idle bucket — which is precisely the case where
+  the cache was useless anyway (**S-61**).
+- It **validates** when every bucket is populated — which is precisely the case where a cached
+  value may have gone stale, and the staleness is then invisible to it.
+
+Nothing else closes the gap. `computedAt` is written by the upsert and **read nowhere**:
+`grep -rn "computedAt" apps/analytics-service/src --include=*.ts` returns exactly one line, the
+`INSERT … ON CONFLICT DO UPDATE` inside `cacheRange`. There is no TTL and no invalidation path —
+`grep -rniE "ttl|invalidat|deleteMany|expire" apps/analytics-service/src --include=*.ts` returns
+nothing (exit 1) — and no other writer of the table exists on the platform:
+`grep -rn "MetricRollup" apps/*/src packages/*/src --include=*.ts`, `dist/` filtered, returns
+nothing outside analytics (exit 1).
+
+### Measured
+
+QA drove it over real HTTP against a real analytics-service process. Re-derived independently at
+the Gate-4 rework through the real `AnalyticsService` and `RollupRepository` against the real
+database as `telemetry_app`, fixtures seeded through `DIRECT_DATABASE_URL` and deleted afterwards.
+**The two-bucket shape is the one that matters, because it is the case the cache exists for and
+the case `AI9` pins** — a range in which every bucket is populated:
+
+```
+req1 (fallback)      -> 2026-04-01=17  2026-04-02=4      cached rows: 2
+req2 (from cache)    -> 2026-04-01=17  2026-04-02=4
+  ... 100 units land in 2026-04-01, a bucket that is already cached ...
+TRUE day-1 total     -> 117
+req3 (after arrival) -> 2026-04-01=17  2026-04-02=4
+req4 (again)         -> 2026-04-01=17  2026-04-02=4
+describeRangeCoverage-> {"expectedBuckets":2,"cachedBuckets":2,"bucketAligned":true}
+```
+
+The last line is the finding. The counts are **equal**, so the check validates, and `117` is
+reported as `17` on every subsequent request. It does not self-heal. The only thing that rewrites
+that bucket is a *different* request whose range happens to contain an idle bucket, forcing a
+fallback over the whole range.
+
+The direction of the error is **under-reporting**, silently — the direction S-61 itself calls
+"the dangerous one" when rejecting an alternative design.
+
+### What still triggers it under D1-A
+
+D1 (dropping the epic's `AND billed = true`) **reduced the frequency and did not remove the
+mechanism**, and that distinction is the whole of why this entry exists. Under D1-B every bucket
+would have gone stale by design, once, when the nightly invoice job flipped `billed`. Under D1-A
+the aggregated columns are never rewritten after insert — worker's `UsageLine` upsert has
+`update: {}` — so only **new rows landing in an already-cached bucket** cause it. That is still
+reachable, by every path that makes a `UsageLine`'s `periodStart` older than its write time:
+
+- stream lag or a worker restart between the event's `occurredAt` and the row being written;
+- an `XAUTOCLAIM` recovery pass;
+- a dead-letter replay through `POST /v1/internal/worker/replay`;
+- **S-45**'s `absorbLateUsage`, which exists precisely because usage arrives after its window
+  closed.
+
+None is exotic. `apps/worker-service/src/validators/stream-message.validator.ts` sets
+`periodStart: occurredAt`, so the gap that has to be crossed is processing lag, not a day.
+
+### Why it is not a blocker
+
+Every answer the **fallback** tier gives is correct, and the fallback is what runs whenever the
+cache cannot validate. No tenant boundary is crossed — this is a wrong number for the right
+tenant, and the tenant predicate and RLS are untouched by it. Nothing bills from this endpoint:
+invoicing reads `Invoice` through `GET /v1/billing/invoices/:id`, a separate path, and the census
+above shows no consumer of `MetricRollup` outside analytics. The behaviour was disclosed at
+planning, put on page one of the plan, and tied to an explicit user decision.
+
+### How this differs from S-61, which it must not be folded into
+
+They are opposite failures of the same check and S-61's title would become false if they were
+merged (the id-stability rule forbids retiring it to do so):
+
+| | **S-61** | **S-62** (this entry) |
+|---|---|---|
+| State | cache **unreachable** | cache **reachable and wrong** |
+| Trigger | any idle bucket in the range | late usage into a populated bucket |
+| Check's behaviour | correctly falls back, forever | correctly validates, and is blind |
+| Consequence | the optimisation is lost; **every answer correct** | a silently low number is served |
+| Fix shape | a completeness marker per bucket (migration) | freshness: a watermark, TTL or invalidation |
+
+Read together they say something sharper than either alone: **the completeness check is sound for
+the question it asks and the question is the wrong one.** It asks "have all these buckets been
+computed?" where a cache needs "are these buckets still right?".
+
+### Forward obligation — the first consumer that would be misled
+
+**Q11 was ruled three dashboard pages, one of them Analytics** (`docs/epics/README.md` § *Q11 —
+Dashboard scope*, which records the Analytics page as backed by "nothing yet" and names
+`GET /v1/analytics/metrics` / T-051 as the endpoint that would back it). Whoever wires that page —
+**T-063** — is the first consumer who would see a stale number and have no way to tell. Do not
+build a "usage is down" alert, a trend line, or anything a customer reconciles against an invoice
+on this endpoint until this entry is closed or the consumer opts out of the cache.
+
+### Fix direction — and a TTL is a decision, not the obvious answer
+
+The cache needs a **freshness** signal, which is a different thing from the completeness signal
+S-61 asks for, though one migration could carry both.
+
+- **A `computedAt` TTL** is the reflex and it is the one to cost rather than assume. It trades a
+  bounded staleness window for a recompute rate, and **neither number is derivable from anything
+  on this tree**: `"UsageLine"` is empty on every environment this has run against, no production
+  request-shape or lag distribution exists, and a TTL short enough to matter on a lagging stream
+  may recompute more often than the cache saves. Measure the real lag distribution and the real
+  query mix first. A TTL also does not *fix* the window — it bounds it, and the bound is a product
+  decision about how wrong a dashboard may be.
+- **A watermark** — record the maximum `UsageLine.processedAt` a bucket's value was computed from,
+  and invalidate when a newer row exists for it. Exact rather than bounded, and it needs a column
+  plus an indexed read.
+- **Invalidation at write time** — have worker delete or mark the affected rollup rows when it
+  writes a `UsageLine` into a past bucket. Exact and cheap to read, but it puts an analytics
+  concern in worker-service and couples two services, which is the shape S-19 and S-39 both record
+  going wrong.
+
+Whichever is chosen, the guard it needs is a case that seeds a cached range, lands late usage in a
+populated bucket, and asserts the **next** response reflects it — the transcript above is that
+case's expected red. Do **not** close this by loosening the completeness comparison: `AM19` and
+`AI6` guard it, and the loosening is measured red at `Tests 7 failed | 21 passed (28)`.
+
+**Correcting the record**: R4's mitigation clause in the plan read *"the completeness check will
+usually already be falling back"*. That is backwards and has been corrected in place. The check
+falls back only on a **missing** bucket, never on a changed one, so it does not mitigate staleness
+in any range the cache can actually serve. R4's *severity* assessment under D1-A stands — this is
+a correction to the mitigation, not to the decision.

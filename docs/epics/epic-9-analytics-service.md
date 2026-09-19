@@ -56,8 +56,9 @@ export const EnvSchema = z.object({
 > Pair it with a case that fails when the registration moves out of the callback —
 > `apps/billing-service/tests/billing-invoices.route.test.ts` `BU78` is the shape: assert the
 > service method was **never called**, not merely that the status was 401. See
-> `.claude/rules/known-gaps.md` S-9, which this task discharges, and S-53 for the separate
-> defects in the `$queryRaw` snippet below.
+> S-9, which this task discharged, and S-53, which recorded the separate defects in the
+> `$queryRaw` snippet below, are both retired — T-051 closed them and the snippet is corrected
+> in place, with the original's five defects enumerated under it.
 
 **Query params**:
 ```ts
@@ -79,17 +80,64 @@ export const EnvSchema = z.object({
 **On-demand aggregation SQL** (via Prisma `$queryRaw`):
 ```sql
 SELECT
-  metric_key,
-  DATE_TRUNC('day', period_start AT TIME ZONE 'UTC') AS bucket_start,
-  SUM(quantity) AS total_quantity
-FROM usage_lines
-WHERE tenant_id = $1
-  AND period_start >= $2
-  AND period_end <= $3
-  AND billed = true   -- only finalized usage
-GROUP BY metric_key, bucket_start
-ORDER BY bucket_start ASC
+  "metricKey",
+  DATE_TRUNC('day', "periodStart") AS "bucketStart",
+  SUM("quantity") AS "totalQuantity"
+FROM "UsageLine"
+WHERE "tenantId" = $1
+  AND "periodStart" >= $2::timestamp(3)
+  AND "periodStart" <  $3::timestamp(3)
+GROUP BY "metricKey", DATE_TRUNC('day', "periodStart")
+ORDER BY DATE_TRUNC('day', "periodStart") ASC, "metricKey" ASC
 ```
+
+> **Corrected by T-051, the task S-53 assigned the fix to (that id is now retired).** The
+> snippet above is not
+> what was originally specified. Five things were wrong with the original and each is recorded
+> here rather than silently overwritten, because the epic files are a record of what was
+> specified (S-32's precedent). What shipped is
+> `apps/analytics-service/src/repositories/rollup.repository.ts`.
+>
+> 1. **`DATE_TRUNC('day', period_start AT TIME ZONE 'UTC')` applied the conversion to the
+>    column.** On a naive `timestamp(3)` column that produces a `timestamptz` and shifts every
+>    bucket boundary by the **server** offset — the defect `CLAUDE.md` § *Raw SQL and timestamps*
+>    named, and which **S-53** recorded until T-051 closed it. Measured on the real `"UsageLine"`
+>    table across four session
+>    zones: a `2026-03-01 03:00` row buckets as `2026-03-01` under `UTC`, `Asia/Kolkata` and
+>    `Asia/Kathmandu`, and as **`2026-02-28`** under `America/New_York`. Per Q3 (decided: fixed
+>    UTC for every tenant) the correct form is a bare `DATE_TRUNC` on the naive column. `AI7` in
+>    `apps/analytics-service/tests/analytics.timezone.integration.test.ts` pins it and goes red
+>    under the original form in three of four zones — **not under `UTC`**, which is why CI's
+>    `postgres:16-alpine` default cannot catch it and why that suite pins its own session zone.
+> 2. **Every identifier was snake_case and nothing in this database is.**
+>    `grep -n "@@map\|@map" prisma/schema.prisma` returns nothing, so Prisma emits model and
+>    field names verbatim as quoted identifiers: `"UsageLine"`, `"metricKey"`, `"periodStart"`,
+>    `"tenantId"`. Unquoted `usage_lines` folds to lower case and matches nothing, so this half
+>    **raised** rather than returning wrong rows — the loud failure, and a copy-and-fix nuisance
+>    rather than a hazard.
+> 3. **The range predicate was S-18.** A bound JS `Date` compared against a naive column resolves
+>    through the database session zone. Both bounds are normalized in JS
+>    (`new Date(iso).toISOString()`) and cast `::timestamp(3)`; `AI8` is the guard, and because
+>    analytics deliberately has **no** `set_config('TimeZone','UTC',true)` pin in its
+>    `base.repository.ts` (S-19), reverting that normalization alone goes red here where the
+>    equivalent revert leaves usage-service's own suite green (S-21).
+> 4. **`AND period_end <= $3` was the wrong column and the wrong bound.** The window is half-open
+>    `[from, to)` on `"periodStart"`, matching `GET /v1/usage/summary`; `periodEnd <= to` would
+>    make the two endpoints disagree about which rows a range contains.
+> 5. **`AND billed = true` was dropped**, on the user's Gate-2 ruling for T-051. Measured: with
+>    the filter, a seeded `5.250000` unbilled row vanishes from the result while sitting in the
+>    database, so a dashboard reports "nothing" for a day that had usage. `billed` is written
+>    `false` at ingestion and flipped later by the nightly invoice job, so the filter would also
+>    guarantee every cached bucket goes stale exactly once. "How much did I use" and "how much
+>    have I been billed for" are different questions and
+>    `GET /v1/billing/invoices/:id` already answers the second. `AI4b` goes red if it returns.
+>
+> **The Files line above and the placement blockquote are unchanged and remain correct.** Two
+> further things the section does not say, filled by T-051's plan: `MetricRollup` has **no
+> `bucketEnd` column**, so both tiers derive it from one frozen granularity map rather than a
+> migration; and "incomplete" is defined as `cachedBuckets == expectedBuckets` over calendar
+> buckets, with any shortfall discarding the whole cache rather than topping it up. The cost of
+> that definition is filed as **S-61**.
 
 **Response**:
 ```ts

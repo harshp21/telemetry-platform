@@ -81,8 +81,11 @@ Implementation sequence based on architectural dependencies and open decision ga
   one in v1.
 - Bucket expressions use a **bare `DATE_TRUNC(<unit>, "<column>")` on the naive column** with no
   `AT TIME ZONE` conversion. `AT TIME ZONE 'UTC'` applied to the *column* is the defect
-  `CLAUDE.md` § *Raw SQL and timestamps* names and S-53 records; applied to a bound *parameter*
-  it is correct. Fix the bound, never the column.
+  `CLAUDE.md` § *Raw SQL and timestamps* names; applied to a bound *parameter* it is correct.
+  Fix the bound, never the column. (This was recorded as S-53 in `.claude/rules/known-gaps.md`
+  while `epic-9-analytics-service.md`'s rollup snippet still wrote the column form. T-051
+  corrected the snippet and S-53 is retired; the record is
+  `docs/plans/t-051-analytics-metrics-rollup.md`.)
 - **`Tenant.timezone` is not an aggregation input.** It stays in the schema and keeps its
   writers; nothing reads it, and nothing in Epic 9 may start. Recorded at the column in
   `prisma/schema.prisma` as well as here, because that is where a reader of the column looks.
@@ -132,12 +135,49 @@ Epic 9 as depending on `Epic 3, Q3` — the whole epic — while
 authoritative**, per S-15's fix direction that it be "the single authority it claims to be"; the
 epic file carries a forward pointer to this section rather than a second copy of the ruling.
 
-- Implemented by: nothing yet. T-051 is the first task that must build on it, and owns the
-  one-line correction to `docs/epics/epic-9-analytics-service.md`'s rollup snippet recorded as
-  S-53 in `.claude/rules/known-gaps.md`.
+- Implemented by: **T-051**, the first task to build on it. It also made the correction to
+  `docs/epics/epic-9-analytics-service.md`'s rollup snippet that S-53 was open for, so that id
+  is retired. The projection is a bare `DATE_TRUNC(<unit>, "periodStart")` on the naive column
+  and `AI7` in `apps/analytics-service/tests/analytics.timezone.integration.test.ts` pins it
+  across four session zones — going red under the column form in three of them, and **green
+  under `UTC`**, which is why a suite that used CI's ambient session would assert nothing here.
 - Revisit trigger: the first customer requirement for billing or reporting boundaries in a local
   zone. Note the cost is not the query — it is recomputing every cached `MetricRollup` row,
   because the unique key carries no column recording which zone a bucket was computed in.
+
+#### Q3a — What "incomplete rollup data" means (T-051's D0-A)
+
+Recorded here because nothing else records it, and because T-052 and T-053 read the same table.
+`epic-9-analytics-service.md` § *T-051* says only *"If rollup data is incomplete (missing
+buckets), fall back to aggregating directly from `UsageLine`"*, which does not say whether a
+partial cache is **topped up** or **discarded**.
+
+- Decision: **discarded.** Any absent bucket invalidates the whole cached range and the entire
+  `[from, to)` window is re-aggregated from `"UsageLine"`. Confirmed by the user at Gate 0 of
+  T-051; until that task it existed only in conversation.
+- Mechanism: enumerate the **calendar** buckets spanning `[from, to)` and compare cardinality
+  against `COUNT(DISTINCT "bucketStart")` in `"MetricRollup"`. Both counts come from the same
+  frozen granularity fragments, so the two cannot disagree about where a boundary falls — which
+  matters most at `week`, where the bucket containing `from` is PostgreSQL's ISO Monday.
+- Rejected alternative: comparing against the buckets that *have* usage. Self-defeating —
+  establishing that set requires reading `"UsageLine"`, which is the read the cache exists to
+  avoid.
+- Two riders T-051 added, both measured rather than reasoned:
+  - **A `metricKey`-filtered request never writes the cache.** `COUNT(DISTINCT "bucketStart")`
+    is blind to the metric dimension, so a cache written by a filtered request would make a
+    later *unfiltered* range look complete while omitting another metric. Measured with both
+    layers of that guard removed: the unfiltered request returned `['api.request']` where the
+    truth is `['api.request', 'storage.write']`. A filtered request may still *read* the cache,
+    because its coverage count carries the same filter.
+  - **A range whose bounds are not on bucket boundaries never touches the cache in either
+    direction.** An unaligned bound leaves part of a bucket outside the request: reading then
+    over-reports it, and writing stores a partial total later readers would trust. Measured —
+    true total for one day bucket `12.500000`, value an unaligned `06:00` request would have
+    cached `2.000000`.
+- Known cost, filed as **S-61**: a bucket with genuinely zero usage produces no rollup row, so
+  any range containing an idle bucket can never satisfy the equality and falls back forever.
+  Correctness-first and accepted; closing it needs a completeness marker on the table, i.e. a
+  migration.
 
 #### Q6 — Multi-tenancy scope
 

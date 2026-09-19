@@ -11,18 +11,36 @@ import { ANALYTICS_HEADERS, ANALYTICS_RESPONSES, ANALYTICS_ROUTES } from "../src
 /**
  * analytics-service's service-to-service auth guard (S-9, slice 1 of 2).
  *
- * **The honest limit, stated once here and again in `src/app.ts`.** Production's guarded
- * `app.register` scope holds **no routes** until T-051, and a scope carrying hooks and no routes
- * never runs those hooks. Re-derived at Gate 3 on fastify 5.10.0 / Node v22.22.2, three forms --
+ * **The honest limit this file was written under, and how T-051 narrowed it.** When these cases
+ * were written, production's guarded `app.register` scope held **no routes**, and a scope
+ * carrying hooks and no routes never runs those hooks. Re-derived then on fastify 5.10.0 /
+ * Node v22.22.2, three forms --
  * a `GET` and a `POST` at an unmatched path under an unprefixed scope, and a `GET` under a scope
  * registered with `{ prefix: "/v1/analytics" }`. All three answered `404` with the hook's own
  * call log still empty; with one route added inside the scope the hook ran for that route and
- * did **not** run again for a sibling 404. So every case below except `AU23` composes its own
- * app from the real factories plus a probe route, because there is no production route to drive.
+ * did **not** run again for a sibling 404.
+ *
+ * **T-051 registered `GET /v1/analytics/metrics` inside that scope**, so the hooks now run in
+ * production and the id that recorded the limitation, S-9, is retired -- the record is
+ * `docs/plans/t-051-analytics-metrics-rollup.md`, and `known-gaps.md` carries no S-9 entry.
+ * Nothing in **this file** changed as a result: every case below except `AU23` still composes
+ * its own app, because the guard's *own* properties are what it is about. What did change is
+ * that the production wiring is no longer unobservable -- `AM23` in `tests/metrics.route.test.ts`
+ * observes the hook order through the real route. See the requalified notes on `AU22b` and
+ * `AU23` below.
+ *
+ * So every case below except `AU23` composes its own
+ * app from the real factories plus a probe route -- which it did originally because there was no
+ * production route to drive, and still does because the guard's own properties are what these
+ * cases are about.
  *
  * What that means for a reader: these cases prove the guard works and that `/health` is outside
- * the scope. They do **not** prove a future tenant-scoped route is inside it -- T-051 owns that,
- * and the narrowed S-9 entry in `.claude/rules/known-gaps.md` is the durable record of it.
+ * the scope. They do **not** prove that a tenant-scoped route is inside it. **T-051 discharged
+ * that**, and `AM20` in `tests/metrics.route.test.ts` is the case that proves it -- it goes red
+ * when the registration moves out of the `app.register` callback. Cite `AM20`, not a
+ * `known-gaps.md` entry: this paragraph used to point at "the narrowed S-9 entry", and S-9 is
+ * retired, so there is no such entry to read (Gate-4 MEDIUM-1). The record is
+ * `docs/plans/t-051-analytics-metrics-rollup.md`.
  *
  * Nothing here touches Postgres or Redis: `AU23`'s container builds an ioredis client with
  * `lazyConnect` and nothing calls `connect()`; every other case runs on a bare Fastify instance.
@@ -33,8 +51,13 @@ const OTHER_VALID_SECRET = "s-009-analytics-wrong-secret-at-least-32-chars";
 const TENANT_ID = "11111111-1111-4111-8111-111111111111";
 const TENANT_ID_NOT_A_UUID = "abc";
 /**
- * The stand-in for T-051's route. It exists only inside these suites' own scope; production's
- * scope is empty, which is the whole subject of the docblock above.
+ * A probe route, existing only inside these suites' own scope.
+ *
+ * It was originally the stand-in for T-051's route, because production's guarded scope was then
+ * empty. **It is not a stand-in any more:** T-051 registered
+ * `GET /v1/analytics/metrics` inside that scope, and `tests/metrics.route.test.ts` drives it. The
+ * probe survives because these cases are about the guard's *own* behaviour -- a real route would
+ * couple every one of them to the controller, the service and the repository for no gain.
  */
 const PROBE_ROUTE = "/probe";
 
@@ -49,8 +72,11 @@ const APP_SOURCE_URL = new URL("../src/app.ts", import.meta.url);
  *
  * Reading the subject's own source is unusual and is done deliberately, because the properties
  * in question are **not observable from behaviour here**: `!==` and `secretsMatch` return the
- * same boolean for every input, and production's hook registration cannot be observed at all
- * while its scope holds no routes. `apps/billing-service/tests/internal-auth.middleware.unit.test.ts`
+ * same boolean for every input, and production's hook registration could not be observed at all
+ * from **this file**, whose cases compose their own app. (Since T-051 it can be observed
+ * elsewhere: `AM23` in `tests/metrics.route.test.ts` drives the real route. The source-text
+ * assertions are kept anyway -- see `AU22b`.)
+ * `apps/billing-service/tests/internal-auth.middleware.unit.test.ts`
  * (`BU135`/`BU136`) is the precedent, and this file's own `env.schema.unit.test.ts` sibling reads
  * `.env.example` and `docker-compose.yml` the same way.
  *
@@ -285,8 +311,12 @@ describe("analytics-service guarded scope composition", () => {
   let app: FastifyInstance;
   let probeHandlerCalls: number;
 
-  // Production's registration order and phases, reproduced here because production's own scope
-  // holds no route to drive. `AU22b` is what ties this composition back to `src/app.ts`.
+  // Production's registration order and phases, reproduced here. This composition was originally
+  // the only way to exercise them at all, because production's scope then held no route; since
+  // T-051 it does, and `AM23` in `tests/metrics.route.test.ts` observes the same ordering through
+  // the real one. Both are kept: `AM23` is the behavioural guard on the shipped wiring, this
+  // composition isolates the guard from the controller and the repository, and `AU22b` is what
+  // ties the two together by asserting `src/app.ts`'s registration text.
   beforeEach(async () => {
     probeHandlerCalls = 0;
     app = Fastify({ logger: false });
@@ -361,8 +391,15 @@ describe("analytics-service guarded scope composition", () => {
   // AU22b -- **not in the plan's §7 table**, added at Gate 3 to close the gap AU22 cannot.
   // AU22 asserts the ordering of a composition this *test file* builds, so on its own it would
   // stay green if `src/app.ts` registered the two hooks in the other order or at the other
-  // phase. Nothing behavioural can notice that while the production scope holds no routes, so
-  // this asserts the registration text instead.
+  // phase. Nothing in **this file** can notice that, since every case here composes its own app,
+  // so this asserts the registration text instead.
+  //
+  // **Since T-051 something behavioural does notice**, and this case is no longer the only
+  // guard: `AM23` in `tests/metrics.route.test.ts` observes the order through the real route, by
+  // the code a doubly-invalid request receives (swapping the two `addHook` calls turns
+  // `UNAUTHORIZED` into `TENANT_CONTEXT_MISSING`). Keep both -- `AM23` is the behavioural guard,
+  // and this one still catches a reordering that leaves the observable codes unchanged, such as
+  // a phase change that happens to preserve the effective order.
   //
   // Scope: it checks that `src/app.ts` adds the guard as an `onRequest` hook, adds the tenant
   // handler as an `onRequest` hook, and writes the guard's registration **earlier in the file**.
@@ -395,9 +432,13 @@ describe("analytics-service /health exemption", () => {
     await app.close();
   });
 
-  // AU23. The **only** case in this task that drives the shipped `buildAnalyticsServiceApp`, and
-  // the only behavioural property of the production wiring that can go red while the guarded
-  // scope holds no routes. `/health` is exempt *structurally* -- registered on the root instance,
+  // AU23. The only case in **this file** that drives the shipped `buildAnalyticsServiceApp`, and
+  // -- when it was written -- the only behavioural property of the production wiring that could
+  // go red at all, because the guarded scope then held no routes. T-051 added a route inside
+  // that scope, so `tests/metrics.route.test.ts` now drives the shipped factory too; `AM23c`
+  // there re-checks this same `/health` exemption now that the scope has a route, since a scope
+  // with routes runs its hooks where an empty one did not.
+  // `/health` is exempt *structurally* -- registered on the root instance,
   // outside the `app.register` callback -- rather than through an allowlist, so there is no list
   // to forget to update (billing's T-046 shape; usage-service's `public-routes.ts` is the other
   // shape and was not copied).

@@ -11,13 +11,26 @@ import { ANALYTICS_HEADERS, ANALYTICS_RESPONSES } from "../constants";
  * an allowlist: it is registered on the root instance, outside the `app.register` scope this
  * guard is added to.
  *
- * **This guard currently protects zero routes, and that is measured rather than assumed.** The
- * scope `src/app.ts` adds it to holds no routes until T-051, and at fastify 5.10.0 a scope
- * carrying hooks and no routes never runs them -- three forms probed at Gate 3 (an unmatched
- * `GET` and `POST` under an unprefixed scope, and a `GET` under a scope registered with
- * `{ prefix: "/v1/analytics" }`): every one answered `404` with the hook's call log still empty.
- * So the wiring is in place for T-051 to register inside, and until it does, nothing reaches
- * this function in production. `.claude/rules/known-gaps.md` S-9 is the durable record.
+ * **This guard protects `GET /v1/analytics/metrics`**, registered inside that same
+ * `app.register` scope by T-051, so it is on the serving path for real tenant data.
+ *
+ * It protected **zero** routes until then, and that was measured rather than assumed: at
+ * fastify 5.10.0 a scope carrying hooks and no routes never runs them -- three forms probed at
+ * S-9 (an unmatched `GET` and `POST` under an unprefixed scope, and a `GET` under a scope
+ * registered with `{ prefix: "/v1/analytics" }`), every one answering `404` with the hook's call
+ * log still empty. That was S-9; **the id is now retired** and the record is
+ * `docs/plans/t-051-analytics-metrics-rollup.md`. `.claude/rules/known-gaps.md` no longer
+ * carries an S-9 entry, so do not cite one.
+ *
+ * What replaced that limitation is a narrower one worth knowing before adding the next route:
+ * this guard covers what is registered **inside** the callback and nothing else. Measured at
+ * T-051 against the real app factory, one route per placement injected with no headers -- a
+ * sibling scope, a prefixed sibling scope and the root instance are all reachable with the guard
+ * never running. What the caller then gets depends on the handler: a bare probe handler answered
+ * `200` **and ran**, while the real `/v1/analytics/metrics` handler answered `500` (or `400` for
+ * a request with no querystring) and did **not** run, because `AnalyticsController` refuses on
+ * the `request.tenantId` no hook set. Identical in the first layer -- this guard is skipped
+ * either way -- and different in what follows.
  *
  * **Derived from the other three guards rather than written afresh** -- S-8 made those three one
  * rule, and a fourth spelling would undo it:
