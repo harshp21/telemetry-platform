@@ -17,7 +17,7 @@ Implementation sequence based on architectural dependencies and open decision ga
 | Q10 — DLQ retry policy (**decided**: `MAX_RETRY_COUNT` 3, `DEAD_LETTER_STREAM` `telemetry:dead-letter`, no retry delay, alerting counter deferred to T-057) | Epic 7 |
 | Q2 — Pricing model (**decided**: flat only for v1 — `amount = summedQuantity x unitPrice`; `Meter.tierJson` unread; tiered deferred pending a graduated-vs-volume ruling) | Epic 8 |
 | Q3 — UTC aggregation timezone (**decided**: fixed UTC for every tenant; `Tenant.timezone` is not an aggregation input) | Epic 9 — T-051, T-052, T-053 only |
-| Q11 — Dashboard scope | Epic 11 |
+| Q11 — Dashboard scope (**decided**: three pages — Usage, Billing, Analytics; no others in v1) | Epic 11 |
 
 ### Day 1 decision notes
 
@@ -164,6 +164,29 @@ epic file carries a forward pointer to this section rather than a second copy of
 - Health endpoints remain unauthenticated for operability checks.
 - Why now: clear trust boundaries and reduced accidental exposure risk.
 - Revisit trigger: service mesh/mTLS rollout or external partner access requirements.
+
+#### Q11 — Dashboard scope
+
+- Decision: **three pages — Usage, Billing, Analytics.** Nothing else ships in the v1 dashboard.
+- Each page is backed by an API that already exists, with one exception recorded below: Usage by
+  usage-service's summary endpoint, Billing by `GET /v1/billing/invoices` and
+  `/v1/billing/invoices/:id` (T-046, T-047), Analytics by nothing yet.
+- **The Analytics page has no endpoint behind it today.** `GET /v1/analytics/metrics` is T-051,
+  which is unstarted at the time of this ruling. Confirming the page does not create the API, and
+  T-063 must not be read as unblocked by this entry alone.
+- Why now: it was the last gate carrying no `decided` marker, and it blocks six tasks
+  (T-060–T-065) — the whole of Epic 11 and the largest single block of pending work. Confirming
+  the page set costs nothing and does not commit anyone to building it next.
+- **What this does not settle.** `docs/epics/epic-11-frontend.md:13` lists **Q5** as a second
+  pre-coding gate for Epic 11, while this README's gate table scopes Q5 to Epic 4 only. The two
+  files disagree about Q5's reach, which is one of the six defects S-15 records; Q5 itself reads
+  unresolved here although `640e53d` and `bdb6bcf` shipped a hybrid cookie + CSRF model. Settling
+  Q11 therefore clears one of the two gates epic-11 names, not both. Whoever resolves Q5 should
+  reconcile its `Required before` column at the same time.
+- State of the code at this ruling, so nobody reads the decision as progress: `apps/web` is a bare
+  Vite scaffold — six source files (`App.tsx`, `main.tsx`, `routes/router.tsx`, `lib/utils.ts`,
+  `styles/index.css`, `vite-env.d.ts`), no API client, no auth context, no pages.
+- Revisit trigger: a customer requirement for a fourth page, or for splitting any of the three.
 
 ---
 
